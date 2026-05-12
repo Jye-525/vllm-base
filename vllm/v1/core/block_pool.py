@@ -197,6 +197,76 @@ class BlockPool:
         self._children: dict[BlockHash, set[BlockHash]] = defaultdict(set)
         self._orphaned: set[BlockHash] = set()
 
+        # Imminent set: block hashes belonging to the top-K waiters in
+        # the scheduling queue, published by the scheduler at the start
+        # of each schedule() step. Among demanded blocks, those NOT in
+        # this set are evicted before those that are. An empty set
+        # degenerates to the original demand-aware behavior.
+        self._imminent_hashes: set[BlockHash] = set()
+
+        # Imminent-protection effectiveness counters. Updated as the
+        # imminent set is republished and as get_cached_block observes
+        # hits on protected hashes. Pure observability — does not
+        # influence eviction.
+        self.imminent_hits: int = 0
+        self.imminent_total_protected: int = 0
+        self.imminent_publishes: int = 0
+
+    def set_imminent_hashes(self, hashes: set[BlockHash]) -> None:
+        """Publish the imminent block-hash set used by demand-aware
+        eviction. Pass an empty set to disable the imminent split.
+        """
+        self._imminent_hashes = hashes
+        self.imminent_total_protected = len(hashes)
+        self.imminent_publishes += 1
+
+    def classify_chain(
+        self,
+        hashes: Sequence[BlockHash],
+        kv_cache_group_ids: Sequence[int] = (0,),
+    ) -> tuple[int, int]:
+        """Single-pass classifier for a waiter's prefix chain.
+
+        Returns (cached_prefix_len, active_hits):
+          cached_prefix_len: length of the longest *contiguous* prefix of
+                             `hashes` for which every hash is cached in
+                             every group in `kv_cache_group_ids`. vLLM v1
+                             only reuses contiguous prefixes, so this is
+                             the safe truncation point for protection.
+          active_hits:       count of hashes *within* the contiguous
+                             cached prefix whose block (in the first
+                             group) has ref_cnt > 0 — cached and held by
+                             a running request, therefore NOT in the
+                             free queue. Used by the scheduler to
+                             discount free-queue cost. Hashes past the
+                             first miss are excluded because the waiter
+                             will allocate fresh blocks for those
+                             positions regardless of what is cached
+                             downstream (contiguous-only matching).
+        """
+        cached_prefix_len = 0
+        active_hits = 0
+        first_group = kv_cache_group_ids[0]
+        cache = self.cached_block_hash_to_block
+        for h in hashes:
+            block_in_first_group: KVCacheBlock | None = None
+            cached_all_groups = True
+            for gid in kv_cache_group_ids:
+                key = make_block_hash_with_group_id(h, gid)
+                blk = cache.get_one_block(key)
+                if gid == first_group:
+                    block_in_first_group = blk
+                if blk is None:
+                    cached_all_groups = False
+                    break
+            if not cached_all_groups:
+                break
+            cached_prefix_len += 1
+            if (block_in_first_group is not None
+                    and block_in_first_group.ref_cnt > 0):
+                active_hits += 1
+        return cached_prefix_len, active_hits
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -222,6 +292,8 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
+        if block_hash in self._imminent_hashes:
+            self.imminent_hits += 1
         return cached_blocks
 
     def cache_full_blocks(
@@ -409,18 +481,24 @@ class BlockPool:
         """Pop blocks from the free queue with priority:
         1. Orphaned blocks (prefix evicted, unreachable)
         2. Zero-demand blocks (no waiting request needs them)
-        3. Positive-demand blocks (LRU among demanded, last resort)
+        3. Demanded blocks NOT in the imminent set
+           (only far-future waiters need them)
+        4. Demanded blocks in the imminent set
+           (next admissions will hit them — last resort)
 
-        Walks the free queue and classifies blocks by eviction priority.
+        Bands 3 and 4 are merged when the imminent set is empty,
+        recovering the original two-band demand-aware behavior.
         """
         t0 = time.perf_counter()
 
         assert self.demand_tracker is not None
         tracker = self.demand_tracker
         queue = self.free_block_queue
+        imminent = self._imminent_hashes
 
         result: list[KVCacheBlock] = []
-        deferred: list[KVCacheBlock] = []
+        deferred_far: list[KVCacheBlock] = []
+        deferred_imminent: list[KVCacheBlock] = []
 
         # Walk queue from head (LRU). Classify each block.
         blocks_walked = 0
@@ -431,22 +509,31 @@ class BlockPool:
             if bh is None:
                 # No hash — not cached, safe to reuse immediately.
                 result.append(block)
-            elif get_block_hash(bh) in self._orphaned:
+                continue
+            raw_hash = get_block_hash(bh)
+            if raw_hash in self._orphaned:
                 # Orphaned — parent evicted, unreachable. Evict first.
                 result.append(block)
-            elif not tracker.has_demand(get_block_hash(bh)):
+            elif not tracker.has_demand(raw_hash):
                 # Zero demand — no waiting request needs this block.
                 result.append(block)
+            elif raw_hash not in imminent:
+                # Demanded only by far-future waiters: band 3.
+                deferred_far.append(block)
             else:
-                # Positive demand — defer eviction.
-                deferred.append(block)
+                # Demanded by an imminent (top-K) waiter: band 4.
+                deferred_imminent.append(block)
 
-        # Put deferred (demanded) blocks back at the tail so they
-        # stay in the queue for future use.
-        if deferred:
-            queue.append_n(deferred)
+        # Re-append far first, then imminent, so the fallback popleft_n
+        # reaches band-3 blocks before band-4 ones. Within each band,
+        # original walk order (LRU) is preserved.
+        if deferred_far:
+            queue.append_n(deferred_far)
+        if deferred_imminent:
+            queue.append_n(deferred_imminent)
 
-        # If we still need more, take demanded blocks (LRU among them).
+        # If we still need more, take demanded blocks (band 3 first,
+        # then band 4) via plain popleft_n.
         still_needed = num_blocks - len(result)
         fell_back = False
         if still_needed > 0:
@@ -456,11 +543,15 @@ class BlockPool:
         elapsed_us = (time.perf_counter() - t0) * 1e6
         logger.info(
             "demand_aware_eviction: %.1f us | requested=%d walked=%d "
-            "deferred=%d fell_back=%s free_remaining=%d "
-            "tracked_hashes=%d orphaned=%d",
+            "deferred_far=%d deferred_imminent=%d fell_back=%s "
+            "free_remaining=%d tracked_hashes=%d imminent=%d "
+            "orphaned=%d imm_hits=%d imm_protected=%d imm_publishes=%d",
             elapsed_us, num_blocks, blocks_walked,
-            len(deferred), fell_back, queue.num_free_blocks,
-            tracker.num_tracked_hashes, len(self._orphaned),
+            len(deferred_far), len(deferred_imminent), fell_back,
+            queue.num_free_blocks, tracker.num_tracked_hashes,
+            len(imminent), len(self._orphaned),
+            self.imminent_hits, self.imminent_total_protected,
+            self.imminent_publishes,
         )
 
         return result

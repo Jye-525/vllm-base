@@ -238,5 +238,291 @@ class TestDemandAwareEviction:
         assert len(new_blocks) == 1
         assert new_blocks[0].block_hash is None  # the uncached one
 
-    # NOTE: test_orphaned_blocks_evicted_first removed — orphan probe (EXP 4)
-    # was intentionally not ported from the v0.15.0-era KVReuse fork.
+    def test_orphaned_blocks_evicted_first(self):
+        """Orphaned blocks (parent evicted) should be evicted before
+        zero-demand cached blocks."""
+        pool = self._make_pool(6)
+        tracker = pool.demand_tracker
+
+        blocks = pool.free_block_queue.popleft_n(3)
+
+        # Cache all 3 blocks
+        for i, block in enumerate(blocks):
+            self._cache_block(pool, block, f"o_{i}".encode())
+            block.ref_cnt = 0
+            pool.free_block_queue.append(block)
+
+        # Mark block 1 as orphaned
+        pool._orphaned.add(_bh(b"o_1"))
+
+        # Evict 1 block — should be the orphaned one
+        new_blocks = pool._pop_blocks_demand_aware(1)
+        assert len(new_blocks) == 1
+
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+        evicted_hash = get_block_hash(new_blocks[0].block_hash)
+        assert evicted_hash == _bh(b"o_1")
+
+
+# ---------------------------------------------------------------------------
+# Imminent-aware eviction (top-K waiters protected over far-future waiters)
+# ---------------------------------------------------------------------------
+
+class TestImminentEviction:
+    """When the imminent set is published, demanded blocks NOT in it
+    should be evicted before demanded blocks that are."""
+
+    def _make_pool(self, num_blocks: int = 10) -> BlockPool:
+        tracker = DemandTracker()
+        return BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=16,
+            demand_tracker=tracker,
+        )
+
+    def _cache(self, pool: BlockPool, block: KVCacheBlock, tag: bytes):
+        bhg = _bhg(tag)
+        block.block_hash = bhg
+        # Use the real BlockHashToBlockMap API.
+        pool.cached_block_hash_to_block.insert(bhg, block)
+
+    def test_empty_imminent_matches_old_behavior(self):
+        """Without an imminent set, all demanded blocks form a single
+        deferred band and the fallback walks them in queue order."""
+        pool = self._make_pool(5)
+        tracker = pool.demand_tracker
+
+        blocks = pool.free_block_queue.popleft_n(3)
+        for i, b in enumerate(blocks):
+            self._cache(pool, b, f"x_{i}".encode())
+            b.ref_cnt = 0
+            pool.free_block_queue.append(b)
+
+        # All demanded — fallback path will run.
+        tracker.add_request([_bh(b"x_0"), _bh(b"x_1"), _bh(b"x_2")])
+        assert pool._imminent_hashes == set()
+
+        evicted = pool._pop_blocks_demand_aware(1)
+        assert len(evicted) == 1
+        # Without imminent split, fallback popleft_n returns the head
+        # of the queue (oldest, x_0).
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+        assert get_block_hash(evicted[0].block_hash) == _bh(b"x_0")
+
+    def test_imminent_protects_top_k_under_pressure(self):
+        """When all candidates are demanded, the fallback must evict
+        a band-3 (far) block before any band-4 (imminent) block."""
+        pool = self._make_pool(5)
+        tracker = pool.demand_tracker
+
+        blocks = pool.free_block_queue.popleft_n(3)
+        for i, b in enumerate(blocks):
+            self._cache(pool, b, f"y_{i}".encode())
+            b.ref_cnt = 0
+            pool.free_block_queue.append(b)
+
+        # All three are globally demanded.
+        tracker.add_request([_bh(b"y_0"), _bh(b"y_1"), _bh(b"y_2")])
+        # But only y_1 and y_2 are imminent (top-K waiter's prefix).
+        # y_0 is at the head of the queue (oldest) — without the
+        # imminent split it would be picked first; with the split it
+        # must NOT be picked because y_0 is imminent. Wait: assertion
+        # below — we mark y_1 as the *only* imminent one to make the
+        # test unambiguous.
+        pool.set_imminent_hashes({_bh(b"y_1")})
+
+        evicted = pool._pop_blocks_demand_aware(1)
+        assert len(evicted) == 1
+        # y_0 and y_2 are band 3 (not in imminent); y_1 is band 4.
+        # Fallback walks band 3 first in queue order: y_0 is at head.
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+        evicted_hash = get_block_hash(evicted[0].block_hash)
+        assert evicted_hash != _bh(b"y_1"), (
+            "imminent block was evicted while a far block was available"
+        )
+        assert evicted_hash in {_bh(b"y_0"), _bh(b"y_2")}
+
+    def test_imminent_band4_only_when_no_band3(self):
+        """When every demanded block is imminent, fallback still
+        succeeds and returns one of them (last-resort eviction)."""
+        pool = self._make_pool(5)
+        tracker = pool.demand_tracker
+
+        blocks = pool.free_block_queue.popleft_n(2)
+        for i, b in enumerate(blocks):
+            self._cache(pool, b, f"z_{i}".encode())
+            b.ref_cnt = 0
+            pool.free_block_queue.append(b)
+
+        tracker.add_request([_bh(b"z_0"), _bh(b"z_1")])
+        pool.set_imminent_hashes({_bh(b"z_0"), _bh(b"z_1")})
+
+        evicted = pool._pop_blocks_demand_aware(1)
+        assert len(evicted) == 1  # last-resort path still works
+
+    def test_zero_demand_still_evicted_first_with_imminent_set(self):
+        """Imminent split applies only to demanded blocks; band-2
+        (zero-demand) eviction must still take precedence."""
+        pool = self._make_pool(6)
+        tracker = pool.demand_tracker
+
+        blocks = pool.free_block_queue.popleft_n(3)
+        for i, b in enumerate(blocks):
+            self._cache(pool, b, f"m_{i}".encode())
+            b.ref_cnt = 0
+            pool.free_block_queue.append(b)
+
+        # Only m_2 is demanded, and it's imminent.
+        tracker.add_request([_bh(b"m_2")])
+        pool.set_imminent_hashes({_bh(b"m_2")})
+
+        evicted = pool._pop_blocks_demand_aware(1)
+        assert len(evicted) == 1
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+        # Must be a zero-demand block, never m_2.
+        evicted_hash = get_block_hash(evicted[0].block_hash)
+        assert evicted_hash in {_bh(b"m_0"), _bh(b"m_1")}
+
+
+# ---------------------------------------------------------------------------
+# classify_chain: per-waiter contiguous-prefix + active-hits classifier
+# ---------------------------------------------------------------------------
+
+class TestClassifyChain:
+    """BlockPool.classify_chain returns (cached_prefix_len, active_hits)
+    in one pass over a waiter's block_hashes."""
+
+    def _make_pool(self, num_blocks: int = 8) -> BlockPool:
+        return BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=16,
+            demand_tracker=DemandTracker(),
+        )
+
+    def _cache(self, pool: BlockPool, block: KVCacheBlock, tag: bytes,
+               ref_cnt: int = 0):
+        bhg = _bhg(tag)
+        block.block_hash = bhg
+        block.ref_cnt = ref_cnt
+        pool.cached_block_hash_to_block.insert(bhg, block)
+
+    def test_all_uncached_returns_zero(self):
+        pool = self._make_pool()
+        hashes = [_bh(b"a"), _bh(b"b"), _bh(b"c")]
+        prefix_len, active = pool.classify_chain(hashes)
+        assert prefix_len == 0
+        assert active == 0
+
+    def test_full_idle_prefix(self):
+        """All cached, all ref_cnt == 0 → full prefix, zero active."""
+        pool = self._make_pool()
+        blocks = pool.free_block_queue.popleft_n(3)
+        tags = [b"a", b"b", b"c"]
+        for blk, tag in zip(blocks, tags):
+            self._cache(pool, blk, tag, ref_cnt=0)
+        prefix_len, active = pool.classify_chain([_bh(t) for t in tags])
+        assert prefix_len == 3
+        assert active == 0
+
+    def test_full_active_prefix(self):
+        """All cached, all ref_cnt > 0 → full prefix, all active."""
+        pool = self._make_pool()
+        blocks = pool.free_block_queue.popleft_n(3)
+        tags = [b"a", b"b", b"c"]
+        for blk, tag in zip(blocks, tags):
+            self._cache(pool, blk, tag, ref_cnt=1)
+        prefix_len, active = pool.classify_chain([_bh(t) for t in tags])
+        assert prefix_len == 3
+        assert active == 3
+
+    def test_gap_truncates_prefix(self):
+        """A missing block ends the contiguous prefix; downstream
+        cached blocks do NOT extend prefix_len or active_hits."""
+        pool = self._make_pool()
+        blocks = pool.free_block_queue.popleft_n(3)
+        # Cache positions 0, 1, 3 (skip 2).
+        self._cache(pool, blocks[0], b"h0", ref_cnt=0)
+        self._cache(pool, blocks[1], b"h1", ref_cnt=1)
+        # blocks[2] is "h3" — cached and active but past the gap.
+        self._cache(pool, blocks[2], b"h3", ref_cnt=1)
+        chain = [_bh(b"h0"), _bh(b"h1"), _bh(b"h2"), _bh(b"h3"), _bh(b"h4")]
+        prefix_len, active = pool.classify_chain(chain)
+        # Prefix stops at h2; h3 cached-active beyond is ignored.
+        assert prefix_len == 2
+        assert active == 1  # only h1 is active and within prefix
+
+    def test_mixed_idle_and_active_within_prefix(self):
+        pool = self._make_pool()
+        blocks = pool.free_block_queue.popleft_n(4)
+        self._cache(pool, blocks[0], b"x0", ref_cnt=2)  # active
+        self._cache(pool, blocks[1], b"x1", ref_cnt=0)  # idle
+        self._cache(pool, blocks[2], b"x2", ref_cnt=3)  # active
+        self._cache(pool, blocks[3], b"x3", ref_cnt=0)  # idle
+        chain = [_bh(b"x0"), _bh(b"x1"), _bh(b"x2"), _bh(b"x3")]
+        prefix_len, active = pool.classify_chain(chain)
+        assert prefix_len == 4
+        assert active == 2
+
+    def test_empty_chain(self):
+        pool = self._make_pool()
+        prefix_len, active = pool.classify_chain([])
+        assert prefix_len == 0
+        assert active == 0
+
+
+# ---------------------------------------------------------------------------
+# Imminent-protection effectiveness counters
+# ---------------------------------------------------------------------------
+
+class TestImminentCounters:
+    """Counters that track whether published imminent protections
+    actually paid off as get_cached_block hits."""
+
+    def _make_pool(self) -> BlockPool:
+        return BlockPool(
+            num_gpu_blocks=6,
+            enable_caching=True,
+            hash_block_size=16,
+            demand_tracker=DemandTracker(),
+        )
+
+    def test_publish_increments_counters(self):
+        pool = self._make_pool()
+        assert pool.imminent_publishes == 0
+        assert pool.imminent_total_protected == 0
+        pool.set_imminent_hashes({_bh(b"a"), _bh(b"b")})
+        assert pool.imminent_publishes == 1
+        assert pool.imminent_total_protected == 2
+        pool.set_imminent_hashes(set())
+        assert pool.imminent_publishes == 2
+        assert pool.imminent_total_protected == 0
+
+    def test_hit_increments_only_when_protected(self):
+        pool = self._make_pool()
+        blocks = pool.free_block_queue.popleft_n(2)
+        bhg_a = _bhg(b"a")
+        bhg_b = _bhg(b"b")
+        blocks[0].block_hash = bhg_a
+        pool.cached_block_hash_to_block.insert(bhg_a, blocks[0])
+        blocks[1].block_hash = bhg_b
+        pool.cached_block_hash_to_block.insert(bhg_b, blocks[1])
+
+        pool.set_imminent_hashes({_bh(b"a")})
+        assert pool.imminent_hits == 0
+
+        # Hit on a protected hash → counter increments.
+        result = pool.get_cached_block(_bh(b"a"), [0])
+        assert result is not None
+        assert pool.imminent_hits == 1
+
+        # Hit on an unprotected hash → no change.
+        result = pool.get_cached_block(_bh(b"b"), [0])
+        assert result is not None
+        assert pool.imminent_hits == 1
+
+        # Miss on a protected hash → no change (only successful lookups count).
+        result = pool.get_cached_block(_bh(b"never_cached"), [0])
+        assert result is None
+        assert pool.imminent_hits == 1

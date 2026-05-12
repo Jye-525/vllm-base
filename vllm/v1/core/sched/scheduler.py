@@ -257,6 +257,24 @@ class Scheduler(SchedulerInterface):
         else:
             self.demand_tracker = None
 
+        # Imminent set: each scheduling step, compute K adaptively from
+        # the free-block budget (how many head waiters' new blocks fit),
+        # then publish the per-waiter contiguous-cached prefix as the
+        # imminent set. VLLM_IMMINENT_K_MIN (default 1) is the floor: at
+        # least the first K_MIN waiters are always protected so the
+        # cache stays warm even when the queue is budget-starved.
+        # Setting K_MIN=0 disables the imminent split entirely (bands 3
+        # and 4 merge in _pop_blocks_demand_aware).
+        try:
+            self._imminent_k_min: int = max(
+                0, int(os.environ.get("VLLM_IMMINENT_K_MIN", "1")))
+        except ValueError:
+            self._imminent_k_min = 1
+        # KV cache group ids used for existence checks during truncation.
+        self._imminent_group_ids: tuple[int, ...] = tuple(
+            range(len(kv_cache_config.kv_cache_groups))
+        ) or (0,)
+
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self.scheduler_reserve_full_isl = (
@@ -343,6 +361,86 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _publish_imminent_hashes(self) -> None:
+        """Compute and publish the imminent block-hash set used by
+        demand-aware eviction.
+
+        For each head waiter we ask BlockPool.classify_chain for two
+        signals in a single pass:
+          - cached_prefix_len: how far the waiter's prefix is currently
+            cached contiguously. Past the first miss, downstream blocks
+            cannot be reused by this waiter (vLLM v1 uses contiguous
+            prefix matching), so we truncate the imminent contribution
+            at this length.
+          - active_hits: how many of the waiter's hashes are cached AND
+            held by a running request (ref_cnt > 0). Those blocks are
+            not in the free queue, so they do not consume free-queue
+            budget when this waiter admits.
+
+        K is the largest prefix of the waiting queue whose cumulative
+        new-block need (total - active_hits) fits in the current free
+        block budget, clamped up to K_MIN to avoid full collapse.
+        """
+        if self.demand_tracker is None:
+            return
+        block_pool = self.kv_cache_manager.block_pool
+
+        k_min = self._imminent_k_min
+        if k_min == 0:
+            # Hard kill switch: revert to plain demand-aware (bands 3/4
+            # merge in _pop_blocks_demand_aware when imminent is empty).
+            block_pool.set_imminent_hashes(set())
+            return
+
+        if not self.waiting:
+            block_pool.set_imminent_hashes(set())
+            return
+
+        group_ids = self._imminent_group_ids
+        budget = block_pool.free_block_queue.num_free_blocks
+
+        cum_need = 0
+        k_budget = 0
+        budget_exhausted = False
+        # Cache (cached_prefix_len, hashes) per waiter so we don't walk
+        # the chain twice.
+        classified: list[tuple[int, Any]] = []
+
+        for i, req in enumerate(self.waiting):
+            # Stop classifying once both the budget is exhausted and we
+            # have classified enough waiters to satisfy the K_MIN floor.
+            if budget_exhausted and i >= k_min:
+                break
+            hashes = req.block_hashes
+            if not hashes:
+                classified.append((0, hashes))
+                if not budget_exhausted:
+                    k_budget = i + 1
+                continue
+            cached_prefix_len, active_hits = block_pool.classify_chain(
+                hashes, group_ids
+            )
+            classified.append((cached_prefix_len, hashes))
+            if budget_exhausted:
+                continue
+            new_need = len(hashes) - active_hits
+            if cum_need + new_need > budget:
+                budget_exhausted = True
+                continue
+            cum_need += new_need
+            k_budget = i + 1
+
+        k = max(k_budget, k_min)
+        if k == 0:
+            block_pool.set_imminent_hashes(set())
+            return
+
+        imminent: set = set()
+        for cached_prefix_len, hashes in classified[:k]:
+            if cached_prefix_len > 0:
+                imminent.update(hashes[:cached_prefix_len])
+        block_pool.set_imminent_hashes(imminent)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -354,6 +452,11 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # Compute the imminent set once per scheduling step. Both
+        # running-request growth and waiting-request admission can
+        # trigger eviction below, so this needs to be set before either.
+        self._publish_imminent_hashes()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
