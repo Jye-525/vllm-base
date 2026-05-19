@@ -15,11 +15,15 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+from vllm.v1.kv_offload.cpu.policies.fifo import FIFOCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lfu import LFUCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "fifo": FIFOCachePolicy,
+    "lfu": LFUCachePolicy,
 }
 
 
