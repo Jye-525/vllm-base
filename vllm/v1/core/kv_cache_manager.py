@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.block_logger import BlockEventLogger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -230,6 +231,18 @@ class KVCacheManager:
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
             )
+
+        # Experiment 1 instrumentation: log cache hits when VLLM_BLOCK_LOG is set.
+        if num_new_computed_tokens > 0:
+            blog = BlockEventLogger.get()
+            if blog is not None:
+                block_size = self.coordinator.block_pool.hash_block_size
+                num_hit_blocks = num_new_computed_tokens // block_size
+                for bh in request.block_hashes[:num_hit_blocks]:
+                    blog.log_cache_hit(
+                        block_hash=bh,
+                        request_id=request.request_id,
+                    )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 

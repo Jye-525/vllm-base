@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -11,6 +12,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.demand_tracker import DemandTracker
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -26,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.tier_logger import _get_tier_logger
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -181,6 +184,11 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Demand-aware eviction: when set, prefer evicting blocks that
+        # no waiting request needs over blocks with positive demand.
+        # Wired by the scheduler after construction.
+        self.demand_tracker: DemandTracker | None = None
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -279,6 +287,18 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+
+            # EXP 2: log GPU store event when VLLM_TIER_LOG is set.
+            tlog = _get_tier_logger()
+            if tlog is not None:
+                j = num_cached_blocks + i
+                parent_hash = block_hashes[j - 1] if j > 0 else None
+                tlog.log_event(
+                    "gpu_store", block_hash, "gpu",
+                    parent_hash=parent_hash,
+                    request_id=request.request_id,
+                )
+
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -344,7 +364,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.enable_caching and self.demand_tracker is not None:
+            ret: list[KVCacheBlock] = self._pop_blocks_demand_aware(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -361,6 +384,61 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _pop_blocks_demand_aware(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop blocks from the free queue, preferring those with no demand
+        from waiting requests over those with positive demand. Walks the
+        LRU queue, classifies blocks by demand, and falls back to demanded
+        blocks only when zero-demand blocks are exhausted.
+        """
+        t0 = time.perf_counter()
+
+        assert self.demand_tracker is not None
+        tracker = self.demand_tracker
+        queue = self.free_block_queue
+
+        result: list[KVCacheBlock] = []
+        deferred: list[KVCacheBlock] = []
+
+        # Walk queue from head (LRU). Classify each block.
+        blocks_walked = 0
+        while len(result) < num_blocks and queue.num_free_blocks > 0:
+            block = queue.popleft()
+            blocks_walked += 1
+            bh = block.block_hash
+            if bh is None:
+                # No hash — not cached, safe to reuse immediately.
+                result.append(block)
+            elif not tracker.has_demand(get_block_hash(bh)):
+                # Zero demand — no waiting request needs this block.
+                result.append(block)
+            else:
+                # Positive demand — defer eviction.
+                deferred.append(block)
+
+        # Put deferred (demanded) blocks back at the tail so they
+        # stay available for future use.
+        for block in deferred:
+            queue.append(block)
+
+        # If we still need more, take demanded blocks (LRU among them).
+        still_needed = num_blocks - len(result)
+        fell_back = False
+        if still_needed > 0:
+            result.extend(queue.popleft_n(still_needed))
+            fell_back = True
+
+        elapsed_us = (time.perf_counter() - t0) * 1e6
+        logger.info(
+            "demand_aware_eviction: %.1f us | requested=%d walked=%d "
+            "deferred=%d fell_back=%s free_remaining=%d "
+            "tracked_hashes=%d",
+            elapsed_us, num_blocks, blocks_walked,
+            len(deferred), fell_back, queue.num_free_blocks,
+            tracker.num_tracked_hashes,
+        )
+
+        return result
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -388,6 +466,11 @@ class BlockPool:
             return False
 
         block.reset_hash()
+
+        # EXP 2: log GPU evict event when VLLM_TIER_LOG is set.
+        tlog = _get_tier_logger()
+        if tlog is not None:
+            tlog.log_event("gpu_evict", get_block_hash(block_hash), "gpu")
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(

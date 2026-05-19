@@ -19,6 +19,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.block_logger import BlockEventLogger
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -680,6 +681,25 @@ def get_request_block_hasher(
             )
 
             new_block_hashes.append(block_hash)
+
+            # Experiment 1 instrumentation: log block creation when
+            # VLLM_BLOCK_LOG is set.
+            blog = BlockEventLogger.get()
+            if blog is not None:
+                phase = (
+                    "prefill"
+                    if start_token_idx < request.num_prompt_tokens
+                    else "decode"
+                )
+                blog.log_block(
+                    block_hash=block_hash,
+                    parent_hash=prev_block_hash_value,
+                    request_id=request.request_id,
+                    block_index=start_token_idx // block_size,
+                    num_tokens=block_size,
+                    phase=phase,
+                )
+
             start_token_idx += block_size
             prev_block_hash_value = block_hash
 

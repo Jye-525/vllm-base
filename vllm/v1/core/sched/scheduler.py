@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -33,8 +34,10 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.demand_tracker import DemandTracker
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.request_logger import RequestEventLogger
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -239,6 +242,20 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+
+        # Demand-aware eviction: track which block hashes are needed by
+        # waiting requests so that the block pool can prefer evicting
+        # blocks that no future request will use. Gated by
+        # VLLM_DEMAND_AWARE_EVICTION=1 (default) and requires prefix caching.
+        demand_aware_enabled = (
+            self.cache_config.enable_prefix_caching
+            and os.environ.get("VLLM_DEMAND_AWARE_EVICTION", "1") != "0"
+        )
+        if demand_aware_enabled:
+            self.demand_tracker: DemandTracker | None = DemandTracker()
+            self.kv_cache_manager.block_pool.demand_tracker = self.demand_tracker
+        else:
+            self.demand_tracker = None
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -760,6 +777,8 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                if self.demand_tracker is not None and request.block_hashes:
+                    self.demand_tracker.remove_request(request.block_hashes)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -947,6 +966,8 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        if self.demand_tracker is not None and request.block_hashes:
+            self.demand_tracker.add_request(request.block_hashes)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1615,6 +1636,8 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+        if self.demand_tracker is not None and request.block_hashes:
+            self.demand_tracker.add_request(request.block_hashes)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
@@ -1823,6 +1846,10 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            if self.demand_tracker is not None:
+                for req in waiting_requests_to_remove:
+                    if req.block_hashes:
+                        self.demand_tracker.remove_request(req.block_hashes)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -1843,6 +1870,10 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        request_logger = RequestEventLogger.get()
+        if request_logger is not None:
+            request_logger.log_request(request)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
