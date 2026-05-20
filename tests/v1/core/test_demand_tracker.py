@@ -145,7 +145,7 @@ class TestDemandAwareEviction:
         """Simulate caching a block: assign a hash and register in cache map."""
         bhg = _bhg(tag, group_id)
         block.block_hash = bhg
-        pool.cached_block_hash_to_block.add(bhg, block)
+        pool.cached_block_hash_to_block.insert(bhg, block)
 
     def test_evicts_zero_demand_before_positive(self):
         """With mixed demand, zero-demand blocks should be evicted first."""
@@ -238,27 +238,5 @@ class TestDemandAwareEviction:
         assert len(new_blocks) == 1
         assert new_blocks[0].block_hash is None  # the uncached one
 
-    def test_orphaned_blocks_evicted_first(self):
-        """Orphaned blocks (parent evicted) should be evicted before
-        zero-demand cached blocks."""
-        pool = self._make_pool(6)
-        tracker = pool.demand_tracker
-
-        blocks = pool.free_block_queue.popleft_n(3)
-
-        # Cache all 3 blocks
-        for i, block in enumerate(blocks):
-            self._cache_block(pool, block, f"o_{i}".encode())
-            block.ref_cnt = 0
-            pool.free_block_queue.append(block)
-
-        # Mark block 1 as orphaned
-        pool._orphaned.add(_bh(b"o_1"))
-
-        # Evict 1 block — should be the orphaned one
-        new_blocks = pool._pop_blocks_demand_aware(1)
-        assert len(new_blocks) == 1
-
-        from vllm.v1.core.kv_cache_utils import get_block_hash
-        evicted_hash = get_block_hash(new_blocks[0].block_hash)
-        assert evicted_hash == _bh(b"o_1")
+    # NOTE: test_orphaned_blocks_evicted_first removed — orphan probe (EXP 4)
+    # was intentionally not ported from the v0.15.0-era KVReuse fork.

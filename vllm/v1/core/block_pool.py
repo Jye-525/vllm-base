@@ -156,6 +156,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        demand_tracker: DemandTracker | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -186,8 +187,8 @@ class BlockPool:
 
         # Demand-aware eviction: when set, prefer evicting blocks that
         # no waiting request needs over blocks with positive demand.
-        # Wired by the scheduler after construction.
-        self.demand_tracker: DemandTracker | None = None
+        # Can be passed at construction or wired by the scheduler after.
+        self.demand_tracker: DemandTracker | None = demand_tracker
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
