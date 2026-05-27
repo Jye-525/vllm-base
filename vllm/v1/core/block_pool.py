@@ -14,7 +14,6 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.demand_tracker import DemandTracker
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -157,7 +156,6 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        demand_tracker: DemandTracker | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -186,9 +184,19 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Demand-aware eviction: when set, prefer evicting blocks that
-        # no waiting request needs over blocks with positive demand.
-        self.demand_tracker = demand_tracker
+        # Eviction policy: "score" uses waiting-queue-aware victim
+        # selection (_select_victims_scored); "lru" uses stock popleft_n
+        # (the baseline). Set by the scheduler at startup; defaults to
+        # plain LRU so the pool behaves like stock vLLM until told
+        # otherwise.
+        self._eviction_policy: str = "lru"
+
+        # Waiting-queue demand scores, published by the scheduler once
+        # per schedule() step. score[h] = sum gamma**p over the
+        # positions p of waiting requests whose contiguous cached prefix
+        # includes h. Higher = reused sooner / by more waiters = keep.
+        # An empty dict degenerates scored eviction to plain LRU.
+        self._demand_scores: dict[BlockHash, float] = {}
 
         # Orphan tracking: parent_hash -> set of child hashes.
         # A block is orphaned when its prefix (parent) is evicted,
@@ -197,28 +205,21 @@ class BlockPool:
         self._children: dict[BlockHash, set[BlockHash]] = defaultdict(set)
         self._orphaned: set[BlockHash] = set()
 
-        # Imminent set: block hashes belonging to the top-K waiters in
-        # the scheduling queue, published by the scheduler at the start
-        # of each schedule() step. Among demanded blocks, those NOT in
-        # this set are evicted before those that are. An empty set
-        # degenerates to the original demand-aware behavior.
-        self._imminent_hashes: set[BlockHash] = set()
+        # Scored-eviction effectiveness counters. Pure observability —
+        # they do not influence eviction.
+        self.scored_hits: int = 0          # hits on positively-scored blocks
+        self.scored_protected: int = 0     # size of last published score dict
+        self.scored_publishes: int = 0
 
-        # Imminent-protection effectiveness counters. Updated as the
-        # imminent set is republished and as get_cached_block observes
-        # hits on protected hashes. Pure observability — does not
-        # influence eviction.
-        self.imminent_hits: int = 0
-        self.imminent_total_protected: int = 0
-        self.imminent_publishes: int = 0
+    def set_demand_scores(self, scores: dict[BlockHash, float]) -> None:
+        """Publish the per-block demand scores used by scored eviction.
 
-    def set_imminent_hashes(self, hashes: set[BlockHash]) -> None:
-        """Publish the imminent block-hash set used by demand-aware
-        eviction. Pass an empty set to disable the imminent split.
+        Pass an empty dict to fall back to plain LRU ordering (e.g. when
+        the waiting queue is empty).
         """
-        self._imminent_hashes = hashes
-        self.imminent_total_protected = len(hashes)
-        self.imminent_publishes += 1
+        self._demand_scores = scores
+        self.scored_protected = len(scores)
+        self.scored_publishes += 1
 
     def classify_chain(
         self,
@@ -292,8 +293,8 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
-        if block_hash in self._imminent_hashes:
-            self.imminent_hits += 1
+        if block_hash in self._demand_scores:
+            self.scored_hits += 1
         return cached_blocks
 
     def cache_full_blocks(
@@ -440,9 +441,11 @@ class BlockPool:
 
         Note that we do not check block cache in this function.
 
-        When a DemandTracker is configured, blocks with zero demand from
-        waiting requests are evicted first. Blocks that future requests
-        will need are preserved as long as zero-demand blocks are available.
+        Under the "score" eviction policy, blocks the waiting queue will
+        reuse soonest (highest demand score) are protected: orphaned and
+        zero-demand blocks are evicted first, demanded blocks only under
+        pressure (lowest score first). Under "lru" (the baseline) blocks
+        are evicted in plain free-queue order.
 
         Args:
             num_blocks: The number of blocks to allocate.
@@ -454,8 +457,8 @@ class BlockPool:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
 
-        if (self.enable_caching and self.demand_tracker is not None):
-            ret = self._pop_blocks_demand_aware(num_blocks)
+        if self.enable_caching and self._eviction_policy == "score":
+            ret = self._select_victims_scored(num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
 
@@ -475,86 +478,91 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
-    def _pop_blocks_demand_aware(
+    def _select_victims_scored(
         self, num_blocks: int
     ) -> list[KVCacheBlock]:
-        """Pop blocks from the free queue with priority:
-        1. Orphaned blocks (prefix evicted, unreachable)
-        2. Zero-demand blocks (no waiting request needs them)
-        3. Demanded blocks NOT in the imminent set
-           (only far-future waiters need them)
-        4. Demanded blocks in the imminent set
-           (next admissions will hit them — last resort)
+        """Select ``num_blocks`` eviction victims using the published
+        per-block demand scores fused with LRU history.
 
-        Bands 3 and 4 are merged when the imminent set is empty,
-        recovering the original two-band demand-aware behavior.
+        Eviction priority (evict first -> last):
+          * "Cheap" blocks — uncached, orphaned, or zero-demand (no
+            waiting request needs them) — taken in LRU order (free-queue
+            head -> tail). (Orphaned blocks always have demand score 0,
+            since their evicted parent breaks every waiter's contiguous
+            cached prefix, so they fall here naturally; the explicit
+            orphaned check is just a fast path.)
+          * Demanded blocks (score > 0) — only under pressure, in
+            ascending score order (lowest protected-value first); LRU
+            breaks exact ties.
+
+        The free list is traversed once from the head (LRU order) without
+        mutating it. Cheap victims (tiers 1-2) are collected in queue
+        order; if they alone satisfy the request the walk stops early and
+        demanded blocks are never disturbed (common fast path). Only under
+        pressure do we sort the demanded candidates and evict the
+        lowest-scoring ones. Chosen victims are unlinked with
+        ``FreeKVCacheBlockQueue.remove()`` so survivors keep their LRU
+        position.
         """
         t0 = time.perf_counter()
-
-        assert self.demand_tracker is not None
-        tracker = self.demand_tracker
         queue = self.free_block_queue
-        imminent = self._imminent_hashes
+        scores = self._demand_scores
 
-        result: list[KVCacheBlock] = []
-        deferred_far: list[KVCacheBlock] = []
-        deferred_imminent: list[KVCacheBlock] = []
+        victims: list[KVCacheBlock] = []
+        # (block, score) for cached blocks with positive demand, in LRU order.
+        demanded: list[tuple[KVCacheBlock, float]] = []
 
-        # Walk queue from head (LRU). Classify each block.
-        blocks_walked = 0
-        while len(result) < num_blocks and queue.num_free_blocks > 0:
-            block = queue.popleft()
-            blocks_walked += 1
+        # Traverse head -> tail. The fake tail has next_free_block is None.
+        walked = 0
+        block = queue.fake_free_list_head.next_free_block
+        while (block is not None and block.next_free_block is not None
+               and len(victims) < num_blocks):
+            nxt = block.next_free_block
+            walked += 1
             bh = block.block_hash
             if bh is None:
-                # No hash — not cached, safe to reuse immediately.
-                result.append(block)
-                continue
-            raw_hash = get_block_hash(bh)
-            if raw_hash in self._orphaned:
-                # Orphaned — parent evicted, unreachable. Evict first.
-                result.append(block)
-            elif not tracker.has_demand(raw_hash):
-                # Zero demand — no waiting request needs this block.
-                result.append(block)
-            elif raw_hash not in imminent:
-                # Demanded only by far-future waiters: band 3.
-                deferred_far.append(block)
+                # Uncached — safe to reuse immediately.
+                victims.append(block)
             else:
-                # Demanded by an imminent (top-K) waiter: band 4.
-                deferred_imminent.append(block)
+                raw_hash = get_block_hash(bh)
+                if raw_hash in self._orphaned:
+                    victims.append(block)            # tier 1: orphaned
+                else:
+                    score = scores.get(raw_hash, 0.0)
+                    if score <= 0.0:
+                        victims.append(block)        # tier 2: zero demand (LRU)
+                    else:
+                        demanded.append((block, score))  # tier 3 candidate
+            block = nxt
 
-        # Re-append far first, then imminent, so the fallback popleft_n
-        # reaches band-3 blocks before band-4 ones. Within each band,
-        # original walk order (LRU) is preserved.
-        if deferred_far:
-            queue.append_n(deferred_far)
-        if deferred_imminent:
-            queue.append_n(deferred_imminent)
+        # Tier 3: only consumed when cheap victims were insufficient. In
+        # that case the loop above ran to the tail, so `demanded` holds
+        # every demanded block. Sort ascending by score (stable sort keeps
+        # LRU order among ties) and evict the lowest-scoring ones.
+        still_needed = num_blocks - len(victims)
+        used_demanded = 0
+        if still_needed > 0 and demanded:
+            demanded.sort(key=lambda t: t[1])
+            take = [blk for blk, _ in demanded[:still_needed]]
+            victims.extend(take)
+            used_demanded = len(take)
 
-        # If we still need more, take demanded blocks (band 3 first,
-        # then band 4) via plain popleft_n.
-        still_needed = num_blocks - len(result)
-        fell_back = False
-        if still_needed > 0:
-            result.extend(queue.popleft_n(still_needed))
-            fell_back = True
+        # Unlink victims; survivors retain their LRU position.
+        for blk in victims:
+            queue.remove(blk)
 
         elapsed_us = (time.perf_counter() - t0) * 1e6
         logger.info(
-            "demand_aware_eviction: %.1f us | requested=%d walked=%d "
-            "deferred_far=%d deferred_imminent=%d fell_back=%s "
-            "free_remaining=%d tracked_hashes=%d imminent=%d "
-            "orphaned=%d imm_hits=%d imm_protected=%d imm_publishes=%d",
-            elapsed_us, num_blocks, blocks_walked,
-            len(deferred_far), len(deferred_imminent), fell_back,
-            queue.num_free_blocks, tracker.num_tracked_hashes,
-            len(imminent), len(self._orphaned),
-            self.imminent_hits, self.imminent_total_protected,
-            self.imminent_publishes,
+            "scored_eviction: %.1f us | requested=%d walked=%d "
+            "demanded_seen=%d demanded_evicted=%d free_remaining=%d "
+            "scored_protected=%d orphaned=%d scored_hits=%d publishes=%d",
+            elapsed_us, num_blocks, walked,
+            len(demanded), used_demanded, queue.num_free_blocks,
+            self.scored_protected, len(self._orphaned),
+            self.scored_hits, self.scored_publishes,
         )
 
-        return result
+        return victims
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -680,9 +688,10 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Clear orphan tracking state.
+        # Clear orphan tracking and published demand scores.
         self._children.clear()
         self._orphaned.clear()
+        self._demand_scores = {}
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

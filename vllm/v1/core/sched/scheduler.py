@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -33,7 +33,8 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.demand_tracker import DemandTracker
+from vllm.v1.core.eviction_scorer import compute_demand_scores
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.request_logger import RequestEventLogger
@@ -242,38 +243,42 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
-        # Demand-aware eviction: track which block hashes are needed by
-        # waiting requests so that the block pool can prefer evicting
-        # blocks that no future request will use.
+        # Waiting-queue-aware eviction. Each schedule() step the scheduler
+        # turns the waiting queue into a per-block demand score
+        #   score[h] = sum gamma**p over waiters p whose contiguous cached
+        #              prefix includes h
+        # and publishes it to the block pool, which protects high-score
+        # blocks from eviction (see eviction_scorer.compute_demand_scores
+        # and BlockPool._select_victims_scored).
+        #   VLLM_EVICTION_POLICY : "score" (default) | "lru" (stock baseline)
+        #   VLLM_EVICTION_GAMMA  : position-decay factor in (0, 1], default 0.9
+        #   VLLM_EVICTION_MAX_WAITERS : cap on waiters scanned per step
         import os
-        demand_aware_enabled = (
-            self.cache_config.enable_prefix_caching
-            and os.environ.get("VLLM_DEMAND_AWARE_EVICTION", "1") != "0"
-        )
-        if demand_aware_enabled:
-            self.demand_tracker: DemandTracker | None = DemandTracker()
-            self.kv_cache_manager.block_pool.demand_tracker = (
-                self.demand_tracker)
-        else:
-            self.demand_tracker = None
-
-        # Imminent set: each scheduling step, compute K adaptively from
-        # the free-block budget (how many head waiters' new blocks fit),
-        # then publish the per-waiter contiguous-cached prefix as the
-        # imminent set. VLLM_IMMINENT_K_MIN (default 1) is the floor: at
-        # least the first K_MIN waiters are always protected so the
-        # cache stays warm even when the queue is budget-starved.
-        # Setting K_MIN=0 disables the imminent split entirely (bands 3
-        # and 4 merge in _pop_blocks_demand_aware).
+        policy = os.environ.get("VLLM_EVICTION_POLICY", "score").strip().lower()
+        if not self.cache_config.enable_prefix_caching:
+            policy = "lru"
+        self._eviction_policy: str = policy if policy in ("score", "lru") \
+            else "score"
         try:
-            self._imminent_k_min: int = max(
-                0, int(os.environ.get("VLLM_IMMINENT_K_MIN", "1")))
+            self._eviction_gamma: float = float(
+                os.environ.get("VLLM_EVICTION_GAMMA", "0.9"))
         except ValueError:
-            self._imminent_k_min = 1
-        # KV cache group ids used for existence checks during truncation.
-        self._imminent_group_ids: tuple[int, ...] = tuple(
+            self._eviction_gamma = 0.9
+        # Clamp to (0, 1]; 0 would zero out every position including p=0.
+        self._eviction_gamma = min(1.0, max(1e-6, self._eviction_gamma))
+        try:
+            self._eviction_max_waiters: int = max(
+                1, int(os.environ.get("VLLM_EVICTION_MAX_WAITERS", "256")))
+        except ValueError:
+            self._eviction_max_waiters = 256
+        # Far waiters whose gamma**p falls below this contribute negligibly.
+        self._eviction_epsilon: float = 1e-3
+        # KV cache group ids used for existence checks during prefix truncation.
+        self._eviction_group_ids: tuple[int, ...] = tuple(
             range(len(kv_cache_config.kv_cache_groups))
         ) or (0,)
+        # Tell the block pool which eviction policy to use.
+        self.kv_cache_manager.block_pool._eviction_policy = self._eviction_policy
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -361,85 +366,53 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
-    def _publish_imminent_hashes(self) -> None:
-        """Compute and publish the imminent block-hash set used by
-        demand-aware eviction.
+    def _publish_demand_scores(self) -> None:
+        """Compute and publish per-block demand scores from the waiting
+        queue, once per schedule() step.
 
-        For each head waiter we ask BlockPool.classify_chain for two
-        signals in a single pass:
-          - cached_prefix_len: how far the waiter's prefix is currently
-            cached contiguously. Past the first miss, downstream blocks
-            cannot be reused by this waiter (vLLM v1 uses contiguous
-            prefix matching), so we truncate the imminent contribution
-            at this length.
-          - active_hits: how many of the waiter's hashes are cached AND
-            held by a running request (ref_cnt > 0). Those blocks are
-            not in the free queue, so they do not consume free-queue
-            budget when this waiter admits.
+        For each waiter at position ``p`` (``p == 0`` is scheduled next),
+        ``BlockPool.classify_chain`` gives its contiguous cached prefix —
+        the cached blocks it will reuse (vLLM v1 only reuses contiguous
+        prefixes, so we truncate at the first miss). Each such hash
+        accumulates ``gamma ** p`` (see eviction_scorer.compute_demand_scores).
 
-        K is the largest prefix of the waiting queue whose cumulative
-        new-block need (total - active_hits) fits in the current free
-        block budget, clamped up to K_MIN to avoid full collapse.
+        Scanning stops after ``VLLM_EVICTION_MAX_WAITERS`` waiters or once
+        ``gamma ** p`` falls below epsilon (far waiters contribute
+        negligibly), keeping the per-step cost bounded.
         """
-        if self.demand_tracker is None:
+        if self._eviction_policy != "score":
             return
         block_pool = self.kv_cache_manager.block_pool
-
-        k_min = self._imminent_k_min
-        if k_min == 0:
-            # Hard kill switch: revert to plain demand-aware (bands 3/4
-            # merge in _pop_blocks_demand_aware when imminent is empty).
-            block_pool.set_imminent_hashes(set())
-            return
-
         if not self.waiting:
-            block_pool.set_imminent_hashes(set())
+            block_pool.set_demand_scores({})
             return
 
-        group_ids = self._imminent_group_ids
-        budget = block_pool.free_block_queue.num_free_blocks
+        group_ids = self._eviction_group_ids
+        gamma = self._eviction_gamma
+        eps = self._eviction_epsilon
+        max_waiters = self._eviction_max_waiters
 
-        cum_need = 0
-        k_budget = 0
-        budget_exhausted = False
-        # Cache (cached_prefix_len, hashes) per waiter so we don't walk
-        # the chain twice.
-        classified: list[tuple[int, Any]] = []
-
+        # Contiguous cached prefix per waiter, in queue order. Empty entries
+        # still hold a position so later waiters keep the right gamma ** p.
+        prefixes: list[Sequence[BlockHash]] = []
+        weight = 1.0
         for i, req in enumerate(self.waiting):
-            # Stop classifying once both the budget is exhausted and we
-            # have classified enough waiters to satisfy the K_MIN floor.
-            if budget_exhausted and i >= k_min:
+            if i >= max_waiters or weight < eps:
                 break
             hashes = req.block_hashes
-            if not hashes:
-                classified.append((0, hashes))
-                if not budget_exhausted:
-                    k_budget = i + 1
-                continue
-            cached_prefix_len, active_hits = block_pool.classify_chain(
-                hashes, group_ids
-            )
-            classified.append((cached_prefix_len, hashes))
-            if budget_exhausted:
-                continue
-            new_need = len(hashes) - active_hits
-            if cum_need + new_need > budget:
-                budget_exhausted = True
-                continue
-            cum_need += new_need
-            k_budget = i + 1
+            if hashes:
+                cached_prefix_len, _ = block_pool.classify_chain(
+                    hashes, group_ids
+                )
+                prefixes.append(
+                    hashes[:cached_prefix_len] if cached_prefix_len > 0 else ()
+                )
+            else:
+                prefixes.append(())
+            weight *= gamma
 
-        k = max(k_budget, k_min)
-        if k == 0:
-            block_pool.set_imminent_hashes(set())
-            return
-
-        imminent: set = set()
-        for cached_prefix_len, hashes in classified[:k]:
-            if cached_prefix_len > 0:
-                imminent.update(hashes[:cached_prefix_len])
-        block_pool.set_imminent_hashes(imminent)
+        scores = compute_demand_scores(prefixes, gamma, eps)
+        block_pool.set_demand_scores(scores)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -453,10 +426,10 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        # Compute the imminent set once per scheduling step. Both
+        # Publish per-block demand scores once per scheduling step. Both
         # running-request growth and waiting-request admission can
         # trigger eviction below, so this needs to be set before either.
-        self._publish_imminent_hashes()
+        self._publish_demand_scores()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -882,10 +855,6 @@ class Scheduler(SchedulerInterface):
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
-                if (self.demand_tracker is not None
-                        and request.block_hashes):
-                    self.demand_tracker.remove_request(
-                        request.block_hashes)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1073,9 +1042,6 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
-        if (self.demand_tracker is not None
-                and request.block_hashes):
-            self.demand_tracker.add_request(request.block_hashes)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1902,8 +1868,6 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
-            if self.demand_tracker is not None and request.block_hashes:
-                self.demand_tracker.add_request(request.block_hashes)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1954,12 +1918,6 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
-            # Update demand tracker for requests leaving the waiting queue
-            if self.demand_tracker is not None:
-                for req in waiting_requests_to_remove:
-                    if req.block_hashes:
-                        self.demand_tracker.remove_request(
-                            req.block_hashes)
 
         # Second pass: set status and free requests
         for request in valid_requests:
