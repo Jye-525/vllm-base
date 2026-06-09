@@ -3,8 +3,8 @@
 """Tests for waiting-queue-aware (demand-score) GPU prefix-cache eviction.
 
 Covers:
-  * compute_demand_scores      — the pure scoring formula (gamma sweep,
-                                  empty-prefix position advance, epsilon cutoff)
+  * compute_demand_scores      — additive mixture scoring (position, reuse,
+                                  chain-loss depth, epsilon cutoff)
   * BlockPool._select_victims_scored — tiered victim selection (cheap blocks
                                   first in LRU order, demanded blocks by
                                   ascending score, survivor LRU preserved)
@@ -85,34 +85,78 @@ class TestComputeDemandScores:
     def test_empty_queue(self):
         assert compute_demand_scores([], 0.9) == {}
 
-    def test_ae_example_gamma_0_9(self):
+    def test_ae_example_additive_default(self):
         s = compute_demand_scores(_AE_PREFIXES, 0.9)
-        assert s[A] == pytest.approx(2.71)   # 1 + .9 + .81
-        assert s[B] == pytest.approx(1.90)   # 1 + .9
-        assert s[C] == pytest.approx(1.00)   # 1
-        assert s[D] == pytest.approx(0.81)   # .9**2
-        assert s[E] == pytest.approx(0.729)  # .9**3
+        assert s[A] == pytest.approx(1.0)
+        assert s[B] == pytest.approx((1.0 + 2 / 3 + 2 / 3) / 3)
+        assert s[C] == pytest.approx((1.0 + 1 / 3 + 1 / 3) / 3)
+        assert s[D] == pytest.approx((0.81 + 1 / 3 + 0.5) / 3)
+        assert s[E] == pytest.approx((0.729 + 1 / 3 + 1.0) / 3)
 
-    def test_gamma_one_is_demand_count(self):
-        """gamma == 1 weights every position equally -> pure popularity."""
-        s = compute_demand_scores(_AE_PREFIXES, 1.0)
+    def test_position_weight_only_is_nearest_reuse(self):
+        s = compute_demand_scores(
+            _AE_PREFIXES,
+            0.9,
+            position_weight=1.0,
+            reuse_weight=0.0,
+            depth_weight=0.0,
+        )
+        assert s[A] == pytest.approx(1.0)
+        assert s[B] == pytest.approx(1.0)
+        assert s[C] == pytest.approx(1.0)
+        assert s[D] == pytest.approx(0.81)
+        assert s[E] == pytest.approx(0.729)
+
+    def test_reuse_weight_only_is_normalized_frequency(self):
+        s = compute_demand_scores(
+            _AE_PREFIXES,
+            0.9,
+            position_weight=0.0,
+            reuse_weight=1.0,
+            depth_weight=0.0,
+        )
+        assert s[A] == pytest.approx(1.0)
+        assert s[B] == pytest.approx(2 / 3)
+        assert s[C] == pytest.approx(1 / 3)
+        assert s[D] == pytest.approx(1 / 3)
+        assert s[E] == pytest.approx(1 / 3)
+
+    def test_chain_loss_depth_weight_only(self):
+        s = compute_demand_scores(
+            [[A, B, C]],
+            0.9,
+            position_weight=0.0,
+            reuse_weight=0.0,
+            depth_weight=1.0,
+        )
+        assert s[A] == pytest.approx(1.0)
+        assert s[B] == pytest.approx(2 / 3)
+        assert s[C] == pytest.approx(1 / 3)
+
+    def test_raw_chain_loss_depth_mode(self):
+        s = compute_demand_scores(
+            [[A, B, C]],
+            0.9,
+            position_weight=0.0,
+            reuse_weight=0.0,
+            depth_weight=1.0,
+            depth_mode="chain_loss",
+        )
         assert s[A] == pytest.approx(3.0)
         assert s[B] == pytest.approx(2.0)
         assert s[C] == pytest.approx(1.0)
-        assert s[D] == pytest.approx(1.0)
-        assert s[E] == pytest.approx(1.0)
-
-    def test_tiny_gamma_is_soonest_only(self):
-        """gamma -> 0 collapses to the next waiter only (Belady-style)."""
-        s = compute_demand_scores(_AE_PREFIXES, 1e-9)
-        assert set(s) == {A, B, C}        # only R0's prefix
-        assert s[A] == pytest.approx(1.0)
 
     def test_empty_prefix_still_advances_position(self):
         """A waiter with no cached prefix consumes its position so later
         waiters keep the correct gamma ** p weight."""
-        s = compute_demand_scores([[A], [], [A]], 0.5)
-        assert s[A] == pytest.approx(1.0 + 0.25)  # pos 0 + pos 2 (not pos 1)
+        s = compute_demand_scores(
+            [[B], [], [A]],
+            0.5,
+            position_weight=1.0,
+            reuse_weight=0.0,
+            depth_weight=0.0,
+        )
+        assert s[A] == pytest.approx(0.25)  # pos 2 (not pos 1)
 
     def test_epsilon_cutoff_bounds_positions(self):
         """Once gamma ** p < epsilon, far waiters stop contributing."""

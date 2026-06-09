@@ -244,15 +244,18 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         # Waiting-queue-aware eviction. Each schedule() step the scheduler
-        # turns the waiting queue into a per-block demand score
-        #   score[h] = sum gamma**p over waiters p whose contiguous cached
-        #              prefix includes h
-        # and publishes it to the block pool, which protects high-score
-        # blocks from eviction (see eviction_scorer.compute_demand_scores
-        # and BlockPool._select_victims_scored).
+        # turns the waiting queue into a per-block demand score and publishes
+        # it to the block pool, which protects high-score blocks from eviction
+        # (see eviction_scorer.compute_demand_scores and
+        # BlockPool._select_victims_scored).
         #   VLLM_EVICTION_POLICY : "score" (default) | "lru" (stock baseline)
         #   VLLM_EVICTION_GAMMA  : position-decay factor in (0, 1], default 0.9
         #   VLLM_EVICTION_MAX_WAITERS : cap on waiters scanned per step
+        #   VLLM_EVICTION_WEIGHT_POSITION : mixture weight for nearest reuse
+        #   VLLM_EVICTION_WEIGHT_REUSE    : mixture weight for reuse count
+        #   VLLM_EVICTION_WEIGHT_DEPTH    : mixture weight for chain-loss depth
+        #   VLLM_EVICTION_DEPTH_ALPHA     : chain-loss exponent
+        #   VLLM_EVICTION_DEPTH_MODE      : "chain_loss_norm" | "chain_loss"
         import os
         policy = os.environ.get("VLLM_EVICTION_POLICY", "score").strip().lower()
         if not self.cache_config.enable_prefix_caching:
@@ -273,6 +276,37 @@ class Scheduler(SchedulerInterface):
             self._eviction_max_waiters = 256
         # Far waiters whose gamma**p falls below this contribute negligibly.
         self._eviction_epsilon: float = 1e-3
+        try:
+            self._eviction_position_weight: float = float(
+                os.environ.get("VLLM_EVICTION_WEIGHT_POSITION",
+                               str(1.0 / 3.0)))
+        except ValueError:
+            self._eviction_position_weight = 1.0 / 3.0
+        try:
+            self._eviction_reuse_weight: float = float(
+                os.environ.get("VLLM_EVICTION_WEIGHT_REUSE",
+                               str(1.0 / 3.0)))
+        except ValueError:
+            self._eviction_reuse_weight = 1.0 / 3.0
+        try:
+            self._eviction_depth_weight: float = float(
+                os.environ.get("VLLM_EVICTION_WEIGHT_DEPTH",
+                               str(1.0 / 3.0)))
+        except ValueError:
+            self._eviction_depth_weight = 1.0 / 3.0
+        try:
+            self._eviction_depth_alpha: float = float(
+                os.environ.get("VLLM_EVICTION_DEPTH_ALPHA", "1.0"))
+        except ValueError:
+            self._eviction_depth_alpha = 1.0
+        self._eviction_depth_alpha = max(0.0, self._eviction_depth_alpha)
+        depth_mode = os.environ.get(
+            "VLLM_EVICTION_DEPTH_MODE", "chain_loss_norm").strip().lower()
+        self._eviction_depth_mode: str = (
+            depth_mode
+            if depth_mode in ("chain_loss_norm", "chain_loss")
+            else "chain_loss_norm"
+        )
         # KV cache group ids used for existence checks during prefix truncation.
         self._eviction_group_ids: tuple[int, ...] = tuple(
             range(len(kv_cache_config.kv_cache_groups))
@@ -369,16 +403,6 @@ class Scheduler(SchedulerInterface):
     def _publish_demand_scores(self) -> None:
         """Compute and publish per-block demand scores from the waiting
         queue, once per schedule() step.
-
-        For each waiter at position ``p`` (``p == 0`` is scheduled next),
-        ``BlockPool.classify_chain`` gives its contiguous cached prefix —
-        the cached blocks it will reuse (vLLM v1 only reuses contiguous
-        prefixes, so we truncate at the first miss). Each such hash
-        accumulates ``gamma ** p`` (see eviction_scorer.compute_demand_scores).
-
-        Scanning stops after ``VLLM_EVICTION_MAX_WAITERS`` waiters or once
-        ``gamma ** p`` falls below epsilon (far waiters contribute
-        negligibly), keeping the per-step cost bounded.
         """
         if self._eviction_policy != "score":
             return
@@ -392,8 +416,7 @@ class Scheduler(SchedulerInterface):
         eps = self._eviction_epsilon
         max_waiters = self._eviction_max_waiters
 
-        # Contiguous cached prefix per waiter, in queue order. Empty entries
-        # still hold a position so later waiters keep the right gamma ** p.
+        # Extract scheduler-visible reusable prefixes from the waiting list.
         prefixes: list[Sequence[BlockHash]] = []
         weight = 1.0
         for i, req in enumerate(self.waiting):
@@ -401,6 +424,8 @@ class Scheduler(SchedulerInterface):
                 break
             hashes = req.block_hashes
             if hashes:
+                # check how much of a waiting request's prefix is actually reusable from the prefix cache.
+                # cached_prefix_len = number of consecutive block hashes
                 cached_prefix_len, _ = block_pool.classify_chain(
                     hashes, group_ids
                 )
@@ -411,7 +436,17 @@ class Scheduler(SchedulerInterface):
                 prefixes.append(())
             weight *= gamma
 
-        scores = compute_demand_scores(prefixes, gamma, eps)
+        # Compute the score for each common block
+        scores = compute_demand_scores(
+            prefixes,
+            gamma,
+            eps,
+            position_weight=self._eviction_position_weight,
+            reuse_weight=self._eviction_reuse_weight,
+            depth_weight=self._eviction_depth_weight,
+            depth_alpha=self._eviction_depth_alpha,
+            depth_mode=self._eviction_depth_mode,
+        )
         block_pool.set_demand_scores(scores)
 
     def schedule(self) -> SchedulerOutput:
