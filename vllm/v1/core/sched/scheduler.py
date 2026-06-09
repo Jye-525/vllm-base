@@ -254,8 +254,6 @@ class Scheduler(SchedulerInterface):
         #   VLLM_EVICTION_WEIGHT_POSITION : mixture weight for nearest reuse
         #   VLLM_EVICTION_WEIGHT_REUSE    : mixture weight for reuse count
         #   VLLM_EVICTION_WEIGHT_DEPTH    : mixture weight for chain-loss depth
-        #   VLLM_EVICTION_DEPTH_ALPHA     : chain-loss exponent
-        #   VLLM_EVICTION_DEPTH_MODE      : "chain_loss_norm" | "chain_loss"
         import os
         policy = os.environ.get("VLLM_EVICTION_POLICY", "score").strip().lower()
         if not self.cache_config.enable_prefix_caching:
@@ -294,19 +292,6 @@ class Scheduler(SchedulerInterface):
                                str(1.0 / 3.0)))
         except ValueError:
             self._eviction_depth_weight = 1.0 / 3.0
-        try:
-            self._eviction_depth_alpha: float = float(
-                os.environ.get("VLLM_EVICTION_DEPTH_ALPHA", "1.0"))
-        except ValueError:
-            self._eviction_depth_alpha = 1.0
-        self._eviction_depth_alpha = max(0.0, self._eviction_depth_alpha)
-        depth_mode = os.environ.get(
-            "VLLM_EVICTION_DEPTH_MODE", "chain_loss_norm").strip().lower()
-        self._eviction_depth_mode: str = (
-            depth_mode
-            if depth_mode in ("chain_loss_norm", "chain_loss")
-            else "chain_loss_norm"
-        )
         # KV cache group ids used for existence checks during prefix truncation.
         self._eviction_group_ids: tuple[int, ...] = tuple(
             range(len(kv_cache_config.kv_cache_groups))
@@ -444,8 +429,6 @@ class Scheduler(SchedulerInterface):
             position_weight=self._eviction_position_weight,
             reuse_weight=self._eviction_reuse_weight,
             depth_weight=self._eviction_depth_weight,
-            depth_alpha=self._eviction_depth_alpha,
-            depth_mode=self._eviction_depth_mode,
         )
         block_pool.set_demand_scores(scores)
 
