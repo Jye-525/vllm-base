@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -32,7 +31,6 @@ from vllm.v1.core.tier_logger import _get_tier_logger
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
 
 class BlockHashToBlockMap:
     """
@@ -198,12 +196,15 @@ class BlockPool:
         # An empty dict degenerates scored eviction to plain LRU.
         self._demand_scores: dict[BlockHash, float] = {}
 
-        # Orphan tracking: parent_hash -> set of child hashes.
-        # A block is orphaned when its prefix (parent) is evicted,
-        # making the block unreachable via prefix-chain lookup.
-        # Orphaned blocks are prioritized for eviction.
-        self._children: dict[BlockHash, set[BlockHash]] = defaultdict(set)
-        self._orphaned: set[BlockHash] = set()
+        # Orphan tracking is intentionally disabled for the demand-aware
+        # experiment. vLLM already frees request blocks in reverse order, so
+        # suffix blocks normally become eviction candidates before prefix
+        # blocks. Keeping an explicit orphan heuristic adds stale-state risk
+        # and can conflict with the demand score.
+        #
+        # OrphanKey = tuple[BlockHash, int]
+        # self._children: dict[OrphanKey, set[OrphanKey]] = defaultdict(set)
+        # self._orphaned: set[OrphanKey] = set()
 
         # Scored-eviction effectiveness counters. Pure observability —
         # they do not influence eviction.
@@ -369,11 +370,17 @@ class BlockPool:
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
 
-            # Register parent→child link for orphan tracking.
+            # Orphan tracking disabled; keep this as historical reference.
+            # block_key = (block_hash, kv_cache_group_id)
+            # self._orphaned.discard(block_key)
+
+            # Register parent->child link for per-group orphan tracking.
+            # Disabled for the demand-aware experiment.
             j = num_cached_blocks + i
-            if j > 0:
-                parent_hash = block_hashes[j - 1]
-                self._children[parent_hash].add(block_hash)
+            # if j > 0:
+            #     parent_hash = block_hashes[j - 1]
+            #     parent_key = (parent_hash, kv_cache_group_id)
+            #     self._children[parent_key].add(block_key)
 
             # --- EXP 2 HOOK: GPU store ---
             if (_tlog := _get_tier_logger()):
@@ -441,10 +448,11 @@ class BlockPool:
 
         Note that we do not check block cache in this function.
 
-        Under the "score" eviction policy, blocks the waiting queue will
-        reuse soonest (highest demand score) are protected: orphaned and
-        zero-demand blocks are evicted first, demanded blocks only under
-        pressure (lowest score first). Under "lru" (the baseline) blocks
+        Under the "score" eviction policy, positive-demand blocks are
+        protected first because the current waiting queue can reuse them.
+        Blocks with no published demand are cheap victims and are evicted in
+        LRU order. If those cheap victims are insufficient, demanded blocks
+        are evicted by ascending score. Under "lru" (the baseline), blocks
         are evicted in plain free-queue order.
 
         Args:
@@ -485,12 +493,8 @@ class BlockPool:
         per-block demand scores fused with LRU history.
 
         Eviction priority (evict first -> last):
-          * "Cheap" blocks — uncached, orphaned, or zero-demand (no
-            waiting request needs them) — taken in LRU order (free-queue
-            head -> tail). (Orphaned blocks always have demand score 0,
-            since their evicted parent breaks every waiter's contiguous
-            cached prefix, so they fall here naturally; the explicit
-            orphaned check is just a fast path.)
+          * "Cheap" blocks — uncached, zero-demand (no waiting request
+            needs them) — taken in LRU order (free-queue head -> tail).
           * Demanded blocks (score > 0) — only under pressure, in
             ascending score order (lowest protected-value first); LRU
             breaks exact ties.
@@ -525,14 +529,11 @@ class BlockPool:
                 victims.append(block)
             else:
                 raw_hash = get_block_hash(bh)
-                if raw_hash in self._orphaned:
-                    victims.append(block)            # tier 1: orphaned
+                score = scores.get(raw_hash, 0.0)
+                if score > 0.0:
+                    demanded.append((block, score))  # tier 3 candidate
                 else:
-                    score = scores.get(raw_hash, 0.0)
-                    if score <= 0.0:
-                        victims.append(block)        # tier 2: zero demand (LRU)
-                    else:
-                        demanded.append((block, score))  # tier 3 candidate
+                    victims.append(block)            # tier 1: zero demand (LRU)
             block = nxt
 
         # Tier 3: only consumed when cheap victims were insufficient. In
@@ -555,11 +556,10 @@ class BlockPool:
         logger.info(
             "scored_eviction: %.1f us | requested=%d walked=%d "
             "demanded_seen=%d demanded_evicted=%d free_remaining=%d "
-            "scored_protected=%d orphaned=%d scored_hits=%d publishes=%d",
+            "scored_protected=%d scored_hits=%d publishes=%d",
             elapsed_us, num_blocks, walked,
             len(demanded), used_demanded, queue.num_free_blocks,
-            self.scored_protected, len(self._orphaned),
-            self.scored_hits, self.scored_publishes,
+            self.scored_protected, self.scored_hits, self.scored_publishes,
         )
 
         return victims
@@ -591,14 +591,16 @@ class BlockPool:
 
         block.reset_hash()
 
-        # Update orphan tracking: mark children as orphaned since
-        # their parent prefix is no longer cached. Children become
-        # unreachable via prefix-chain lookup.
-        raw_hash = get_block_hash(block_hash)
-        self._orphaned.discard(raw_hash)
-        for child in self._children.get(raw_hash, set()):
-            self._orphaned.add(child)
-        self._children.pop(raw_hash, None)
+        # Orphan tracking disabled for demand-aware eviction. Historical
+        # implementation kept per-group parent->child state here, but the
+        # heuristic can become stale and conflict with demand scores.
+        # raw_hash = get_block_hash(block_hash)
+        # group_id = get_group_id(block_hash)
+        # block_key = (raw_hash, group_id)
+        # self._orphaned.discard(block_key)
+        # for child in self._children.get(block_key, set()):
+        #     self._orphaned.add(child)
+        # self._children.pop(block_key, None)
 
         # --- EXP 2 HOOK: GPU evict ---
         if (_tlog := _get_tier_logger()):
@@ -688,9 +690,9 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Clear orphan tracking and published demand scores.
-        self._children.clear()
-        self._orphaned.clear()
+        # Clear published demand scores. Orphan tracking is disabled.
+        # self._children.clear()
+        # self._orphaned.clear()
         self._demand_scores = {}
 
         # Remove all hashes from all blocks.

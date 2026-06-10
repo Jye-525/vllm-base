@@ -248,18 +248,21 @@ class Scheduler(SchedulerInterface):
         # it to the block pool, which protects high-score blocks from eviction
         # (see eviction_scorer.compute_demand_scores and
         # BlockPool._select_victims_scored).
-        #   VLLM_EVICTION_POLICY : "score" (default) | "lru" (stock baseline)
+        #   VLLM_EVICTION_POLICY : "lru" (default stock baseline)
+        #                          | "score"/"demand_aware" (opt-in)
         #   VLLM_EVICTION_GAMMA  : position-decay factor in (0, 1], default 0.9
         #   VLLM_EVICTION_MAX_WAITERS : cap on waiters scanned per step
         #   VLLM_EVICTION_WEIGHT_POSITION : mixture weight for nearest reuse
         #   VLLM_EVICTION_WEIGHT_REUSE    : mixture weight for reuse count
         #   VLLM_EVICTION_WEIGHT_DEPTH    : mixture weight for chain-loss depth
         import os
-        policy = os.environ.get("VLLM_EVICTION_POLICY", "score").strip().lower()
+        policy = os.environ.get("VLLM_EVICTION_POLICY", "lru").strip().lower()
+        if policy == "demand_aware":
+            policy = "score"
         if not self.cache_config.enable_prefix_caching:
             policy = "lru"
         self._eviction_policy: str = policy if policy in ("score", "lru") \
-            else "score"
+            else "lru"
         try:
             self._eviction_gamma: float = float(
                 os.environ.get("VLLM_EVICTION_GAMMA", "0.9"))
