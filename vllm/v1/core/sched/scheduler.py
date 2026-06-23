@@ -255,6 +255,12 @@ class Scheduler(SchedulerInterface):
         #   VLLM_EVICTION_WEIGHT_POSITION : mixture weight for nearest reuse
         #   VLLM_EVICTION_WEIGHT_REUSE    : mixture weight for reuse count
         #   VLLM_EVICTION_WEIGHT_DEPTH    : mixture weight for chain-loss depth
+        #   VLLM_EVICTION_REUSE_MIN_COUNT : min waiters reusing a block before
+        #                                   it receives a positive score
+        #   VLLM_EVICTION_DEMAND_MODE : "evictable_only" (default)
+        #                              | "full_prefix_evictable_output"
+        #   VLLM_EVICTION_BINARY_DEMAND : if true, collapse every positive
+        #                                 demand score to 1.0
         import os
         policy = os.environ.get("VLLM_EVICTION_POLICY", "lru").strip().lower()
         if policy == "demand_aware":
@@ -295,6 +301,22 @@ class Scheduler(SchedulerInterface):
                                str(1.0 / 3.0)))
         except ValueError:
             self._eviction_depth_weight = 1.0 / 3.0
+        try:
+            self._eviction_reuse_min_count: int = max(
+                1, int(os.environ.get("VLLM_EVICTION_REUSE_MIN_COUNT", "1")))
+        except ValueError:
+            self._eviction_reuse_min_count = 1
+        demand_mode = os.environ.get(
+            "VLLM_EVICTION_DEMAND_MODE", "evictable_only").strip().lower()
+        if demand_mode in ("full_prefix", "full_prefix_evictable",
+                           "full_prefix_evictable_output"):
+            demand_mode = "full_prefix_evictable_output"
+        elif demand_mode not in ("evictable_only", ):
+            demand_mode = "evictable_only"
+        self._eviction_demand_mode = demand_mode
+        self._eviction_binary_demand = os.environ.get(
+            "VLLM_EVICTION_BINARY_DEMAND", "0").strip().lower() in (
+                "1", "true", "yes", "on")
         # KV cache group ids used for existence checks during prefix truncation.
         self._eviction_group_ids: tuple[int, ...] = tuple(
             range(len(kv_cache_config.kv_cache_groups))
@@ -406,22 +428,61 @@ class Scheduler(SchedulerInterface):
 
         # Extract scheduler-visible reusable prefixes from the waiting list.
         prefixes: list[Sequence[BlockHash]] = []
+        eligible_hashes: set[BlockHash] | None = (
+            set() if self._eviction_demand_mode ==
+            "full_prefix_evictable_output" else None)
         weight = 1.0
+        scanned_waiters = 0
+        nonempty_prefixes = 0
+        total_cached_prefix_blocks = 0
+        total_evictable_prefix_blocks = 0
+        max_cached_prefix_blocks = 0
+        total_active_hits = 0
+        cutoff_reason = "waiting_exhausted"
+        position_buckets = [0, 0, 0, 0]
+        evictable_position_buckets = [0, 0, 0, 0]
         for i, req in enumerate(self.waiting):
-            if i >= max_waiters or weight < eps:
+            if i >= max_waiters:
+                cutoff_reason = "max_waiters"
+                break
+            if weight < eps:
+                cutoff_reason = "epsilon"
                 break
             hashes = req.block_hashes
             if hashes:
                 # check how much of a waiting request's prefix is actually reusable from the prefix cache.
                 # cached_prefix_len = number of consecutive block hashes
-                cached_prefix_len, _ = block_pool.classify_chain(
-                    hashes, group_ids
+                cached_prefix_len, active_hits, evictable_hashes = (
+                    block_pool.classify_chain(hashes, group_ids)
                 )
-                prefixes.append(
-                    hashes[:cached_prefix_len] if cached_prefix_len > 0 else ()
-                )
+                evictable_prefix_len = len(evictable_hashes)
+                if cached_prefix_len > 0:
+                    nonempty_prefixes += 1
+                    total_cached_prefix_blocks += cached_prefix_len
+                    total_evictable_prefix_blocks += evictable_prefix_len
+                    max_cached_prefix_blocks = max(
+                        max_cached_prefix_blocks, cached_prefix_len)
+                    total_active_hits += active_hits
+                    if i < 8:
+                        position_buckets[0] += cached_prefix_len
+                        evictable_position_buckets[0] += evictable_prefix_len
+                    elif i < 32:
+                        position_buckets[1] += cached_prefix_len
+                        evictable_position_buckets[1] += evictable_prefix_len
+                    elif i < 128:
+                        position_buckets[2] += cached_prefix_len
+                        evictable_position_buckets[2] += evictable_prefix_len
+                    else:
+                        position_buckets[3] += cached_prefix_len
+                        evictable_position_buckets[3] += evictable_prefix_len
+                if eligible_hashes is None:
+                    prefixes.append(evictable_hashes)
+                else:
+                    prefixes.append(hashes[:cached_prefix_len])
+                    eligible_hashes.update(evictable_hashes)
             else:
                 prefixes.append(())
+            scanned_waiters += 1
             weight *= gamma
 
         # Compute the score for each common block
@@ -432,8 +493,45 @@ class Scheduler(SchedulerInterface):
             position_weight=self._eviction_position_weight,
             reuse_weight=self._eviction_reuse_weight,
             depth_weight=self._eviction_depth_weight,
+            reuse_min_count=self._eviction_reuse_min_count,
+            eligible_hashes=eligible_hashes,
         )
+        if self._eviction_binary_demand:
+            scores = {h: 1.0 for h in scores}
         block_pool.set_demand_scores(scores)
+        if scores:
+            score_values = list(scores.values())
+            avg_score = sum(score_values) / len(score_values)
+            min_score = min(score_values)
+            max_score = max(score_values)
+        else:
+            avg_score = min_score = max_score = 0.0
+        avg_cached_prefix_blocks = (
+            total_cached_prefix_blocks / nonempty_prefixes
+            if nonempty_prefixes > 0 else 0.0)
+        logger.info(
+            "demand_publish: waiting=%d scanned=%d cutoff=%s gamma=%.4f "
+            "eps=%.1e max_waiters=%d reuse_min_count=%d mode=%s nonempty=%d "
+            "cached_blocks=%d evictable_blocks=%d "
+            "avg_cached=%.1f max_cached=%d "
+            "active_hits=%d scores=%d "
+            "score_min=%.6f score_avg=%.6f score_max=%.6f "
+            "pos_blocks_0_7=%d pos_blocks_8_31=%d "
+            "pos_blocks_32_127=%d pos_blocks_128p=%d "
+            "evictable_pos_blocks_0_7=%d evictable_pos_blocks_8_31=%d "
+            "evictable_pos_blocks_32_127=%d evictable_pos_blocks_128p=%d",
+            len(self.waiting), scanned_waiters, cutoff_reason, gamma,
+            eps, max_waiters, self._eviction_reuse_min_count,
+            self._eviction_demand_mode,
+            nonempty_prefixes,
+            total_cached_prefix_blocks, total_evictable_prefix_blocks,
+            avg_cached_prefix_blocks, max_cached_prefix_blocks,
+            total_active_hits, len(scores), min_score, avg_score, max_score,
+            position_buckets[0], position_buckets[1], position_buckets[2],
+            position_buckets[3], evictable_position_buckets[0],
+            evictable_position_buckets[1], evictable_position_buckets[2],
+            evictable_position_buckets[3],
+        )
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -897,6 +995,30 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                self.kv_cache_manager.record_local_prefix_cache_hit(
+                    request,
+                    num_new_local_computed_tokens,
+                )
+                block_size = self.kv_cache_manager.block_pool.hash_block_size
+                local_hit_blocks = num_new_local_computed_tokens // block_size
+                prompt_blocks = len(request.block_hashes)
+                first_missing_block = (
+                    local_hit_blocks if local_hit_blocks < prompt_blocks else -1)
+                logger.info(
+                    "admitted_prefix_cache: policy=%s request_id=%s "
+                    "prompt_tokens=%d prompt_blocks=%d "
+                    "local_hit_tokens=%d local_hit_blocks=%d "
+                    "hit_rate=%.6f first_missing_block=%d "
+                    "num_new_tokens=%d waiting_after_pop=%d running=%d",
+                    self._eviction_policy, request.request_id,
+                    request.num_tokens, prompt_blocks,
+                    num_new_local_computed_tokens, local_hit_blocks,
+                    (num_new_local_computed_tokens / request.num_tokens
+                     if request.num_tokens > 0 else 0.0),
+                    first_missing_block, num_new_tokens,
+                    len(self.waiting), len(self.running),
+                )
+
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -950,6 +1072,45 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
+
+        scheduled_token_values = list(num_scheduled_tokens.values())
+        prefill_tokens = 0
+        decode_tokens = 0
+        prefill_chunks: list[int] = []
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            remaining_prompt_tokens = max(
+                request.num_prompt_tokens - request.num_computed_tokens, 0)
+            req_prefill_tokens = min(num_tokens, remaining_prompt_tokens)
+            prefill_tokens += req_prefill_tokens
+            decode_tokens += num_tokens - req_prefill_tokens
+            if req_prefill_tokens > 0:
+                prefill_chunks.append(req_prefill_tokens)
+
+        scheduled_requests = len(scheduled_token_values)
+        mean_scheduled_tokens = (
+            total_num_scheduled_tokens / scheduled_requests
+            if scheduled_requests > 0 else 0.0)
+        mean_prefill_chunk = (
+            sum(prefill_chunks) / len(prefill_chunks)
+            if prefill_chunks else 0.0)
+        logger.info(
+            "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
+            "running=%d preempted=%d waiting_after=%d running_after=%d "
+            "token_budget_used=%d token_budget_max=%d "
+            "prefill_tokens=%d decode_tokens=%d max_scheduled_tokens=%d "
+            "mean_scheduled_tokens=%.1f max_prefill_chunk=%d "
+            "mean_prefill_chunk=%.1f",
+            self._eviction_policy, scheduled_requests, len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs), len(scheduled_running_reqs),
+            len(preempted_reqs), len(self.waiting), len(self.running),
+            total_num_scheduled_tokens, self.max_num_scheduled_tokens,
+            prefill_tokens, decode_tokens,
+            max(scheduled_token_values) if scheduled_token_values else 0,
+            mean_scheduled_tokens,
+            max(prefill_chunks) if prefill_chunks else 0,
+            mean_prefill_chunk,
+        )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.

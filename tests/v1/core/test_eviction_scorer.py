@@ -121,6 +121,36 @@ class TestComputeDemandScores:
         assert s[D] == pytest.approx(1 / 3)
         assert s[E] == pytest.approx(1 / 3)
 
+    def test_reuse_min_count_filters_weak_candidates(self):
+        s = compute_demand_scores(
+            _AE_PREFIXES,
+            0.9,
+            position_weight=0.0,
+            reuse_weight=1.0,
+            depth_weight=0.0,
+            reuse_min_count=2,
+        )
+        assert s[A] == pytest.approx(1.0)
+        assert s[B] == pytest.approx(2 / 3)
+        assert C not in s
+        assert D not in s
+        assert E not in s
+
+    def test_eligible_hashes_filter_output_only(self):
+        s = compute_demand_scores(
+            _AE_PREFIXES,
+            0.9,
+            position_weight=0.0,
+            reuse_weight=1.0,
+            depth_weight=0.0,
+            eligible_hashes={B, C},
+        )
+        # Reuse is normalized using full-prefix demand counts first, so B keeps
+        # its 2/3 score even though A is filtered out of the returned map.
+        assert set(s) == {B, C}
+        assert s[B] == pytest.approx(2 / 3)
+        assert s[C] == pytest.approx(1 / 3)
+
     def test_chain_loss_depth_weight_only(self):
         s = compute_demand_scores(
             [[A, B, C]],

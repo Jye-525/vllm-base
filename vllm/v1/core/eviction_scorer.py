@@ -32,7 +32,7 @@ waiters are scanned.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Container, Iterable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,8 +48,10 @@ def compute_demand_scores(
     position_weight: float = 1.0 / 3.0,
     reuse_weight: float = 1.0 / 3.0,
     depth_weight: float = 1.0 / 3.0,
+    reuse_min_count: int = 1,
     depth_alpha: float = 1.0,
     depth_mode: str = "chain_loss_norm",
+    eligible_hashes: Container[BlockHash] | None = None,
 ) -> dict[BlockHash, float]:
     """Compute per-block demand scores from the waiting queue.
 
@@ -68,8 +70,17 @@ def compute_demand_scores(
             weights are normalized internally, so they need not sum to 1.
         reuse_weight: Mixture weight for upcoming reuse frequency.
         depth_weight: Mixture weight for chain-loss depth.
+        reuse_min_count: Minimum number of waiting requests that must reuse a
+            block before it receives a positive score. Blocks below this
+            threshold remain absent from the returned map and are treated as
+            zero-demand eviction candidates.
         depth_alpha: Deprecated and ignored; kept for caller compatibility.
         depth_mode: Deprecated and ignored; kept for caller compatibility.
+        eligible_hashes: Optional output filter. When provided, demand is still
+            computed from the full ``waiter_prefixes`` input, but only hashes in
+            this container are returned. This supports full-prefix demand
+            accounting while publishing scores only for currently evictable
+            blocks.
 
     Returns:
         Mapping from block hash to its demand score. Hashes reused by no waiter
@@ -105,9 +116,24 @@ def compute_demand_scores(
     if not reuse_counts:
         return {}
 
-    max_reuse = max(reuse_counts.values())
+    reuse_min_count = max(1, int(reuse_min_count))
+    eligible_reuse_counts = {
+        h: count for h, count in reuse_counts.items()
+        if count >= reuse_min_count
+    }
+    if not eligible_reuse_counts:
+        return {}
+    max_reuse = max(eligible_reuse_counts.values())
+    if eligible_hashes is not None:
+        eligible_reuse_counts = {
+            h: count for h, count in eligible_reuse_counts.items()
+            if h in eligible_hashes
+        }
+    if not eligible_reuse_counts:
+        return {}
+
     scores: dict[BlockHash, float] = {}
-    for h, count in reuse_counts.items():
+    for h, count in eligible_reuse_counts.items():
         reuse_score = count / max_reuse
         scores[h] = (
             position_weight * position_scores[h]

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
 import time
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -195,6 +197,7 @@ class BlockPool:
         # includes h. Higher = reused sooner / by more waiters = keep.
         # An empty dict degenerates scored eviction to plain LRU.
         self._demand_scores: dict[BlockHash, float] = {}
+        self._evictable_hash_counts: dict[BlockHash, int] = {}
 
         # Orphan tracking is intentionally disabled for the demand-aware
         # experiment. vLLM already frees request blocks in reverse order, so
@@ -212,6 +215,111 @@ class BlockPool:
         self.scored_protected: int = 0     # size of last published score dict
         self.scored_publishes: int = 0
 
+        self._eviction_trace_path = os.getenv("VLLM_EVICTION_TRACE_PATH")
+        self._eviction_trace_seq = 0
+        self._eviction_trace_context: dict[str, Any] = {}
+
+    def set_eviction_trace_context(
+        self,
+        *,
+        request_id: str | None = None,
+        num_new_tokens: int | None = None,
+        num_computed_tokens: int | None = None,
+    ) -> None:
+        if not self._eviction_trace_path:
+            return
+        self._eviction_trace_context = {
+            "request_id": request_id,
+            "num_new_tokens": num_new_tokens,
+            "num_computed_tokens": num_computed_tokens,
+        }
+
+    def clear_eviction_trace_context(self) -> None:
+        self._eviction_trace_context = {}
+
+    def _trace_block_hash(self, block: KVCacheBlock) -> str:
+        if block.block_hash is None:
+            return ""
+        return bytes(get_block_hash(block.block_hash)).hex()
+
+    def _trace_eviction_selection(
+        self,
+        num_blocks: int,
+        victims: list[KVCacheBlock],
+        *,
+        walked: int | None = None,
+    ) -> None:
+        if not self._eviction_trace_path:
+            return
+        if not any(block.block_hash is not None for block in victims):
+            return
+        self._eviction_trace_seq += 1
+        rows = []
+        for idx, block in enumerate(victims):
+            raw_hash = (
+                get_block_hash(block.block_hash)
+                if block.block_hash is not None else None
+            )
+            score = (
+                self._demand_scores.get(raw_hash, 0.0)
+                if raw_hash is not None else 0.0
+            )
+            if block.block_hash is None:
+                tier = "uncached"
+            elif self._eviction_policy == "score" and score > 0.0:
+                tier = "demanded"
+            elif self._eviction_policy == "score":
+                tier = "zero_demand"
+            else:
+                tier = "lru_cached"
+            rows.append({
+                "victim_index": idx,
+                "block_id": block.block_id,
+                "block_hash": self._trace_block_hash(block),
+                "tier": tier,
+                "score": score,
+                "ref_cnt": block.ref_cnt,
+            })
+        record = {
+            "source": "vllm",
+            "event": "eviction_selection",
+            "event_index": self._eviction_trace_seq,
+            "policy": self._eviction_policy,
+            "requested_blocks": num_blocks,
+            "selected_blocks": len(victims),
+            "walked_blocks": walked,
+            "free_blocks_before_reuse": self.free_block_queue.num_free_blocks,
+            "scored_protected": self.scored_protected,
+            "scored_publishes": self.scored_publishes,
+            **self._eviction_trace_context,
+            "victims": rows,
+        }
+        trace_dir = os.path.dirname(self._eviction_trace_path)
+        if trace_dir:
+            os.makedirs(trace_dir, exist_ok=True)
+        with open(self._eviction_trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _mark_evictable(self, block_hash: BlockHashWithGroupId | None) -> None:
+        if block_hash is None:
+            return
+        raw_hash = get_block_hash(block_hash)
+        self._evictable_hash_counts[raw_hash] = (
+            self._evictable_hash_counts.get(raw_hash, 0) + 1)
+
+    def _unmark_evictable(self, block_hash: BlockHashWithGroupId | None) -> None:
+        if block_hash is None:
+            return
+        raw_hash = get_block_hash(block_hash)
+        count = self._evictable_hash_counts.get(raw_hash, 0)
+        if count <= 1:
+            self._evictable_hash_counts.pop(raw_hash, None)
+        else:
+            self._evictable_hash_counts[raw_hash] = count - 1
+
+    def is_hash_evictable(self, block_hash: BlockHash) -> bool:
+        return self._evictable_hash_counts.get(block_hash, 0) > 0
+
     def set_demand_scores(self, scores: dict[BlockHash, float]) -> None:
         """Publish the per-block demand scores used by scored eviction.
 
@@ -226,10 +334,10 @@ class BlockPool:
         self,
         hashes: Sequence[BlockHash],
         kv_cache_group_ids: Sequence[int] = (0,),
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[BlockHash]]:
         """Single-pass classifier for a waiter's prefix chain.
 
-        Returns (cached_prefix_len, active_hits):
+        Returns (cached_prefix_len, active_hits, evictable_hashes):
           cached_prefix_len: length of the longest *contiguous* prefix of
                              `hashes` for which every hash is cached in
                              every group in `kv_cache_group_ids`. vLLM v1
@@ -245,11 +353,17 @@ class BlockPool:
                              will allocate fresh blocks for those
                              positions regardless of what is cached
                              downstream (contiguous-only matching).
+          evictable_hashes:  hashes within the contiguous cached prefix that
+                             have at least one cached block with ref_cnt == 0.
+                             Demand scores only affect free-queue eviction
+                             candidates, so publishing pinned-only hashes adds
+                             scheduler overhead without changing victim choice.
         """
         cached_prefix_len = 0
         active_hits = 0
         first_group = kv_cache_group_ids[0]
         cache = self.cached_block_hash_to_block
+        evictable_hashes: list[BlockHash] = []
         for h in hashes:
             block_in_first_group: KVCacheBlock | None = None
             cached_all_groups = True
@@ -267,7 +381,9 @@ class BlockPool:
             if (block_in_first_group is not None
                     and block_in_first_group.ref_cnt > 0):
                 active_hits += 1
-        return cached_prefix_len, active_hits
+            if self.is_hash_evictable(h):
+                evictable_hashes.append(h)
+        return cached_prefix_len, active_hits, evictable_hashes
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -369,6 +485,8 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            if blk.ref_cnt == 0:
+                self._mark_evictable(block_hash_with_group_id)
 
             # Orphan tracking disabled; keep this as historical reference.
             # block_key = (block_hash, kv_cache_group_id)
@@ -469,6 +587,7 @@ class BlockPool:
             ret = self._select_victims_scored(num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
+            self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -515,6 +634,8 @@ class BlockPool:
         victims: list[KVCacheBlock] = []
         # (block, score) for cached blocks with positive demand, in LRU order.
         demanded: list[tuple[KVCacheBlock, float]] = []
+        zero_demand_cached = 0
+        uncached_seen = 0
 
         # Traverse head -> tail. The fake tail has next_free_block is None.
         walked = 0
@@ -526,6 +647,7 @@ class BlockPool:
             bh = block.block_hash
             if bh is None:
                 # Uncached — safe to reuse immediately.
+                uncached_seen += 1
                 victims.append(block)
             else:
                 raw_hash = get_block_hash(bh)
@@ -533,6 +655,7 @@ class BlockPool:
                 if score > 0.0:
                     demanded.append((block, score))  # tier 3 candidate
                 else:
+                    zero_demand_cached += 1
                     victims.append(block)            # tier 1: zero demand (LRU)
             block = nxt
 
@@ -542,9 +665,12 @@ class BlockPool:
         # LRU order among ties) and evict the lowest-scoring ones.
         still_needed = num_blocks - len(victims)
         used_demanded = 0
+        demanded_victim_scores: list[float] = []
         if still_needed > 0 and demanded:
             demanded.sort(key=lambda t: t[1])
-            take = [blk for blk, _ in demanded[:still_needed]]
+            take_with_scores = demanded[:still_needed]
+            take = [blk for blk, _ in take_with_scores]
+            demanded_victim_scores = [score for _, score in take_with_scores]
             victims.extend(take)
             used_demanded = len(take)
 
@@ -552,13 +678,37 @@ class BlockPool:
         for blk in victims:
             queue.remove(blk)
 
+        self._trace_eviction_selection(num_blocks, victims, walked=walked)
+
+        if demanded:
+            demanded_scores = [score for _, score in demanded]
+            demanded_min = min(demanded_scores)
+            demanded_avg = sum(demanded_scores) / len(demanded_scores)
+            demanded_max = max(demanded_scores)
+        else:
+            demanded_min = demanded_avg = demanded_max = 0.0
+        if demanded_victim_scores:
+            victim_score_min = min(demanded_victim_scores)
+            victim_score_avg = (
+                sum(demanded_victim_scores) / len(demanded_victim_scores))
+            victim_score_max = max(demanded_victim_scores)
+        else:
+            victim_score_min = victim_score_avg = victim_score_max = 0.0
+
         elapsed_us = (time.perf_counter() - t0) * 1e6
         logger.info(
             "scored_eviction: %.1f us | requested=%d walked=%d "
             "demanded_seen=%d demanded_evicted=%d free_remaining=%d "
+            "uncached_seen=%d zero_demand_cached=%d "
+            "demanded_score_min=%.6f demanded_score_avg=%.6f "
+            "demanded_score_max=%.6f victim_score_min=%.6f "
+            "victim_score_avg=%.6f victim_score_max=%.6f "
             "scored_protected=%d scored_hits=%d publishes=%d",
             elapsed_us, num_blocks, walked,
             len(demanded), used_demanded, queue.num_free_blocks,
+            uncached_seen, zero_demand_cached, demanded_min, demanded_avg,
+            demanded_max, victim_score_min, victim_score_avg,
+            victim_score_max,
             self.scored_protected, self.scored_hits, self.scored_publishes,
         )
 
@@ -589,6 +739,8 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        if block.ref_cnt == 0:
+            self._unmark_evictable(block_hash)
         block.reset_hash()
 
         # Orphan tracking disabled for demand-aware eviction. Historical
@@ -630,6 +782,7 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                self._unmark_evictable(block.block_hash)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -645,7 +798,11 @@ class BlockPool:
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
+            was_in_use = block.ref_cnt > 0
             block.ref_cnt -= 1
+            if (was_in_use and block.ref_cnt == 0 and not block.is_null
+                    and block.block_hash is not None):
+                self._mark_evictable(block.block_hash)
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -694,6 +851,7 @@ class BlockPool:
         # self._children.clear()
         # self._orphaned.clear()
         self._demand_scores = {}
+        self._evictable_hash_counts = {}
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

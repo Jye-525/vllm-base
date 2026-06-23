@@ -229,6 +229,19 @@ class KVCacheManager:
             )
         )
 
+        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def record_local_prefix_cache_hit(
+        self,
+        request: Request,
+        num_new_computed_tokens: int,
+    ) -> None:
+        """Record local prefix-cache hits for an admitted request.
+
+        Prefix-cache lookup can happen before request admission. Keep the
+        accounting here so failed admission attempts do not inflate hit stats
+        or block-event logs.
+        """
         # -- Experiment 1 instrumentation: log cache hits --
         if num_new_computed_tokens > 0 and (_blog := _get_block_logger()):
             block_size = self.coordinator.block_pool.hash_block_size
@@ -246,8 +259,6 @@ class KVCacheManager:
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
             )
-
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def allocate_slots(
         self,
@@ -404,25 +415,33 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-            )
-
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
+        self.block_pool.set_eviction_trace_context(
+            request_id=request.request_id,
+            num_new_tokens=num_new_tokens,
+            num_computed_tokens=request.num_computed_tokens,
         )
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now to
+                # avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
+
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        finally:
+            self.block_pool.clear_eviction_trace_context()
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
