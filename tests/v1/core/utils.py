@@ -57,6 +57,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    scheduling_policy: str = "fcfs",
+    lpm_window_size: int = SchedulerConfig.lpm_window_size,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -89,6 +91,8 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        policy=scheduling_policy,
+        lpm_window_size=lpm_window_size,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

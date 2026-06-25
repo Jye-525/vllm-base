@@ -414,6 +414,21 @@ class BlockPool:
             self.scored_hits += 1
         return cached_blocks
 
+    def is_cached_block(self, block_hash: BlockHash,
+                        kv_cache_group_ids: list[int]) -> bool:
+        """Return whether the block hash exists for all requested groups.
+
+        Unlike get_cached_block(), this helper is for scheduling/ranking probes
+        and does not update any cache-hit counters.
+        """
+        for group_id in kv_cache_group_ids:
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, group_id)
+            if not self.cached_block_hash_to_block.get_one_block(
+                    block_hash_with_group_id):
+                return False
+        return True
+
     def cache_full_blocks(
         self,
         request: Request,

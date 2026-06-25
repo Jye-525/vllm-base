@@ -267,6 +267,20 @@ class KVCacheCoordinator(ABC):
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         pass
 
+    def find_longest_cache_hit_length(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> int:
+        """Return only the longest cache-hit length in tokens.
+
+        This is used by cache-aware scheduling policies to rank waiting
+        requests without allocating KV blocks or recording prefix-cache stats.
+        """
+        _, hit_length = self.find_longest_cache_hit(
+            block_hashes, max_cache_hit_length)
+        return hit_length
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         for manager in self.single_type_managers:
@@ -319,6 +333,13 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             [] for _ in range(self.num_single_type_manager)
         )
         return blocks, 0
+
+    def find_longest_cache_hit_length(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> int:
+        return 0
 
 
 class UnitaryKVCacheCoordinator(KVCacheCoordinator):
@@ -387,6 +408,23 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=self.pcp_world_size,
         )
         return hit_blocks, len(hit_blocks[0]) * self.block_size
+
+    def find_longest_cache_hit_length(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> int:
+        return self.single_type_managers[0].find_longest_cache_hit_length(
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=[0],
+            block_pool=self.block_pool,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=0 in self.eagle_group_ids,
+            alignment_tokens=self.block_size,
+            dcp_world_size=self.dcp_world_size,
+            pcp_world_size=self.pcp_world_size,
+        )
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
@@ -605,6 +643,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         ), hit_length
+
+    # find_longest_cache_hit_length: inherit the base implementation, which
+    # delegates to find_longest_cache_hit above. Upstream's hybrid algorithm
+    # (per-group EAGLE verification, simple-hybrid fast path) changed after
+    # v0.15.0, so a hand-mirrored length-only copy would drift from it.
 
 
 def get_kv_cache_coordinator(

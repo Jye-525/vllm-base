@@ -15,6 +15,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    LPM = "lpm"
 
 
 class RequestQueue(ABC):
@@ -127,6 +128,13 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
         """Iterate over the queue according to FCFS policy."""
         return super().__iter__()
 
+    def iter_first_n(self, n: int) -> Iterator[Request]:
+        """Iterate over at most the first n requests in FCFS order."""
+        for i, request in enumerate(self):
+            if i >= n:
+                break
+            yield request
+
 
 class PriorityRequestQueue(RequestQueue):
     """
@@ -202,7 +210,7 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
-    elif policy == SchedulingPolicy.FCFS:
+    elif policy in (SchedulingPolicy.FCFS, SchedulingPolicy.LPM):
         return FCFSRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

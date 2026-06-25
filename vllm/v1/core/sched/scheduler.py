@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
@@ -163,6 +164,17 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        if (self.policy == SchedulingPolicy.LPM
+                and not self.cache_config.enable_prefix_caching):
+            logger.warning_once(
+                "LPM scheduling requires prefix caching. Falling back to FCFS "
+                "because prefix caching is disabled.")
+            self.policy = SchedulingPolicy.FCFS
+        try:
+            self._lpm_max_windows = max(
+                1, int(os.environ.get("VLLM_LPM_MAX_WINDOWS", "1")))
+        except ValueError:
+            self._lpm_max_windows = 1
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
@@ -261,7 +273,6 @@ class Scheduler(SchedulerInterface):
         #                              | "full_prefix_evictable_output"
         #   VLLM_EVICTION_BINARY_DEMAND : if true, collapse every positive
         #                                 demand score to 1.0
-        import os
         policy = os.environ.get("VLLM_EVICTION_POLICY", "lru").strip().lower()
         if policy == "demand_aware":
             policy = "score"
@@ -533,6 +544,79 @@ class Scheduler(SchedulerInterface):
             evictable_position_buckets[3],
         )
 
+    def _can_rank_request_for_lpm(
+        self,
+        request: Request,
+        scheduled_loras: set[int],
+    ) -> bool:
+        """Return whether a waiting request is eligible for LPM ranking.
+
+        This check is intentionally conservative and side-effect free. The
+        normal waiting-admission path still performs the authoritative checks
+        before scheduling the selected request.
+        """
+        if request.status != RequestStatus.WAITING:
+            return False
+        if request.num_computed_tokens != 0:
+            return False
+        if request.skip_reading_prefix_cache:
+            return False
+        if (
+            self.lora_config
+            and request.lora_request
+            and len(scheduled_loras) == self.lora_config.max_loras
+            and request.lora_request.lora_int_id not in scheduled_loras
+        ):
+            return False
+        return True
+
+    def _rank_lpm_waiting_requests(
+        self,
+        scheduled_loras: set[int],
+    ) -> list[Request]:
+        """Rank a bounded FCFS window of waiting requests by prefix hit.
+
+        The queue itself is not reordered. Only the first lpm_window_size
+        requests are inspected, and ties preserve FCFS order.
+        """
+        window_size = self.scheduler_config.lpm_window_size
+        iter_first_n = getattr(self.waiting, "iter_first_n", None)
+        if iter_first_n is None:
+            waiting_window = list(itertools.islice(self.waiting, window_size))
+        else:
+            waiting_window = list(iter_first_n(window_size))
+
+        ranked: list[tuple[int, int, int, Request]] = []
+        for pos, request in enumerate(waiting_window):
+            if not self._can_rank_request_for_lpm(request, scheduled_loras):
+                continue
+            prefix_len = self.kv_cache_manager.get_computed_prefix_len(request)
+            # Treat low-hit candidates in the same cache block as near-equal
+            # and prefer the request with the smaller remaining cache
+            # footprint. For meaningful prefix hits, keep the original LPM
+            # behavior and preserve FCFS as the tie-breaker.
+            prefix_blocks = prefix_len // self.block_size
+            if prefix_blocks <= 3:
+                tie_breaker = max(request.num_tokens - prefix_len, 0)
+            else:
+                tie_breaker = pos
+            ranked.append((-prefix_len, tie_breaker, pos, request))
+
+        ranked.sort()
+        return [request for _, _, _, request in ranked]
+
+    @staticmethod
+    def _pop_next_lpm_candidate(
+        ranked_candidates: list[Request],
+        waiting: Any,
+    ) -> Request | None:
+        """Return the next ranked LPM candidate still present in waiting."""
+        while ranked_candidates:
+            request = ranked_candidates.pop(0)
+            if request in waiting:
+                return request
+        return None
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -753,6 +837,9 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        ranked_lpm_candidates: list[Request] | None = None
+        num_lpm_ranked_windows = 0
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -764,7 +851,41 @@ class Scheduler(SchedulerInterface):
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
-                request = request_queue.peek_request()
+                use_lpm_candidate = False
+                head_request = request_queue.peek_request()
+                if (self.policy != SchedulingPolicy.LPM
+                        or request_queue is not self.waiting):
+                    # LPM only reorders fresh requests in self.waiting;
+                    # blocked requests in skipped_waiting keep FCFS order.
+                    request = head_request
+                elif head_request.status == RequestStatus.PREEMPTED:
+                    # Resume preempted head requests before allowing LPM to
+                    # bypass them with fresh waiting requests.
+                    request = head_request
+                    ranked_lpm_candidates = None
+                    num_lpm_ranked_windows = 0
+                else:
+                    if ranked_lpm_candidates is None:
+                        ranked_lpm_candidates = self._rank_lpm_waiting_requests(
+                            scheduled_loras)
+                        num_lpm_ranked_windows = 1
+                    lpm_request = self._pop_next_lpm_candidate(
+                        ranked_lpm_candidates, self.waiting)
+                    while (lpm_request is None
+                           and num_lpm_ranked_windows < self._lpm_max_windows):
+                        ranked_lpm_candidates = self._rank_lpm_waiting_requests(
+                            scheduled_loras)
+                        num_lpm_ranked_windows += 1
+                        if not ranked_lpm_candidates:
+                            break
+                        lpm_request = self._pop_next_lpm_candidate(
+                            ranked_lpm_candidates, self.waiting)
+                    if lpm_request is not None:
+                        request = lpm_request
+                        use_lpm_candidate = True
+                    else:
+                        request = head_request
+
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -776,7 +897,10 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    if use_lpm_candidate:
+                        request_queue.remove_request(request)
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -791,7 +915,10 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    if use_lpm_candidate:
+                        request_queue.remove_request(request)
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -818,7 +945,10 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            if use_lpm_candidate:
+                                request_queue.remove_request(request)
+                            else:
+                                request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -971,9 +1101,13 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
-                # Request was already popped from self.waiting
-                # unless it was re-added above due to new_blocks being None.
-                request = request_queue.pop_request()
+                # Remove the request from its queue only after allocation
+                # succeeds. LPM candidates may come from inside the bounded
+                # FCFS window rather than the queue head.
+                if use_lpm_candidate:
+                    request_queue.remove_request(request)
+                else:
+                    request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1894,7 +2028,7 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy == SchedulingPolicy.FCFS:
+        if self.policy in (SchedulingPolicy.FCFS, SchedulingPolicy.LPM):
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.

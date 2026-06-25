@@ -25,6 +25,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -104,6 +105,86 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     assert len(scheduler.running) == len(requests)
     for i, request in enumerate(requests):
         assert scheduler.running[i] == request
+
+
+def test_lpm_schedules_best_prefix_hit_in_bounded_window():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=3,
+    )
+    requests = create_requests(num_requests=4)
+    for request in requests:
+        scheduler.add_request(request)
+
+    hit_by_req_id = {
+        requests[0].request_id: 0,
+        requests[1].request_id: 16,
+        requests[2].request_id: 32,
+        requests[3].request_id: 64,
+    }
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
+        side_effect=lambda req: hit_by_req_id[req.request_id])
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        requests[2].request_id
+    ]
+    # The fourth request has the largest hit, but it is outside the LPM window.
+    scanned_req_ids = [
+        call.args[0].request_id
+        for call in scheduler.kv_cache_manager.get_computed_prefix_len.call_args_list
+    ]
+    assert scanned_req_ids == [
+        requests[0].request_id,
+        requests[1].request_id,
+        requests[2].request_id,
+    ]
+
+
+def test_lpm_preserves_fcfs_for_equal_prefix_hits():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=3,
+    )
+    requests = create_requests(num_requests=3)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        requests[0].request_id
+    ]
+
+
+def test_lpm_falls_back_to_fcfs_without_prefix_caching():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=False,
+        scheduling_policy="lpm",
+        lpm_window_size=3,
+    )
+    assert scheduler.policy == SchedulingPolicy.FCFS
+
+    requests = create_requests(num_requests=3)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=32)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        requests[0].request_id
+    ]
+    scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
 
 
 def test_schedule_multimodal_requests():

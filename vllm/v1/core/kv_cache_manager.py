@@ -231,6 +231,20 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def get_computed_prefix_len(self, request: Request) -> int:
+        """Get only the number of locally prefix-cached tokens.
+
+        This is a lightweight scheduling helper. It does not allocate KV
+        blocks, update request state, or record prefix-cache statistics. The
+        selected request must still call get_computed_blocks() during admission.
+        """
+        if not self.enable_caching or request.skip_reading_prefix_cache:
+            return 0
+
+        max_cache_hit_length = request.num_tokens - 1
+        return self.coordinator.find_longest_cache_hit_length(
+            request.block_hashes, max_cache_hit_length)
+
     def record_local_prefix_cache_hit(
         self,
         request: Request,

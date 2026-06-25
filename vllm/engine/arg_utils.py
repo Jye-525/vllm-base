@@ -593,6 +593,7 @@ class EngineArgs:
 
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
+    lpm_window_size: int = SchedulerConfig.lpm_window_size
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
 
@@ -1366,6 +1367,9 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--lpm-window-size", **scheduler_kwargs["lpm_window_size"]
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -2012,6 +2016,7 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            lpm_window_size=self.lpm_window_size,
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
