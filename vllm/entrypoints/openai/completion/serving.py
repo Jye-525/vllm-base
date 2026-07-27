@@ -139,6 +139,23 @@ class OpenAIServingCompletion(OpenAIServing):
         engine_inputs = result
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+        
+        ## PD-disagg bench mapping: emit a one-line CLIENT_REQ_LOG so the
+        ## offline analyzer can join engine logs (REQ_TIMING_LOG / KV_XFER_LOG,
+        ## which carry the router-generated hex32 only) back to the
+        ## user-supplied tag (e.g. "warm-…" vs "bench-…"). The router forwards
+        ## the original X-Request-Id from the client as X-Client-Request-Id;
+        ## X-Request-Id itself has been overwritten with the synthetic
+        ## ___prefill_addr_…_<hex32> id needed for KV routing. No-op when
+        ## the header isn't set (non-PD deployments, direct calls, etc.).
+        if raw_request is not None:
+            client_supplied_id = raw_request.headers.get("X-Client-Request-Id")
+            if client_supplied_id:
+                logger.info(
+                    "CLIENT_REQ_LOG request_id=%s client_supplied_id=%s",
+                    request_id,
+                    client_supplied_id,
+                )
         created_time = int(time.time())
 
         request_metadata = RequestResponseMetadata(request_id=request_id)

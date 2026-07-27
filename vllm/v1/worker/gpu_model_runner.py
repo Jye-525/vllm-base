@@ -7149,7 +7149,24 @@ class GPUModelRunner(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
             else:
-                kv_transfer_group.register_kv_caches(kv_caches)
+                # kv_transfer_group.register_kv_caches(kv_caches)
+
+                ## Cross-layer KV-sharing alias layers (e.g. Gemma4's last
+                ## `num_kv_shared_layers` layers) point at the same physical
+                ## buffer as their target. The connector was constructed
+                ## before these aliases were injected into kv_cache_groups,
+                ## so its layer-spec map does not know about them — skip them
+                ## here; the target layer's registration covers the memory.
+                kv_caches_for_xfer = (
+                    {
+                        n: c
+                        for n, c in kv_caches.items()
+                        if n not in self.shared_kv_cache_layers
+                    }
+                    if self.shared_kv_cache_layers
+                    else kv_caches
+                )
+                kv_transfer_group.register_kv_caches(kv_caches_for_xfer)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
     def _get_attention_kv_cache_gid(self) -> int:

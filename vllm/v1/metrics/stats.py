@@ -237,6 +237,12 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    # Raw timestamps for per-request external log emission (PD disagg bench).
+    arrival_time: float = 0.0
+    queued_ts: float = 0.0
+    scheduled_ts: float = 0.0
+    first_token_ts: float = 0.0
+    last_token_ts: float = 0.0
 
 
 @dataclass
@@ -472,6 +478,11 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            arrival_time=req_stats.arrival_time,
+            queued_ts=req_stats.queued_ts,
+            scheduled_ts=req_stats.scheduled_ts,
+            first_token_ts=req_stats.first_token_ts,
+            last_token_ts=req_stats.last_token_ts,
         )
         self.finished_requests.append(finished_req)
 

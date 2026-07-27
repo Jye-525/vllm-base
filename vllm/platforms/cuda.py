@@ -524,8 +524,21 @@ class CudaPlatformBase(Platform):
         dst_block_indices: torch.Tensor,
     ) -> None:
         """Copy blocks from src_cache to dst_cache on GPU."""
-        _src_cache = src_cache[:, src_block_indices]
-        dst_cache[:, dst_block_indices] = _src_cache.to(dst_cache.device)
+        # _src_cache = src_cache[:, src_block_indices]
+        # dst_cache[:, dst_block_indices] = _src_cache.to(dst_cache.device)
+        if src_cache.shape[0] == 2:
+            # Legacy non-MLA layout with K/V leading:
+            # (2, num_blocks, block_size, num_kv_heads, head_size).
+            _src_cache = src_cache[:, src_block_indices]
+            dst_cache[:, dst_block_indices] = _src_cache.to(dst_cache.device)
+        else:
+            # Generic dim-0 indexed copy. Covers MLA (num_blocks, block_size,
+            # head_size) and HND non-MLA (num_blocks, 2, block_size,
+            # num_kv_heads, head_size), including HMA-aliased hybrid layouts
+            # where each layer views the same backing storage with its own
+            # per-layer shape (e.g. Gemma-4 full-attention + sliding-window).
+            _src_cache = src_cache[src_block_indices]
+            dst_cache[dst_block_indices] = _src_cache.to(dst_cache.device)
 
     @classmethod
     def swap_out_blocks_to_host(
@@ -536,8 +549,21 @@ class CudaPlatformBase(Platform):
         dst_block_indices: torch.Tensor,
     ) -> None:
         """Copy blocks from GPU to host (CPU)."""
-        _src_cache = src_cache[:, src_block_indices]
-        dst_cache[:, dst_block_indices] = _src_cache.cpu()
+        # _src_cache = src_cache[:, src_block_indices]
+        # dst_cache[:, dst_block_indices] = _src_cache.cpu()
+        if src_cache.shape[0] == 2:
+            # Legacy non-MLA layout with K/V leading:
+            # (2, num_blocks, block_size, num_kv_heads, head_size).
+            _src_cache = src_cache[:, src_block_indices]
+            dst_cache[:, dst_block_indices] = _src_cache.cpu()
+        else:
+            # Generic dim-0 indexed copy. Covers MLA (num_blocks, block_size,
+            # head_size) and HND non-MLA (num_blocks, 2, block_size,
+            # num_kv_heads, head_size), including HMA-aliased hybrid layouts
+            # where each layer views the same backing storage with its own
+            # per-layer shape (e.g. Gemma-4 full-attention + sliding-window).
+            _src_cache = src_cache[src_block_indices]
+            dst_cache[dst_block_indices] = _src_cache.cpu()
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

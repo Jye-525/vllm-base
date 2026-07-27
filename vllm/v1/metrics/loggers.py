@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -31,6 +32,25 @@ from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
+
+# Extracts the router-generated UUID (32 hex chars) embedded in every engine
+# request_id under the PD-disaggregation router. The router sets
+#   X-Request-Id: ___prefill_addr_<PA>___decode_addr_<DA>_<hex32>
+# and vLLM wraps it as
+#   cmpl-___prefill_addr_<PA>___decode_addr_<DA>_<hex32>-<index>
+# The <hex32> is unique per client request and serves as the join key against
+# KV_XFER_LOG, which appends a per-block hash suffix the analyzer would
+# otherwise have to strip.
+_PD_CLIENT_RID_RE = re.compile(r"_([0-9a-f]{32})(?:-\d+)?(?:-[0-9a-f]+)?$")
+
+
+def _extract_client_request_id(engine_request_id: str | None) -> str:
+    """Return the router-generated hex32 from `engine_request_id`, or the id
+    itself if no match (e.g. running without the PD router)."""
+    if not engine_request_id:
+        return ""
+    m = _PD_CLIENT_RID_RE.search(engine_request_id)
+    return m.group(1) if m else engine_request_id
 
 # User-facing reason labels for waiting request breakdown
 WAITING_REASON_CAPACITY = "capacity"
@@ -1214,6 +1234,38 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+                
+            # Per-request timing log for external benchmarking (PD disagg).
+            # client_request_id is the router-generated hex32 embedded in the
+            # engine request_id; KV_XFER_LOG emits the same field so the
+            # analyzer can join on a single, suffix-free key.
+            logger.info(
+                "REQ_TIMING_LOG engine_idx=%d request_id=%s "
+                "client_request_id=%s "
+                "queued_time_ms=%.3f prefill_time_ms=%.3f "
+                "decode_time_ms=%.3f inference_time_ms=%.3f "
+                "e2e_latency_ms=%.3f "
+                "num_prompt_tokens=%d num_generation_tokens=%d "
+                "num_cached_tokens=%d "
+                "arrival_time=%.6f queued_ts=%.6f scheduled_ts=%.6f "
+                "first_token_ts=%.6f last_token_ts=%.6f",
+                engine_idx,
+                finished_request.request_id,
+                _extract_client_request_id(finished_request.request_id),
+                finished_request.queued_time * 1e3,
+                finished_request.prefill_time * 1e3,
+                finished_request.decode_time * 1e3,
+                finished_request.inference_time * 1e3,
+                finished_request.e2e_latency * 1e3,
+                finished_request.num_prompt_tokens,
+                finished_request.num_generation_tokens,
+                finished_request.num_cached_tokens,
+                finished_request.arrival_time,
+                finished_request.queued_ts,
+                finished_request.scheduled_ts,
+                finished_request.first_token_ts,
+                finished_request.last_token_ts,
+            )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

@@ -5,6 +5,7 @@
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -81,6 +82,21 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+# See loggers.py:_PD_CLIENT_RID_RE — extracts the router-generated UUID
+# (32 hex chars) from the engine request_id. KV_XFER_LOG req_ids look like
+#   cmpl-___prefill_addr_<PA>___decode_addr_<DA>_<hex32>-<idx>-<blockhash>
+# REQ_TIMING_LOG req_ids look like
+#   cmpl-___prefill_addr_<PA>___decode_addr_<DA>_<hex32>-<idx>
+# Both yield the same <hex32>, which is the client-side join key.
+_PD_CLIENT_RID_RE = re.compile(r"_([0-9a-f]{32})(?:-\d+)?(?:-[0-9a-f]+)?$")
+
+
+def _extract_client_request_id(req_id: str | None) -> str:
+    if not req_id:
+        return ""
+    m = _PD_CLIENT_RID_RE.search(req_id)
+    return m.group(1) if m else req_id
 
 
 class NixlConnectorWorker:
@@ -435,6 +451,13 @@ class NixlConnectorWorker:
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.xfer_stats = NixlKVConnectorStats()
 
+        # Per-request KV transfer timing keyed by request_id. Used to emit a
+        # structured log line per request so transfer cost can be correlated
+        # with a specific request_id (grep "KV_XFER_LOG").
+        self._req_xfer_recv_start: dict[ReqId, float] = {}
+        self._req_xfer_recv_agg: dict[ReqId, dict[str, float]] = {}
+        self._req_xfer_send_start: dict[ReqId, float] = {}
+
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
 
@@ -593,11 +616,55 @@ class NixlConnectorWorker:
         """
         Initialize transfer buffer in CPU mem for accelerators
         NOT directly supported by NIXL (e.g., tpu)
+
+        HMA pools the GPU KV cache: layers in the same `KVCacheTensor.shared_by`
+        list are views of the *same* underlying GPU allocation, so they share
+        `data_ptr()`. Mirror that on the host — one CPU staging tensor per unique
+        GPU data_ptr, aliased into every layer-name that maps to it. Otherwise
+        the host alloc balloons to `num_layers × per_layer_bytes` while the GPU
+        side is far smaller, which OOM-kills the worker for long-context models
+        with sliding-window attention (e.g. Gemma4).
         """
         xfer_buffers: dict[str, torch.Tensor] = {}
+        # Map GPU data_ptr -> already-allocated CPU staging tensor.
+        gpu_ptr_to_cpu: dict[int, torch.Tensor] = {}
         inv_order = [0, 1, 3, 2, 4]
         try:
             for layer_name, kv_cache in kv_caches.items():
+                gpu_ptr = kv_cache.data_ptr()
+                if gpu_ptr in gpu_ptr_to_cpu:
+                    # HMA alias: layers sharing one GPU allocation reuse the
+                    # same CPU staging buffer. When the aliased layers view
+                    # those bytes with the SAME shape (e.g. MTP draft layers),
+                    # the buffer can be reused as-is. When they view it with
+                    # DIFFERENT per-layer (num_kv_heads, head_size, block_size)
+                    # — e.g. Gemma-4 full-attention vs sliding-window in HMA —
+                    # we need a per-layer view of the same CPU storage so
+                    # per-layer d2h/h2d copies see matching src/dst shapes.
+                    base = gpu_ptr_to_cpu[gpu_ptr]
+                    if base.shape == kv_cache.shape:
+                        xfer_buffers[layer_name] = base
+                    else:
+                        assert base.numel() == kv_cache.numel(), (
+                            f"HMA host-buffer numel mismatch for {layer_name}: "
+                            f"base={base.numel()} layer={kv_cache.numel()}"
+                        )
+                        aliased = torch.empty(
+                            0, dtype=kv_cache.dtype, device="cpu"
+                        )
+                        aliased.set_(
+                            base.untyped_storage(),
+                            storage_offset=0,
+                            size=tuple(kv_cache.shape),
+                            stride=torch.empty(
+                                kv_cache.shape,
+                                dtype=kv_cache.dtype,
+                                device="cpu",
+                            ).stride(),
+                        )
+                        xfer_buffers[layer_name] = aliased
+                    continue
+
                 kv_shape = kv_cache.shape
                 kv_dtype = kv_cache.dtype
                 permute_shape = False
@@ -621,13 +688,19 @@ class NixlConnectorWorker:
                     )
                     permute_shape = not self.use_mla
 
-                xfer_buffers[layer_name] = torch.empty(
-                    kv_shape, dtype=kv_dtype, device="cpu"
-                )
+                cpu_tensor = torch.empty(kv_shape, dtype=kv_dtype, device="cpu")
                 if permute_shape:
-                    xfer_buffers[layer_name] = xfer_buffers[layer_name].permute(
-                        inv_order
-                    )
+                    cpu_tensor = cpu_tensor.permute(inv_order)
+                xfer_buffers[layer_name] = cpu_tensor
+                gpu_ptr_to_cpu[gpu_ptr] = cpu_tensor
+
+                # xfer_buffers[layer_name] = torch.empty(
+                #     kv_shape, dtype=kv_dtype, device="cpu"
+                # )
+                # if permute_shape:
+                #     xfer_buffers[layer_name] = xfer_buffers[layer_name].permute(
+                #         inv_order
+                #     )
         except MemoryError as e:
             logger.error("NIXLConnectorWorker gets %s.", e)
             raise
@@ -850,6 +923,18 @@ class NixlConnectorWorker:
             # However, physical page_size may differ when kernel requires a specific
             # block size. This leads to SSM and FA layers having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
+            if layer_name not in self._layer_specs:
+                # Defensive: cross-layer KV-sharing alias layers should be
+                # filtered out by the caller (see gpu_model_runner). If one
+                # slips through, skip it rather than crashing — its tensor
+                # is already covered by the target layer's registration.
+                logger.warning_once(
+                    "Skipping NIXL registration for layer %s: not in "
+                    "_layer_specs (likely a cross-layer KV-sharing alias).",
+                    layer_name,
+                )
+                continue
+
             layer_spec = self._layer_specs[layer_name]
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 # MLA DSv32 Indexer case: UniformTypeKVCacheSpecs merges kv_cache_specs
@@ -1785,6 +1870,8 @@ class NixlConnectorWorker:
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
+            # Discard the send-side start ts to avoid leaking entries on expiry.
+            self._req_xfer_send_start.pop(req_id, None)
             done_sending.add(req_id)
 
         return done_sending, done_recving
@@ -1842,6 +1929,21 @@ class NixlConnectorWorker:
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
+
+                    # Emit one structured log per request (KV-send side).
+                    # client_request_id mirrors REQ_TIMING_LOG so the analyzer
+                    # can join on a single suffix-free key.
+                    start = self._req_xfer_send_start.pop(req_id, None)
+                    if start is not None:
+                        logger.info(
+                            "KV_XFER_LOG side=send request_id=%s "
+                            "client_request_id=%s "
+                            "wall_time_ms=%.3f",
+                            req_id,
+                            _extract_client_request_id(req_id),
+                            (time.perf_counter() - start) * 1e3,
+                        )
+
         return notified_req_ids
 
     def _handle_heartbeat(self, payload: str) -> None:
@@ -1883,6 +1985,22 @@ class NixlConnectorWorker:
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        # Per-request accumulation for grep-able timing log.
+                        agg = self._req_xfer_recv_agg.setdefault(
+                            req_id,
+                            {
+                                "xfer_us": 0.0,
+                                "post_us": 0.0,
+                                "bytes": 0.0,
+                                "descs": 0.0,
+                                "handles": 0.0,
+                            },
+                        )
+                        agg["xfer_us"] += float(res.xferDuration)
+                        agg["post_us"] += float(res.postDuration)
+                        agg["bytes"] += float(res.totalBytes)
+                        agg["descs"] += float(res.descCount)
+                        agg["handles"] += 1.0
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -1908,6 +2026,29 @@ class NixlConnectorWorker:
                 # Only report request as completed when all transfers are done.
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+                # Emit one structured log per request (KV-recv side).
+                agg = self._req_xfer_recv_agg.pop(req_id, None)
+                start = self._req_xfer_recv_start.pop(req_id, None)
+                if agg is not None and agg["handles"] > 0:
+                    wall_ms = (
+                        (time.perf_counter() - start) * 1e3
+                        if start is not None
+                        else -1.0
+                    )
+                    logger.info(
+                        "KV_XFER_LOG side=recv request_id=%s "
+                        "client_request_id=%s "
+                        "xfer_time_ms=%.3f post_time_ms=%.3f bytes=%d "
+                        "descriptors=%d handles=%d wall_time_ms=%.3f",
+                        req_id,
+                        _extract_client_request_id(req_id),
+                        agg["xfer_us"] / 1e3,
+                        agg["post_us"] / 1e3,
+                        int(agg["bytes"]),
+                        int(agg["descs"]),
+                        int(agg["handles"]),
+                        wall_ms,
+                    )
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
@@ -1936,6 +2077,8 @@ class NixlConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
+            # Record KV-recv start time per request (for KV_XFER_LOG).
+            self._req_xfer_recv_start.setdefault(req_id, time.perf_counter())
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
             )
@@ -1986,6 +2129,8 @@ class NixlConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+                # Record KV-send start time per request (for KV_XFER_LOG).
+                self._req_xfer_send_start.setdefault(req_id, time.perf_counter())
 
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
