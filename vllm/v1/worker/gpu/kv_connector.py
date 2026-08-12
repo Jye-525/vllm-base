@@ -44,6 +44,11 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
+    def on_model_output_ready(self) -> None:
+        """Notify the connector after existing output synchronization."""
+
+        pass
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -117,6 +122,10 @@ class ActiveKVConnector(KVConnector):
         # Ensure that layer-wise connector hooks aren't called when disabled.
         kv_transfer_state._KV_CONNECTOR_AGENT = None if disabled else self.kv_connector
         self._disabled = disabled
+
+    def on_model_output_ready(self) -> None:
+        if not self._disabled:
+            self.kv_connector.on_model_output_ready()
 
 
 NO_OP_KV_CONNECTOR = KVConnector()

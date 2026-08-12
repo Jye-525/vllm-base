@@ -354,6 +354,15 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def on_model_output_ready(self) -> None:
+        """Notify the connector after vLLM's existing output synchronization.
+
+        Connectors may use this hook to resolve already-recorded asynchronous
+        measurements. Implementations must not add synchronization here.
+        """
+
+        return
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
