@@ -3,6 +3,7 @@
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -22,6 +23,12 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
     cudaStream_t,
     ncclComm_t,
     ncclDataTypeEnum,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_timing import (
+    CudaEventSpan,
+    P2pRequestTimingTracker,
+    parse_timing_options,
+    timing_log_record,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.tensor_memory_pool import (  # noqa: E501
     TensorMemoryPool,
@@ -79,12 +86,17 @@ class P2pNcclEngine:
         hostname: str = "",
         port_offset: int = 0,
         library_path: str | None = None,
+        tp_rank: int | None = None,
+        tp_size: int = 1,
     ) -> None:
         self.config = config
         self.rank = port_offset
         self.local_rank = local_rank
         self.device = torch.device(f"cuda:{self.local_rank}")
         self.nccl = NCCLLibrary(library_path)
+
+        self.send_type = self.config.get_from_extra_config("send_type", "PUT_ASYNC")
+        self.enable_timing, self.timing_detail = parse_timing_options(self.config)
 
         if not hostname:
             hostname = get_ip()
@@ -136,6 +148,29 @@ class P2pNcclEngine:
         self.send_stream = torch.cuda.Stream()
         self.recv_stream = torch.cuda.Stream()
 
+        if self.enable_timing:
+            self._timing_anchor = torch.cuda.Event(enable_timing=True)
+            self._timing_anchor.record(torch.cuda.current_stream(self.device))
+            resolved_tp_rank = self.rank if tp_rank is None else int(tp_rank)
+            role = "producer" if self.config.is_kv_producer else "consumer"
+            self._timing_tracker = P2pRequestTimingTracker(
+                side="send" if role == "producer" else "recv",
+                detail=self.timing_detail,  # type: ignore[arg-type]
+                anchor=self._timing_anchor,
+                common={
+                    "schema_version": 1,
+                    "connector": "P2pNcclConnector",
+                    "role": role,
+                    "send_type": self.send_type,
+                    "tp_rank": resolved_tp_rank,
+                    "tp_size": int(tp_size),
+                    "local_rank": self.local_rank,
+                    "host": self._hostname,
+                    "device": str(self.device),
+                },
+                emit=lambda record: timing_log_record(logger, record),
+            )
+
         mem_pool_size_gb = float(
             self.config.get_from_extra_config(
                 "mem_pool_size_gb", DEFAULT_MEM_POOL_SIZE_GB
@@ -147,7 +182,6 @@ class P2pNcclEngine:
 
         # The sending type includes tree mutually exclusive options:
         # PUT, GET, PUT_ASYNC.
-        self.send_type = self.config.get_from_extra_config("send_type", "PUT_ASYNC")
         if self.send_type == "GET":
             # tensor_id: torch.Tensor
             self.send_store: dict[str, torch.Tensor] = {}
@@ -237,6 +271,7 @@ class P2pNcclEngine:
         tensor_id: str,
         tensor: torch.Tensor,
         remote_address: str | None = None,
+        batch_id: str | None = None,
     ) -> bool:
         if remote_address is None:
             with self.recv_store_cv:
@@ -245,8 +280,22 @@ class P2pNcclEngine:
             return True
 
         item = SendQueueItem(
-            tensor_id=tensor_id, remote_address=remote_address, tensor=tensor
+            tensor_id=tensor_id,
+            remote_address=remote_address,
+            tensor=tensor,
         )
+
+        if self.enable_timing:
+            queued_perf_ns = time.perf_counter_ns()
+            queued_wall_ns = time.time_ns()
+            self._safe_timing_call(
+                self._timing_tracker.enqueue,
+                tensor_id=tensor_id,
+                payload_bytes=tensor.element_size() * tensor.numel(),
+                batch_id=batch_id,
+                queued_perf_ns=queued_perf_ns,
+                queued_wall_ns=queued_wall_ns,
+            )
 
         if self.send_type == "PUT":
             return self.send_sync(item)
@@ -392,16 +441,102 @@ class P2pNcclEngine:
                     )
             elif data["cmd"] == "PUT":
                 tensor_id = data["tensor_id"]
+                timing_queued_perf_ns = (
+                    time.perf_counter_ns() if self.enable_timing else 0
+                )
+                timing_queued_wall_ns = time.time_ns() if self.enable_timing else 0
+                dtype = getattr(torch, data["dtype"])
+                if self.enable_timing:
+                    payload_bytes = (
+                        math.prod(data["shape"])
+                        * torch.empty((), dtype=dtype).element_size()
+                    )
+                    self._safe_timing_call(
+                        self._timing_tracker.enqueue,
+                        tensor_id=tensor_id,
+                        payload_bytes=payload_bytes,
+                        batch_id=None,
+                        queued_perf_ns=timing_queued_perf_ns,
+                        queued_wall_ns=timing_queued_wall_ns,
+                    )
                 try:
+                    allocation_start_perf_ns = (
+                        time.perf_counter_ns() if self.enable_timing else 0
+                    )
+                    allocation_start_wall_ns = (
+                        time.time_ns() if self.enable_timing else 0
+                    )
                     with torch.cuda.stream(self.recv_stream):
                         tensor = torch.empty(
                             data["shape"],
-                            dtype=getattr(torch, data["dtype"]),
+                            dtype=dtype,
                             device=self.device,
                         )
+                    if self.enable_timing:
+                        self._safe_timing_call(
+                            self._timing_tracker.update_tensor,
+                            tensor_id,
+                            allocation_start_perf_ns=allocation_start_perf_ns,
+                            allocation_end_perf_ns=time.perf_counter_ns(),
+                            allocation_start_wall_ns=allocation_start_wall_ns,
+                            allocation_end_wall_ns=time.time_ns(),
+                        )
+                    control_start_perf_ns = (
+                        time.perf_counter_ns() if self.enable_timing else 0
+                    )
+                    control_start_wall_ns = (
+                        time.time_ns() if self.enable_timing else 0
+                    )
                     self.router_socket.send_multipart([remote_address, b"0"])
+                    if self.enable_timing:
+                        self._safe_timing_call(
+                            self._timing_tracker.update_tensor,
+                            tensor_id,
+                            control_start_perf_ns=control_start_perf_ns,
+                            control_end_perf_ns=time.perf_counter_ns(),
+                            control_start_wall_ns=control_start_wall_ns,
+                            control_end_wall_ns=time.time_ns(),
+                        )
                     comm, rank = self.comms[remote_address.decode()]
-                    self.recv(comm, tensor, rank ^ 1, self.recv_stream)
+                    nccl_span = self._new_cuda_span(record_start=False)
+                    nccl_start_perf_ns = (
+                        time.perf_counter_ns() if self.enable_timing else 0
+                    )
+                    nccl_start_wall_ns = time.time_ns() if self.enable_timing else 0
+                    try:
+                        self.recv(
+                            comm,
+                            tensor,
+                            rank ^ 1,
+                            self.recv_stream,
+                            timing_span=nccl_span,
+                        )
+                    except BaseException as exc:
+                        if self.enable_timing:
+                            self._safe_timing_call(
+                                self._timing_tracker.complete_tensor,
+                                tensor_id,
+                                completed_perf_ns=time.perf_counter_ns(),
+                                completed_wall_ns=time.time_ns(),
+                                status="failed",
+                                error=f"nccl_receive_failed:{type(exc).__name__}",
+                            )
+                            self._safe_timing_call(
+                                self._timing_tracker.fail_request,
+                                tensor_id.split("#", 1)[0],
+                                f"nccl_receive_failed:{type(exc).__name__}",
+                            )
+                        raise
+                    if self.enable_timing:
+                        self._safe_timing_call(
+                            self._timing_tracker.update_tensor,
+                            tensor_id,
+                            nccl_start_perf_ns=nccl_start_perf_ns,
+                            nccl_end_perf_ns=time.perf_counter_ns(),
+                            nccl_start_wall_ns=nccl_start_wall_ns,
+                            nccl_end_wall_ns=time.time_ns(),
+                            nccl_span=nccl_span,
+                        )
                     tensor_size = tensor.element_size() * tensor.numel()
                     if self.buffer_size + tensor_size > self.buffer_size_threshold:
                         # Store Tensor in memory pool
@@ -426,6 +561,16 @@ class P2pNcclEngine:
                         self.zmq_address,
                         remote_address.decode(),
                         data,
+                    )
+
+                if self.enable_timing:
+                    self._safe_timing_call(
+                        self._timing_tracker.complete_tensor,
+                        tensor_id,
+                        completed_perf_ns=time.perf_counter_ns(),
+                        completed_wall_ns=time.time_ns(),
+                        status="ok" if tensor is not None else "failed",
+                        error=None if tensor is not None else "receiver_out_of_memory",
                     )
 
                 with self.recv_store_cv:
@@ -513,9 +658,20 @@ class P2pNcclEngine:
             "shape": tensor.shape,
             "dtype": str(tensor.dtype).replace("torch.", ""),
         }
+        control_start_perf_ns = time.perf_counter_ns() if self.enable_timing else 0
+        control_start_wall_ns = time.time_ns() if self.enable_timing else 0
         sock.send(msgpack.dumps(data))
 
         response = sock.recv()
+        if self.enable_timing:
+            self._safe_timing_call(
+                self._timing_tracker.update_tensor,
+                item.tensor_id,
+                control_start_perf_ns=control_start_perf_ns,
+                control_end_perf_ns=time.perf_counter_ns(),
+                control_start_wall_ns=control_start_wall_ns,
+                control_end_wall_ns=time.time_ns(),
+            )
         if response != b"0":
             logger.error(
                 "🔴Send Tensor, Peer Out Of Memory/Threshold, %s 👉 %s, "
@@ -528,9 +684,61 @@ class P2pNcclEngine:
                 tensor.element_size() * tensor.numel() / 1024**3,
                 response.decode(),
             )
+            if self.enable_timing:
+                self._safe_timing_call(
+                    self._timing_tracker.complete_tensor,
+                    item.tensor_id,
+                    completed_perf_ns=time.perf_counter_ns(),
+                    completed_wall_ns=time.time_ns(),
+                    status="failed",
+                    error=f"peer_rejected_transfer:{response.decode()}",
+                )
             return False
 
-        self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
+        nccl_span = self._new_cuda_span(record_start=False)
+        nccl_start_perf_ns = time.perf_counter_ns() if self.enable_timing else 0
+        nccl_start_wall_ns = time.time_ns() if self.enable_timing else 0
+        try:
+            self.send(
+                comm,
+                tensor.to(self.device),
+                rank ^ 1,
+                self.send_stream,
+                timing_span=nccl_span,
+            )
+        except BaseException as exc:
+            if self.enable_timing:
+                self._safe_timing_call(
+                    self._timing_tracker.complete_tensor,
+                    item.tensor_id,
+                    completed_perf_ns=time.perf_counter_ns(),
+                    completed_wall_ns=time.time_ns(),
+                    status="failed",
+                    error=f"nccl_send_failed:{type(exc).__name__}",
+                )
+            raise
+        if self.enable_timing:
+            completed_perf_ns = time.perf_counter_ns()
+            completed_wall_ns = time.time_ns()
+            self._safe_timing_call(
+                self._timing_tracker.update_tensor,
+                item.tensor_id,
+                nccl_start_perf_ns=nccl_start_perf_ns,
+                nccl_end_perf_ns=completed_perf_ns,
+                nccl_start_wall_ns=nccl_start_wall_ns,
+                nccl_end_wall_ns=completed_wall_ns,
+                nccl_span=nccl_span,
+            )
+            # In PUT_ASYNC this call runs on the existing send thread. A sealed
+            # request is therefore published only after the real in-flight
+            # transfer has completed, independently of wait_for_sent().
+            self._safe_timing_call(
+                self._timing_tracker.complete_tensor,
+                item.tensor_id,
+                completed_perf_ns=completed_perf_ns,
+                completed_wall_ns=completed_wall_ns,
+                status="ok",
+            )
 
         if self.send_type == "PUT_ASYNC":
             self.have_sent_tensor_id(item.tensor_id)
@@ -586,7 +794,14 @@ class P2pNcclEngine:
             sock.send(msgpack.dumps(data))
             time.sleep(3)
 
-    def send(self, comm, tensor: torch.Tensor, dst: int, stream=None):
+    def send(
+        self,
+        comm,
+        tensor: torch.Tensor,
+        dst: int,
+        stream=None,
+        timing_span: CudaEventSpan | None = None,
+    ):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
@@ -595,6 +810,8 @@ class P2pNcclEngine:
             stream = current_stream()
 
         with torch.cuda.stream(stream):
+            if timing_span is not None:
+                timing_span.start.record(stream)
             self.nccl.ncclSend(
                 buffer_type(tensor.data_ptr()),
                 tensor.numel(),
@@ -603,9 +820,18 @@ class P2pNcclEngine:
                 comm,
                 cudaStream_t(stream.cuda_stream),
             )
+            if timing_span is not None:
+                timing_span.end.record(stream)
         stream.synchronize()
 
-    def recv(self, comm, tensor: torch.Tensor, src: int, stream=None):
+    def recv(
+        self,
+        comm,
+        tensor: torch.Tensor,
+        src: int,
+        stream=None,
+        timing_span: CudaEventSpan | None = None,
+    ):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
@@ -614,6 +840,8 @@ class P2pNcclEngine:
             stream = current_stream()
 
         with torch.cuda.stream(stream):
+            if timing_span is not None:
+                timing_span.start.record(stream)
             self.nccl.ncclRecv(
                 buffer_type(tensor.data_ptr()),
                 tensor.numel(),
@@ -622,7 +850,96 @@ class P2pNcclEngine:
                 comm,
                 cudaStream_t(stream.cuda_stream),
             )
+            if timing_span is not None:
+                timing_span.end.record(stream)
         stream.synchronize()
+
+    # ==============================
+    # Optional timing methods
+    # ==============================
+
+    def begin_request_timing(self, request_id: str, batch_id: str | None) -> None:
+        if self.enable_timing:
+            self._safe_timing_call(
+                self._timing_tracker.bind_request, request_id, batch_id
+            )
+
+    def start_cuda_timing_span(self) -> CudaEventSpan | None:
+        return self._new_cuda_span(record_start=True)
+
+    def finish_cuda_timing_span(
+        self,
+        request_id: str,
+        stage: str,
+        span: CudaEventSpan | None,
+    ) -> None:
+        if not self.enable_timing or span is None:
+            return
+        try:
+            span.end.record()
+            self._timing_tracker.add_stage_span(
+                request_id,
+                stage,  # type: ignore[arg-type]
+                span,
+            )
+        except Exception:
+            self._safe_timing_log_exception(
+                "Failed to record P2P NCCL %s timing for %s", stage, request_id
+            )
+
+    def seal_request_timing(self, request_id: str, batch_id: str | None) -> None:
+        if self.enable_timing:
+            self._safe_timing_call(
+                self._timing_tracker.seal_request, request_id, batch_id
+            )
+
+    def fail_request_timing(self, request_id: str, message: str) -> None:
+        if self.enable_timing:
+            self._safe_timing_call(
+                self._timing_tracker.fail_request, request_id, message
+            )
+
+    def publish_ready_timing(self) -> None:
+        if self.enable_timing:
+            self._safe_timing_call(self._timing_tracker.publish_ready)
+
+    def discard_request_timing(self, request_id: str) -> None:
+        if self.enable_timing:
+            self._safe_timing_call(
+                self._timing_tracker.discard_request, request_id
+            )
+
+    @property
+    def timing_anchor(self) -> Any | None:
+        return getattr(self, "_timing_anchor", None)
+
+    def _new_cuda_span(self, *, record_start: bool) -> CudaEventSpan | None:
+        if not self.enable_timing:
+            return None
+        try:
+            span = CudaEventSpan(
+                start=torch.cuda.Event(enable_timing=True),
+                end=torch.cuda.Event(enable_timing=True),
+            )
+            if record_start:
+                span.start.record()
+            return span
+        except Exception:
+            self._safe_timing_log_exception("Failed to create P2P NCCL CUDA events")
+            return None
+
+    def _safe_timing_call(self, callback, *args, **kwargs) -> None:
+        try:
+            callback(*args, **kwargs)
+        except Exception:
+            self._safe_timing_log_exception("P2P NCCL timing operation failed")
+
+    @staticmethod
+    def _safe_timing_log_exception(message: str, *args: Any) -> None:
+        try:
+            logger.exception(message, *args)
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._listener_thread.join()

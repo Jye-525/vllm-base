@@ -1322,7 +1322,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_async_scheduling:
             return async_output
-        return async_output.get_output()
+        output = async_output.get_output()
+        self.kv_connector.on_model_output_ready()
+        return output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()

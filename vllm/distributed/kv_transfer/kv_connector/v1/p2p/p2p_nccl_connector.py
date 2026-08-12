@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -16,7 +18,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
 )
-from vllm.distributed.parallel_state import get_world_group
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_timing import (
+    CudaEventSpan,
+    extract_client_request_id,
+    nonnegative_duration_ms,
+    parse_timing_options,
+    timing_log_record,
+)
+from vllm.distributed.parallel_state import get_tp_group, get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.v1.attention.backend import AttentionMetadata
@@ -52,6 +61,13 @@ class ReqMeta:
         )
 
 
+@dataclass(frozen=True)
+class ScheduledReqMeta:
+    request_id: str
+    token_count: int
+    phase: str
+
+
 @dataclass
 class P2pNcclConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta]
@@ -71,6 +87,43 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         )
 
 
+@dataclass
+class P2pNcclTimingConnectorMetadata(P2pNcclConnectorMetadata):
+    """Timing-only scheduler metadata, absent from the disabled path."""
+
+    timed_requests: list[ScheduledReqMeta]
+    batch_request_ids: list[str]
+    batch_id: str | None
+
+    def __init__(self):
+        super().__init__()
+        self.timed_requests = []
+        self.batch_request_ids = []
+        self.batch_id = None
+
+
+@dataclass
+class _ActiveBatchTiming:
+    batch_id: str
+    requests: list[ScheduledReqMeta]
+    batch_request_ids: list[str]
+    forward_start: Any
+    host_start_perf_ns: int
+    host_start_wall_ns: int
+
+
+@dataclass
+class _PendingBatchTiming:
+    batch_id: str
+    requests: list[ScheduledReqMeta]
+    batch_request_ids: list[str]
+    forward_span: CudaEventSpan
+    host_start_perf_ns: int
+    host_end_perf_ns: int
+    host_start_wall_ns: int
+    host_end_wall_ns: int
+
+
 class P2pNcclConnector(KVConnectorBase_V1):
     def __init__(
         self,
@@ -88,10 +141,26 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self.is_producer = self._kv_transfer_config.is_kv_producer
         self.chunked_prefill: dict[str, tuple[list[int], list[int] | None]] = {}
 
+        self._timing_enabled, self._timing_detail = parse_timing_options(
+            self._kv_transfer_config,
+            async_scheduling=bool(vllm_config.scheduler_config.async_scheduling),
+        )
+        if self._timing_enabled:
+            self._timing_batch_counter = 0
+
         self._rank = get_world_group().rank if role == KVConnectorRole.WORKER else 0
         self._local_rank = (
             get_world_group().local_rank if role == KVConnectorRole.WORKER else 0
         )
+        self._tp_rank = 0
+        self._tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
+        if role == KVConnectorRole.WORKER:
+            tp_group = get_tp_group()
+            self._tp_rank = int(tp_group.rank_in_group)
+            self._tp_size = int(tp_group.world_size)
+        if self._timing_enabled and role == KVConnectorRole.WORKER:
+            self._active_timing: _ActiveBatchTiming | None = None
+            self._pending_timing: deque[_PendingBatchTiming] = deque()
 
         self.p2p_nccl_engine = (
             P2pNcclEngine(
@@ -99,6 +168,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 config=self._kv_transfer_config,
                 hostname="",
                 port_offset=self._rank,
+                tp_rank=self._tp_rank,
+                tp_size=self._tp_size,
             )
             if role == KVConnectorRole.WORKER
             else None
@@ -121,14 +192,24 @@ class P2pNcclConnector(KVConnectorBase_V1):
             the same.
         """
 
-        # Only consumer/decode loads KV Cache
+        # Producer timing starts at the same pre-forward hook. Consumers start
+        # only after the initial KV receive and insertion below.
         if self.is_producer:
+            if self.p2p_nccl_engine is not None and self._timing_enabled:
+                metadata = self._get_connector_metadata()
+                assert isinstance(metadata, P2pNcclTimingConnectorMetadata)
+                for request in metadata.requests:
+                    self.p2p_nccl_engine.begin_request_timing(
+                        request.request_id, metadata.batch_id
+                    )
+            self._start_batch_timing()
             return
 
         assert self.p2p_nccl_engine is not None
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
+            self._start_batch_timing()
             return
 
         def inject_kv_into_layer(
@@ -195,6 +276,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Get the metadata
         metadata: KVConnectorMetadata = self._get_connector_metadata()
         assert isinstance(metadata, P2pNcclConnectorMetadata)
+        timing_metadata = None
+        if self._timing_enabled:
+            assert isinstance(metadata, P2pNcclTimingConnectorMetadata)
+            timing_metadata = metadata
 
         if metadata is None:
             return
@@ -202,31 +287,59 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Load the KV for each request each layer
         for request in metadata.requests:
             request_id = request.request_id
+            if self._timing_enabled:
+                assert timing_metadata is not None
+                self.p2p_nccl_engine.begin_request_timing(
+                    request_id, timing_metadata.batch_id
+                )
             ip, port = self.parse_request_id(request_id, False)
             remote_address = ip + ":" + str(port + self._rank)
-            for layer_name in forward_context.no_compile_layers:
-                layer = forward_context.no_compile_layers[layer_name]
+            try:
+                for layer_name in forward_context.no_compile_layers:
+                    layer = forward_context.no_compile_layers[layer_name]
 
-                # Only process layers that have kv_cache
-                # attribute (attention layers) Skip non-attention
-                # layers like FusedMoE
-                kv_cache = getattr(layer, "kv_cache", None)
-                if kv_cache is None:
-                    continue
+                    # Only process layers that have kv_cache
+                    # attribute (attention layers) Skip non-attention
+                    # layers like FusedMoE
+                    kv_cache = getattr(layer, "kv_cache", None)
+                    if kv_cache is None:
+                        continue
 
-                layer = kv_cache
+                    layer = kv_cache
 
-                kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address
+                    kv_cache = self.p2p_nccl_engine.recv_tensor(
+                        request.request_id + "#" + layer_name, remote_address
+                    )
+
+                    if kv_cache is None:
+                        logger.warning("🚧kv_cache is None, %s", request.request_id)
+                        continue
+
+                    insertion_span = None
+                    if self._timing_enabled:
+                        insertion_span = (
+                            self.p2p_nccl_engine.start_cuda_timing_span()
+                        )
+                    inject_kv_into_layer(
+                        layer, kv_cache, request.block_ids, request.request_id
+                    )
+                    if self._timing_enabled:
+                        self.p2p_nccl_engine.finish_cuda_timing_span(
+                            request_id, "insertion", insertion_span
+                        )
+            except Exception as exc:
+                if self._timing_enabled:
+                    self.p2p_nccl_engine.fail_request_timing(
+                        request_id, f"consumer_load_failed:{type(exc).__name__}"
+                    )
+                raise
+            if self._timing_enabled:
+                assert timing_metadata is not None
+                self.p2p_nccl_engine.seal_request_timing(
+                    request_id, timing_metadata.batch_id
                 )
 
-                if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
-                    continue
-
-                inject_kv_into_layer(
-                    layer, kv_cache, request.block_ids, request.request_id
-                )
+        self._start_batch_timing()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -296,20 +409,57 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
+        timing_metadata = None
+        if self._timing_enabled:
+            assert isinstance(
+                connector_metadata, P2pNcclTimingConnectorMetadata
+            )
+            timing_metadata = connector_metadata
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
+            extraction_span = None
+            if self._timing_enabled:
+                extraction_span = self.p2p_nccl_engine.start_cuda_timing_span()
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
-            )
+            if self._timing_enabled:
+                assert timing_metadata is not None
+                self.p2p_nccl_engine.finish_cuda_timing_span(
+                    request_id, "extraction", extraction_span
+                )
+                assert timing_metadata is not None
+                self.p2p_nccl_engine.send_tensor(
+                    request_id + "#" + layer_name,
+                    kv_cache,
+                    remote_address,
+                    batch_id=timing_metadata.batch_id,
+                )
+            else:
+                self.p2p_nccl_engine.send_tensor(
+                    request_id + "#" + layer_name, kv_cache, remote_address
+                )
 
     def wait_for_save(self):
+        self._end_batch_timing()
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
+            if self._timing_enabled:
+                metadata = self._get_connector_metadata()
+                assert isinstance(metadata, P2pNcclTimingConnectorMetadata)
+                for request in metadata.requests:
+                    self.p2p_nccl_engine.seal_request_timing(
+                        request.request_id, metadata.batch_id
+                    )
             self.p2p_nccl_engine.wait_for_sent()
+
+    def on_model_output_ready(self) -> None:
+        if not self._timing_enabled:
+            return
+        if self.p2p_nccl_engine is not None:
+            self.p2p_nccl_engine.publish_ready_timing()
+        self._drain_ready_batch_timing()
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any
@@ -388,7 +538,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
 
-        meta = P2pNcclConnectorMetadata()
+        meta = (
+            P2pNcclTimingConnectorMetadata()
+            if self._timing_enabled
+            else P2pNcclConnectorMetadata()
+        )
 
         for new_req in scheduler_output.scheduled_new_reqs:
             if self.is_producer:
@@ -473,7 +627,212 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
 
         self._requests_need_load.clear()
+        if self._timing_enabled:
+            self._add_scheduled_timing(meta, scheduler_output)
         return meta
+
+    def _add_scheduled_timing(
+        self,
+        meta: P2pNcclConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        assert isinstance(meta, P2pNcclTimingConnectorMetadata)
+        transfer_request_ids = {request.request_id for request in meta.requests}
+        meta.batch_request_ids = [
+            str(request_id) for request_id in scheduler_output.num_scheduled_tokens
+        ]
+        meta.timed_requests = []
+        for request_id, token_count in scheduler_output.num_scheduled_tokens.items():
+            if self.is_producer:
+                phase = "prefill"
+            elif request_id in transfer_request_ids:
+                phase = "decode_first"
+            else:
+                phase = "decode_generation"
+            meta.timed_requests.append(
+                ScheduledReqMeta(
+                    request_id=str(request_id),
+                    token_count=int(token_count),
+                    phase=phase,
+                )
+            )
+        counter = self._timing_batch_counter
+        self._timing_batch_counter += 1
+        engine_id = str(self._kv_transfer_config.engine_id or "engine")[:12]
+        role = "producer" if self.is_producer else "consumer"
+        # This scheduler-created value is copied to every TP worker.
+        meta.batch_id = f"p2p-{role}-{engine_id}-{counter:08d}"
+
+    def _start_batch_timing(self) -> None:
+        if not self._timing_enabled or self.p2p_nccl_engine is None:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, P2pNcclTimingConnectorMetadata)
+        if not metadata.timed_requests or metadata.batch_id is None:
+            return
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            host_start_perf_ns = time.perf_counter_ns()
+            host_start_wall_ns = time.time_ns()
+            start.record()
+            self._active_timing = _ActiveBatchTiming(
+                batch_id=metadata.batch_id,
+                requests=list(metadata.timed_requests),
+                batch_request_ids=list(metadata.batch_request_ids or ()),
+                forward_start=start,
+                host_start_perf_ns=host_start_perf_ns,
+                host_start_wall_ns=host_start_wall_ns,
+            )
+        except Exception:
+            self._safe_timing_log_exception(
+                "Failed to start P2P NCCL batch timing %s", metadata.batch_id
+            )
+
+    def _end_batch_timing(self) -> None:
+        if not self._timing_enabled:
+            return
+        active = getattr(self, "_active_timing", None)
+        if active is None:
+            return
+        try:
+            host_end_perf_ns = time.perf_counter_ns()
+            host_end_wall_ns = time.time_ns()
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._pending_timing.append(
+                _PendingBatchTiming(
+                    batch_id=active.batch_id,
+                    requests=active.requests,
+                    batch_request_ids=active.batch_request_ids,
+                    forward_span=CudaEventSpan(active.forward_start, end),
+                    host_start_perf_ns=active.host_start_perf_ns,
+                    host_end_perf_ns=host_end_perf_ns,
+                    host_start_wall_ns=active.host_start_wall_ns,
+                    host_end_wall_ns=host_end_wall_ns,
+                )
+            )
+        except Exception:
+            self._safe_timing_log_exception(
+                "Failed to finish P2P NCCL batch timing %s", active.batch_id
+            )
+        finally:
+            self._active_timing = None
+
+    def _drain_ready_batch_timing(self) -> None:
+        ready: list[_PendingBatchTiming] = []
+        retained: deque[_PendingBatchTiming] = deque()
+        while self._pending_timing:
+            pending = self._pending_timing.popleft()
+            try:
+                if pending.forward_span.ready():
+                    ready.append(pending)
+                else:
+                    retained.append(pending)
+            except Exception:
+                retained.append(pending)
+                self._safe_timing_log_exception(
+                    "Failed to query P2P NCCL batch timing %s", pending.batch_id
+                )
+        self._pending_timing = retained
+        for pending in ready:
+            try:
+                self._emit_batch_timing(pending)
+            except Exception:
+                self._safe_timing_log_exception(
+                    "Failed to emit P2P NCCL batch timing %s", pending.batch_id
+                )
+
+    def _emit_batch_timing(self, pending: _PendingBatchTiming) -> None:
+        assert self.p2p_nccl_engine is not None
+        anchor = self.p2p_nccl_engine.timing_anchor
+        if anchor is None:
+            return
+        forward_gpu_ms = pending.forward_span.elapsed_ms()
+        anchor_start_ms, anchor_end_ms = (
+            pending.forward_span.anchor_offsets_ms(anchor)
+        )
+        host_ms, clock_anomaly = nonnegative_duration_ms(
+            pending.host_start_perf_ns, pending.host_end_perf_ns
+        )
+        clock_anomaly |= pending.host_end_wall_ns < pending.host_start_wall_ns
+        phases = {request.phase for request in pending.requests}
+        if self.is_producer:
+            phase = "prefill"
+        elif phases == {"decode_first"}:
+            phase = "decode_first"
+        elif phases == {"decode_generation"}:
+            phase = "decode_generation"
+        else:
+            phase = "mixed"
+        batch_request_ids = list(pending.batch_request_ids) or [
+            request.request_id for request in pending.requests
+        ]
+        client_ids = {
+            extract_client_request_id(request_id)
+            for request_id in batch_request_ids
+        }
+        send_type = self._kv_transfer_config.get_from_extra_config(
+            "send_type", "PUT_ASYNC"
+        )
+        record = {
+            "schema_version": 1,
+            "record_type": "batch_forward",
+            "connector": "P2pNcclConnector",
+            "role": "producer" if self.is_producer else "consumer",
+            "send_type": send_type,
+            "request_id": (
+                batch_request_ids[0] if len(batch_request_ids) == 1 else None
+            ),
+            "client_request_id": (
+                next(iter(client_ids)) if len(client_ids) == 1 else None
+            ),
+            "batch_id": pending.batch_id,
+            "batch_size": len(batch_request_ids),
+            "batch_request_ids": batch_request_ids,
+            "requests": [
+                {
+                    "request_id": request.request_id,
+                    "client_request_id": extract_client_request_id(
+                        request.request_id
+                    ),
+                    "token_count": request.token_count,
+                    "phase": request.phase,
+                }
+                for request in pending.requests
+            ],
+            "phase": phase,
+            "tp_rank": self._tp_rank,
+            "tp_size": self._tp_size,
+            "local_rank": self._local_rank,
+            "host": self.p2p_nccl_engine._hostname,
+            "device": str(self.p2p_nccl_engine.device),
+            "measurement_scope": (
+                "exact_per_request"
+                if len(batch_request_ids) == 1
+                else "batch_shared"
+            ),
+            "forward_gpu_ms": forward_gpu_ms,
+            "forward_host_envelope_ms": host_ms,
+            "host_envelope_start_wall_ns": pending.host_start_wall_ns,
+            "host_envelope_end_wall_ns": pending.host_end_wall_ns,
+            "gpu_anchor_start_ms": anchor_start_ms,
+            "gpu_anchor_end_ms": anchor_end_ms,
+            "status": "clock_anomaly" if clock_anomaly else "ok",
+            "measurement_semantics": {
+                "forward": "model_stream_envelope_not_kernel_sum",
+                "batch_compute": "shared_not_divided_across_requests",
+                "put": "synchronous_send_not_added_to_prefill",
+                "put_async": "overlap_prefill_use_batch_tail_not_request_sum",
+            },
+        }
+        timing_log_record(logger, record)
+
+    @staticmethod
+    def _safe_timing_log_exception(message: str, *args: Any) -> None:
+        try:
+            logger.exception(message, *args)
+        except Exception:
+            pass
 
     def request_finished(
         self,

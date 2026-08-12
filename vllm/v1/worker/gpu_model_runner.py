@@ -283,6 +283,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().on_model_output_ready()
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -4473,6 +4475,8 @@ class GPUModelRunner(
         # draft model to also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
+        if not self.use_async_scheduling and has_kv_transfer_group():
+            get_kv_transfer_group().on_model_output_ready()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()

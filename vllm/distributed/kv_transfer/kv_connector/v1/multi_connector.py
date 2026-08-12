@@ -290,6 +290,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.wait_for_save()
 
+    def on_model_output_ready(self) -> None:
+        for c in self._connectors:
+            c.on_model_output_ready()
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
