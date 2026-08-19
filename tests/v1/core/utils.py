@@ -59,6 +59,13 @@ def create_scheduler(
     ec_role: str | None = None,
     scheduling_policy: str = "fcfs",
     lpm_window_size: int = SchedulerConfig.lpm_window_size,
+    lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold,
+    lpm_deprioritize_threshold: int = SchedulerConfig.lpm_deprioritize_threshold,
+    clpm_big_lane_share: float = SchedulerConfig.clpm_big_lane_share,
+    clpm_age_alpha: float = SchedulerConfig.clpm_age_alpha,
+    clpm_group_major: bool = SchedulerConfig.clpm_group_major,
+    clpm_dynamic_lane: bool = SchedulerConfig.clpm_dynamic_lane,
+    clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -93,6 +100,13 @@ def create_scheduler(
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=scheduling_policy,
         lpm_window_size=lpm_window_size,
+        lpm_check_threshold=lpm_check_threshold,
+        lpm_deprioritize_threshold=lpm_deprioritize_threshold,
+        clpm_big_lane_share=clpm_big_lane_share,
+        clpm_age_alpha=clpm_age_alpha,
+        clpm_group_major=clpm_group_major,
+        clpm_dynamic_lane=clpm_dynamic_lane,
+        clpm_slo_budget_s=clpm_slo_budget_s,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

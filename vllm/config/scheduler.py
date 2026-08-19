@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "lpm"]
+SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm"]
 
 
 @config
@@ -113,11 +113,36 @@ class SchedulerConfig:
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
-    - "lpm" means longest prefix match among a bounded FCFS window."""
+    - "lpm" means PEEK-style longest prefix match among a bounded FCFS
+      window.
+    - "clpm" adds clustered demand and an age-aware fairness lane."""
 
-    lpm_window_size: int = Field(default=16, ge=1)
-    """For LPM scheduling, the number of waiting requests to inspect and rank
-    by local prefix-cache hit length in each scheduler step."""
+    lpm_window_size: int = Field(default=128, ge=0)
+    """For LPM/cLPM scheduling, the number of waiting requests to reorder per
+    scheduler step. Zero means the full waiting queue."""
+
+    lpm_check_threshold: int = 32
+    """Requests with at most this many cached tokens are considered cold.
+    A negative value disables cold pioneer/sibling classification."""
+
+    lpm_deprioritize_threshold: int = 32
+    """Token depth used for the cold-prefix pioneer claim. A non-positive
+    value disables sibling deprioritization."""
+
+    clpm_big_lane_share: float = Field(default=0.7, ge=0.0, le=1.0)
+    """Static share assigned to cLPM's cache-oriented lane A."""
+
+    clpm_age_alpha: float = Field(default=0.0, ge=0.0)
+    """Cached-token-equivalent score added per second of waiting in lane A."""
+
+    clpm_group_major: bool = False
+    """Order lane A by shared-prefix groups before individual requests."""
+
+    clpm_dynamic_lane: bool = False
+    """Dynamically adjust the age-lane share from singleton and age pressure."""
+
+    clpm_slo_budget_s: float = Field(default=2.0, gt=0.0)
+    """Waiting-time budget used to normalize cLPM's dynamic age pressure."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

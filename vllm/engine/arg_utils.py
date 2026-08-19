@@ -594,6 +594,13 @@ class EngineArgs:
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
     lpm_window_size: int = SchedulerConfig.lpm_window_size
+    lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
+    lpm_deprioritize_threshold: int = SchedulerConfig.lpm_deprioritize_threshold
+    clpm_big_lane_share: float = SchedulerConfig.clpm_big_lane_share
+    clpm_age_alpha: float = SchedulerConfig.clpm_age_alpha
+    clpm_group_major: bool = SchedulerConfig.clpm_group_major
+    clpm_dynamic_lane: bool = SchedulerConfig.clpm_dynamic_lane
+    clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
 
@@ -1370,6 +1377,28 @@ class EngineArgs:
             "--lpm-window-size", **scheduler_kwargs["lpm_window_size"]
         )
         scheduler_group.add_argument(
+            "--lpm-check-threshold", **scheduler_kwargs["lpm_check_threshold"]
+        )
+        scheduler_group.add_argument(
+            "--lpm-deprioritize-threshold",
+            **scheduler_kwargs["lpm_deprioritize_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--clpm-big-lane-share", **scheduler_kwargs["clpm_big_lane_share"]
+        )
+        scheduler_group.add_argument(
+            "--clpm-age-alpha", **scheduler_kwargs["clpm_age_alpha"]
+        )
+        scheduler_group.add_argument(
+            "--clpm-group-major", **scheduler_kwargs["clpm_group_major"]
+        )
+        scheduler_group.add_argument(
+            "--clpm-dynamic-lane", **scheduler_kwargs["clpm_dynamic_lane"]
+        )
+        scheduler_group.add_argument(
+            "--clpm-slo-budget-s", **scheduler_kwargs["clpm_slo_budget_s"]
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -2017,6 +2046,13 @@ class EngineArgs:
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
             lpm_window_size=self.lpm_window_size,
+            lpm_check_threshold=self.lpm_check_threshold,
+            lpm_deprioritize_threshold=self.lpm_deprioritize_threshold,
+            clpm_big_lane_share=self.clpm_big_lane_share,
+            clpm_age_alpha=self.clpm_age_alpha,
+            clpm_group_major=self.clpm_group_major,
+            clpm_dynamic_lane=self.clpm_dynamic_lane,
+            clpm_slo_budget_s=self.clpm_slo_budget_s,
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,

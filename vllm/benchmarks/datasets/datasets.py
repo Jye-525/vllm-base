@@ -29,6 +29,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, cast
 
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 import numpy as np
 import pybase64 as base64
 from huggingface_hub import snapshot_download
@@ -83,6 +85,8 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    chat_messages: list[dict[str, Any]] | None = None
+    request_overrides: dict | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -1582,6 +1586,21 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         "from the sampled HF dataset.",
     )
 
+    bfcl_group = parser.add_argument_group(
+        "BFCL dataset options", description=BFCLDataset.__doc__
+    )
+    bfcl_group.add_argument(
+        "--bfcl-categories",
+        type=lambda value: [
+            category.strip() for category in value.split(",") if category.strip()
+        ],
+        default=None,
+        help="Comma-separated list of BFCL v3 category names (without the "
+        "'BFCL_v3_' prefix or '.json' suffix) to sample from, e.g. "
+        "'simple,live_simple,multiple'. Defaults to "
+        f"'{','.join(BFCLDataset.DEFAULT_CATEGORIES)}'.",
+    )
+
     prefix_repetition_group = parser.add_argument_group(
         "prefix repetition dataset options"
     )
@@ -2005,6 +2024,19 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
             dataset_class = MMStarDataset
             args.hf_split = args.hf_split if args.hf_split else "val"
             args.hf_subset = None
+        elif (
+            args.dataset_path in BFCLDataset.SUPPORTED_DATASET_PATHS
+            or args.hf_name in BFCLDataset.SUPPORTED_DATASET_PATHS
+        ):
+            if args.backend != "openai-chat":
+                raise ValueError(
+                    "BFCL dataset requires the 'openai-chat' backend because "
+                    "it sends per-request tool schemas via chat completions."
+                )
+            dataset_class = BFCLDataset
+            args.hf_split = args.hf_split or "train"
+            args.hf_subset = None
+            hf_kwargs = {"categories": args.bfcl_categories}
         else:
             supported_datasets = set(
                 [
@@ -3918,3 +3950,175 @@ class SpeedBench(CustomDataset):
         random.seed(self.random_seed)
         if not getattr(self, "disable_shuffle", False):
             random.shuffle(self.data)
+
+
+# -----------------------------------------------------------------------------
+# BFCL (Berkeley Function Calling Leaderboard) Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class BFCLDataset(HuggingFaceDataset):
+    """Berkeley Function Calling Leaderboard dataset.
+
+    BFCL stores one JSON-lines file per category at the dataset repository root.
+    The loader interleaves selected categories, translates BFCL function schemas
+    to OpenAI tools, and creates chat-completion requests with per-request tools.
+    """
+
+    DEFAULT_OUTPUT_LEN = 512
+    DEFAULT_CATEGORIES = ("simple", "live_simple", "multiple")
+    SUPPORTED_DATASET_PATHS = {
+        "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+    }
+    IS_MULTIMODAL = False
+    _TYPE_REMAP = {
+        "dict": "object",
+        "float": "number",
+        "tuple": "array",
+        "any": "string",
+    }
+
+    def load_data(self) -> None:
+        """Defer loading until the requested categories are known."""
+        self.data = None
+
+    def _resolve_categories(self, categories: list[str] | None) -> list[str]:
+        if not categories:
+            return list(self.DEFAULT_CATEGORIES)
+        resolved = [category.strip() for category in categories if category.strip()]
+        return resolved or list(self.DEFAULT_CATEGORIES)
+
+    def _load_category(self, category: str) -> list[dict]:
+        filename = f"BFCL_v3_{category}.json"
+        try:
+            path = hf_hub_download(
+                repo_id=self.dataset_path,
+                filename=filename,
+                repo_type="dataset",
+            )
+        except EntryNotFoundError as exc:
+            defaults = ", ".join(self.DEFAULT_CATEGORIES)
+            raise ValueError(
+                f"BFCL category '{category}' not found: file '{filename}' "
+                f"does not exist in {self.dataset_path}. Check --bfcl-categories "
+                f"(defaults: {defaults})."
+            ) from exc
+
+        rows: list[dict] = []
+        with open(path) as dataset_file:
+            for line in dataset_file:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    @classmethod
+    def _translate_schema(cls, node: Any) -> Any:
+        """Translate BFCL-flavored JSON schema to strict JSON Schema."""
+        if isinstance(node, dict):
+            translated = {
+                key: cls._translate_schema(value) for key, value in node.items()
+            }
+            schema_type = translated.get("type")
+            if isinstance(schema_type, str) and schema_type in cls._TYPE_REMAP:
+                translated["type"] = cls._TYPE_REMAP[schema_type]
+            return translated
+        if isinstance(node, list):
+            return [cls._translate_schema(value) for value in node]
+        return node
+
+    @classmethod
+    def _to_openai_tools(cls, functions: list[dict]) -> list[dict]:
+        return [
+            {"type": "function", "function": cls._translate_schema(function)}
+            for function in functions
+        ]
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        output_len: int | None = None,
+        categories: list[str] | None = None,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
+        categories = self._resolve_categories(categories)
+        per_category_rows = [self._load_category(category) for category in categories]
+
+        interleaved: list[dict] = []
+        max_len = max((len(rows) for rows in per_category_rows), default=0)
+        for index in range(max_len):
+            for rows in per_category_rows:
+                if index < len(rows):
+                    interleaved.append(rows[index])
+
+        if not self.disable_shuffle:
+            rng = random.Random(self.random_seed)
+            rng.shuffle(interleaved)
+
+        sampled_requests: list[SampleRequest] = []
+        for row in interleaved:
+            if len(sampled_requests) >= num_requests:
+                break
+            question = row.get("question")
+            functions = row.get("function")
+            if not question or not functions or not isinstance(question, list):
+                continue
+
+            first_turn = question[0]
+            if not isinstance(first_turn, list) or not first_turn:
+                continue
+            messages = first_turn
+            if not isinstance(functions, list):
+                functions = [functions]
+            tools = self._to_openai_tools(functions)
+
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except TypeError:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "BFCL: apply_chat_template failed for a sample; falling "
+                    "back to plain-text prompt length: %s",
+                    exc,
+                    exc_info=True,
+                )
+                rendered = None
+
+            if isinstance(rendered, str):
+                prompt_len = len(tokenizer(rendered).input_ids)
+            else:
+                text = "\n".join(
+                    str(message.get("content", "")) for message in messages
+                )
+                prompt_len = len(tokenizer(text).input_ids)
+
+            prompt_text = str(messages[-1].get("content", ""))
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt_text,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    request_id=request_id_prefix + str(len(sampled_requests)),
+                    chat_messages=messages,
+                    request_overrides={"tools": tools, "tool_choice": "auto"},
+                )
+            )
+
+        self.maybe_oversample_requests(
+            sampled_requests, num_requests, request_id_prefix, no_oversample
+        )
+        return sampled_requests

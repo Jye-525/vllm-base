@@ -4,7 +4,7 @@ import itertools
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -34,10 +34,9 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.eviction_scorer import compute_demand_scores
-from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.request_logger import RequestEventLogger
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -47,11 +46,14 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    FCFSRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
+from vllm.v1.core.sched.waiting_ranker import RankPlan, rank_clpm, rank_lpm
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -164,21 +166,23 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
-        if (self.policy == SchedulingPolicy.LPM
-                and not self.cache_config.enable_prefix_caching):
+        if (
+            self.policy in (SchedulingPolicy.LPM, SchedulingPolicy.CLPM)
+            and not self.cache_config.enable_prefix_caching
+        ):
             logger.warning_once(
-                "LPM scheduling requires prefix caching. Falling back to FCFS "
-                "because prefix caching is disabled.")
+                "LPM/cLPM scheduling requires prefix caching. Falling back to FCFS "
+                "because prefix caching is disabled."
+            )
             self.policy = SchedulingPolicy.FCFS
-        try:
-            self._lpm_max_windows = max(
-                1, int(os.environ.get("VLLM_LPM_MAX_WINDOWS", "1")))
-        except ValueError:
-            self._lpm_max_windows = 1
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
+        self.pending_prefix_index = PendingPrefixIndex()
+        self._clpm_lane_a_pass = 0.0
+        self._clpm_lane_b_pass = 0.0
+        self._clpm_dynamic_b_share = 0.3
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -255,22 +259,13 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
-        # Waiting-queue-aware eviction. Each schedule() step the scheduler
-        # turns the waiting queue into a per-block demand score and publishes
-        # it to the block pool, which protects high-score blocks from eviction
-        # (see eviction_scorer.compute_demand_scores and
-        # BlockPool._select_victims_scored).
+        # Waiting-queue-aware eviction. PendingPrefixIndex maintains cumulative
+        # block-hash demand as requests enter and leave the waiting queue. The
+        # block pool consumes only the changed absolute counts.
         #   VLLM_EVICTION_POLICY : "lru" (default stock baseline)
         #                          | "score"/"demand_aware" (opt-in)
-        #   VLLM_EVICTION_GAMMA  : position-decay factor in (0, 1], default 0.9
-        #   VLLM_EVICTION_MAX_WAITERS : cap on waiters scanned per step
-        #   VLLM_EVICTION_WEIGHT_POSITION : mixture weight for nearest reuse
-        #   VLLM_EVICTION_WEIGHT_REUSE    : mixture weight for reuse count
-        #   VLLM_EVICTION_WEIGHT_DEPTH    : mixture weight for chain-loss depth
         #   VLLM_EVICTION_REUSE_MIN_COUNT : min waiters reusing a block before
         #                                   it receives a positive score
-        #   VLLM_EVICTION_DEMAND_MODE : "evictable_only" (default)
-        #                              | "full_prefix_evictable_output"
         #   VLLM_EVICTION_BINARY_DEMAND : if true, collapse every positive
         #                                 demand score to 1.0
         policy = os.environ.get("VLLM_EVICTION_POLICY", "lru").strip().lower()
@@ -278,60 +273,16 @@ class Scheduler(SchedulerInterface):
             policy = "score"
         if not self.cache_config.enable_prefix_caching:
             policy = "lru"
-        self._eviction_policy: str = policy if policy in ("score", "lru") \
-            else "lru"
-        try:
-            self._eviction_gamma: float = float(
-                os.environ.get("VLLM_EVICTION_GAMMA", "0.9"))
-        except ValueError:
-            self._eviction_gamma = 0.9
-        # Clamp to (0, 1]; 0 would zero out every position including p=0.
-        self._eviction_gamma = min(1.0, max(1e-6, self._eviction_gamma))
-        try:
-            self._eviction_max_waiters: int = max(
-                1, int(os.environ.get("VLLM_EVICTION_MAX_WAITERS", "256")))
-        except ValueError:
-            self._eviction_max_waiters = 256
-        # Far waiters whose gamma**p falls below this contribute negligibly.
-        self._eviction_epsilon: float = 1e-3
-        try:
-            self._eviction_position_weight: float = float(
-                os.environ.get("VLLM_EVICTION_WEIGHT_POSITION",
-                               str(1.0 / 3.0)))
-        except ValueError:
-            self._eviction_position_weight = 1.0 / 3.0
-        try:
-            self._eviction_reuse_weight: float = float(
-                os.environ.get("VLLM_EVICTION_WEIGHT_REUSE",
-                               str(1.0 / 3.0)))
-        except ValueError:
-            self._eviction_reuse_weight = 1.0 / 3.0
-        try:
-            self._eviction_depth_weight: float = float(
-                os.environ.get("VLLM_EVICTION_WEIGHT_DEPTH",
-                               str(1.0 / 3.0)))
-        except ValueError:
-            self._eviction_depth_weight = 1.0 / 3.0
+        self._eviction_policy: str = policy if policy in ("score", "lru") else "lru"
         try:
             self._eviction_reuse_min_count: int = max(
-                1, int(os.environ.get("VLLM_EVICTION_REUSE_MIN_COUNT", "1")))
+                1, int(os.environ.get("VLLM_EVICTION_REUSE_MIN_COUNT", "1"))
+            )
         except ValueError:
             self._eviction_reuse_min_count = 1
-        demand_mode = os.environ.get(
-            "VLLM_EVICTION_DEMAND_MODE", "evictable_only").strip().lower()
-        if demand_mode in ("full_prefix", "full_prefix_evictable",
-                           "full_prefix_evictable_output"):
-            demand_mode = "full_prefix_evictable_output"
-        elif demand_mode not in ("evictable_only", ):
-            demand_mode = "evictable_only"
-        self._eviction_demand_mode = demand_mode
         self._eviction_binary_demand = os.environ.get(
-            "VLLM_EVICTION_BINARY_DEMAND", "0").strip().lower() in (
-                "1", "true", "yes", "on")
-        # KV cache group ids used for existence checks during prefix truncation.
-        self._eviction_group_ids: tuple[int, ...] = tuple(
-            range(len(kv_cache_config.kv_cache_groups))
-        ) or (0,)
+            "VLLM_EVICTION_BINARY_DEMAND", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         # Tell the block pool which eviction policy to use.
         self.kv_cache_manager.block_pool._eviction_policy = self._eviction_policy
 
@@ -421,135 +372,51 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
-    def _publish_demand_scores(self) -> None:
-        """Compute and publish per-block demand scores from the waiting
-        queue, once per schedule() step.
-        """
+    def _update_pending_demand(self, counts: Mapping[BlockHash, int]) -> None:
+        if self._eviction_policy != "score" or not counts:
+            return
+        self.kv_cache_manager.block_pool.update_demand_counts(
+            counts,
+            min_count=self._eviction_reuse_min_count,
+            binary=self._eviction_binary_demand,
+        )
+
+    def _track_waiting_request(self, request: Request) -> None:
+        counts = self.pending_prefix_index.upsert(
+            request.request_id,
+            request.block_hashes,
+            ready=request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED),
+        )
+        self._update_pending_demand(counts)
+
+    def _set_waiting_request_ready(self, request: Request) -> None:
+        self.pending_prefix_index.set_ready(
+            request.request_id,
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED),
+        )
+
+    def _untrack_waiting_request(self, request: Request) -> None:
+        counts = self.pending_prefix_index.discard(request.request_id)
+        self._update_pending_demand(counts)
+
+    def _republish_pending_demand(self) -> None:
         if self._eviction_policy != "score":
             return
-        block_pool = self.kv_cache_manager.block_pool
-        if not self.waiting:
-            block_pool.set_demand_scores({})
-            return
+        min_count = self._eviction_reuse_min_count
+        binary = self._eviction_binary_demand
+        scores = {
+            block_hash: 1.0 if binary else float(count)
+            for block_hash, count in self.pending_prefix_index.demand_counts.items()
+            if count >= min_count
+        }
+        self.kv_cache_manager.block_pool.set_demand_scores(scores)
 
-        group_ids = self._eviction_group_ids
-        gamma = self._eviction_gamma
-        eps = self._eviction_epsilon
-        max_waiters = self._eviction_max_waiters
-
-        # Extract scheduler-visible reusable prefixes from the waiting list.
-        prefixes: list[Sequence[BlockHash]] = []
-        eligible_hashes: set[BlockHash] | None = (
-            set() if self._eviction_demand_mode ==
-            "full_prefix_evictable_output" else None)
-        weight = 1.0
-        scanned_waiters = 0
-        nonempty_prefixes = 0
-        total_cached_prefix_blocks = 0
-        total_evictable_prefix_blocks = 0
-        max_cached_prefix_blocks = 0
-        total_active_hits = 0
-        cutoff_reason = "waiting_exhausted"
-        position_buckets = [0, 0, 0, 0]
-        evictable_position_buckets = [0, 0, 0, 0]
-        for i, req in enumerate(self.waiting):
-            if i >= max_waiters:
-                cutoff_reason = "max_waiters"
-                break
-            if weight < eps:
-                cutoff_reason = "epsilon"
-                break
-            hashes = req.block_hashes
-            if hashes:
-                # check how much of a waiting request's prefix is actually reusable from the prefix cache.
-                # cached_prefix_len = number of consecutive block hashes
-                cached_prefix_len, active_hits, evictable_hashes = (
-                    block_pool.classify_chain(hashes, group_ids)
-                )
-                evictable_prefix_len = len(evictable_hashes)
-                if cached_prefix_len > 0:
-                    nonempty_prefixes += 1
-                    total_cached_prefix_blocks += cached_prefix_len
-                    total_evictable_prefix_blocks += evictable_prefix_len
-                    max_cached_prefix_blocks = max(
-                        max_cached_prefix_blocks, cached_prefix_len)
-                    total_active_hits += active_hits
-                    if i < 8:
-                        position_buckets[0] += cached_prefix_len
-                        evictable_position_buckets[0] += evictable_prefix_len
-                    elif i < 32:
-                        position_buckets[1] += cached_prefix_len
-                        evictable_position_buckets[1] += evictable_prefix_len
-                    elif i < 128:
-                        position_buckets[2] += cached_prefix_len
-                        evictable_position_buckets[2] += evictable_prefix_len
-                    else:
-                        position_buckets[3] += cached_prefix_len
-                        evictable_position_buckets[3] += evictable_prefix_len
-                if eligible_hashes is None:
-                    prefixes.append(evictable_hashes)
-                else:
-                    prefixes.append(hashes[:cached_prefix_len])
-                    eligible_hashes.update(evictable_hashes)
-            else:
-                prefixes.append(())
-            scanned_waiters += 1
-            weight *= gamma
-
-        # Compute the score for each common block
-        scores = compute_demand_scores(
-            prefixes,
-            gamma,
-            eps,
-            position_weight=self._eviction_position_weight,
-            reuse_weight=self._eviction_reuse_weight,
-            depth_weight=self._eviction_depth_weight,
-            reuse_min_count=self._eviction_reuse_min_count,
-            eligible_hashes=eligible_hashes,
-        )
-        if self._eviction_binary_demand:
-            scores = {h: 1.0 for h in scores}
-        block_pool.set_demand_scores(scores)
-        if scores:
-            score_values = list(scores.values())
-            avg_score = sum(score_values) / len(score_values)
-            min_score = min(score_values)
-            max_score = max(score_values)
-        else:
-            avg_score = min_score = max_score = 0.0
-        avg_cached_prefix_blocks = (
-            total_cached_prefix_blocks / nonempty_prefixes
-            if nonempty_prefixes > 0 else 0.0)
-        logger.info(
-            "demand_publish: waiting=%d scanned=%d cutoff=%s gamma=%.4f "
-            "eps=%.1e max_waiters=%d reuse_min_count=%d mode=%s nonempty=%d "
-            "cached_blocks=%d evictable_blocks=%d "
-            "avg_cached=%.1f max_cached=%d "
-            "active_hits=%d scores=%d "
-            "score_min=%.6f score_avg=%.6f score_max=%.6f "
-            "pos_blocks_0_7=%d pos_blocks_8_31=%d "
-            "pos_blocks_32_127=%d pos_blocks_128p=%d "
-            "evictable_pos_blocks_0_7=%d evictable_pos_blocks_8_31=%d "
-            "evictable_pos_blocks_32_127=%d evictable_pos_blocks_128p=%d",
-            len(self.waiting), scanned_waiters, cutoff_reason, gamma,
-            eps, max_waiters, self._eviction_reuse_min_count,
-            self._eviction_demand_mode,
-            nonempty_prefixes,
-            total_cached_prefix_blocks, total_evictable_prefix_blocks,
-            avg_cached_prefix_blocks, max_cached_prefix_blocks,
-            total_active_hits, len(scores), min_score, avg_score, max_score,
-            position_buckets[0], position_buckets[1], position_buckets[2],
-            position_buckets[3], evictable_position_buckets[0],
-            evictable_position_buckets[1], evictable_position_buckets[2],
-            evictable_position_buckets[3],
-        )
-
-    def _can_rank_request_for_lpm(
+    def _can_rank_waiting_request(
         self,
         request: Request,
         scheduled_loras: set[int],
     ) -> bool:
-        """Return whether a waiting request is eligible for LPM ranking.
+        """Return whether a waiting request is eligible for prefix ranking.
 
         This check is intentionally conservative and side-effect free. The
         normal waiting-admission path still performs the authoritative checks
@@ -561,61 +428,97 @@ class Scheduler(SchedulerInterface):
             return False
         if request.skip_reading_prefix_cache:
             return False
-        if (
+        return not (
             self.lora_config
             and request.lora_request
             and len(scheduled_loras) == self.lora_config.max_loras
             and request.lora_request.lora_int_id not in scheduled_loras
-        ):
-            return False
-        return True
+        )
 
-    def _rank_lpm_waiting_requests(
+    def _reorder_waiting_requests(
         self,
         scheduled_loras: set[int],
-    ) -> list[Request]:
-        """Rank a bounded FCFS window of waiting requests by prefix hit.
-
-        The queue itself is not reordered. Only the first lpm_window_size
-        requests are inspected, and ties preserve FCFS order.
-        """
+    ) -> RankPlan | None:
+        """Reorder rankable slots in one bounded waiting-queue prefix."""
+        if self.policy not in (SchedulingPolicy.LPM, SchedulingPolicy.CLPM):
+            return None
+        assert isinstance(self.waiting, FCFSRequestQueue)
         window_size = self.scheduler_config.lpm_window_size
-        iter_first_n = getattr(self.waiting, "iter_first_n", None)
-        if iter_first_n is None:
-            waiting_window = list(itertools.islice(self.waiting, window_size))
+        effective_window = len(self.waiting) if window_size == 0 else window_size
+        waiting_window = list(self.waiting.iter_first_n(effective_window))
+        candidates = [
+            request
+            for request in waiting_window
+            if self._can_rank_waiting_request(request, scheduled_loras)
+        ]
+        if len(candidates) <= 1:
+            return None
+
+        prefix_hits = {
+            request.request_id: self.kv_cache_manager.get_computed_prefix_len(request)
+            for request in candidates
+        }
+        deprioritize_threshold = self.scheduler_config.lpm_deprioritize_threshold
+        claim_depth_blocks = (
+            (deprioritize_threshold + self.block_size - 1) // self.block_size
+            if deprioritize_threshold > 0
+            else 0
+        )
+        candidate_ids = [request.request_id for request in candidates]
+        rank_info = self.pending_prefix_index.rank_info_many(
+            candidate_ids, claim_depth_blocks
+        )
+        if len(rank_info) != len(candidates):
+            raise RuntimeError("Prefix index is inconsistent with waiting queue")
+
+        check_threshold = self.scheduler_config.lpm_check_threshold
+        if self.policy == SchedulingPolicy.LPM or not any(
+            info.cluster_size >= 2 for info in rank_info.values()
+        ):
+            plan = rank_lpm(candidates, prefix_hits, rank_info, check_threshold)
         else:
-            waiting_window = list(iter_first_n(window_size))
+            plan = rank_clpm(
+                candidates,
+                prefix_hits,
+                rank_info,
+                check_threshold=check_threshold,
+                big_lane_share=self.scheduler_config.clpm_big_lane_share,
+                age_alpha=self.scheduler_config.clpm_age_alpha,
+                group_major=self.scheduler_config.clpm_group_major,
+                dynamic_lane=self.scheduler_config.clpm_dynamic_lane,
+                slo_budget_s=self.scheduler_config.clpm_slo_budget_s,
+                previous_b_share=self._clpm_dynamic_b_share,
+                lane_a_pass=self._clpm_lane_a_pass,
+                lane_b_pass=self._clpm_lane_b_pass,
+                now=time.time(),
+            )
+            if plan.dynamic_b_share is not None:
+                self._clpm_dynamic_b_share = plan.dynamic_b_share
 
-        ranked: list[tuple[int, int, int, Request]] = []
-        for pos, request in enumerate(waiting_window):
-            if not self._can_rank_request_for_lpm(request, scheduled_loras):
-                continue
-            prefix_len = self.kv_cache_manager.get_computed_prefix_len(request)
-            # Treat low-hit candidates in the same cache block as near-equal
-            # and prefer the request with the smaller remaining cache
-            # footprint. For meaningful prefix hits, keep the original LPM
-            # behavior and preserve FCFS as the tie-breaker.
-            prefix_blocks = prefix_len // self.block_size
-            if prefix_blocks <= 3:
-                tie_breaker = max(request.num_tokens - prefix_len, 0)
-            else:
-                tie_breaker = pos
-            ranked.append((-prefix_len, tie_breaker, pos, request))
+        self.waiting.reorder_rankable_prefix(
+            window_size,
+            plan.ordered_requests,
+            set(candidate_ids),
+        )
+        return plan
 
-        ranked.sort()
-        return [request for _, _, _, request in ranked]
+    def _commit_clpm_admission(
+        self, request_id: str, rank_plan: RankPlan | None
+    ) -> None:
+        if rank_plan is None:
+            return
+        credit = rank_plan.lane_credit.get(request_id)
+        if credit is None:
+            return
+        if credit.lane == "a":
+            self._clpm_lane_a_pass += credit.stride
+        else:
+            self._clpm_lane_b_pass += credit.stride
 
-    @staticmethod
-    def _pop_next_lpm_candidate(
-        ranked_candidates: list[Request],
-        waiting: Any,
-    ) -> Request | None:
-        """Return the next ranked LPM candidate still present in waiting."""
-        while ranked_candidates:
-            request = ranked_candidates.pop(0)
-            if request in waiting:
-                return request
-        return None
+        min_pass = min(self._clpm_lane_a_pass, self._clpm_lane_b_pass)
+        if min_pass > 1_000_000:
+            self._clpm_lane_a_pass -= min_pass
+            self._clpm_lane_b_pass -= min_pass
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -628,11 +531,6 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
-        # Publish per-block demand scores once per scheduling step. Both
-        # running-request growth and waiting-request admission can
-        # trigger eviction below, so this needs to be set before either.
-        self._publish_demand_scores()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -837,12 +735,14 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        ranked_lpm_candidates: list[Request] | None = None
-        num_lpm_ranked_windows = 0
+        prefix_rank_plan: RankPlan | None = None
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # LPM/cLPM: reorder the bounded rankable prefix of self.waiting
+            # once per step; admission below still pops from the queue head.
+            prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -851,41 +751,7 @@ class Scheduler(SchedulerInterface):
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
-                use_lpm_candidate = False
-                head_request = request_queue.peek_request()
-                if (self.policy != SchedulingPolicy.LPM
-                        or request_queue is not self.waiting):
-                    # LPM only reorders fresh requests in self.waiting;
-                    # blocked requests in skipped_waiting keep FCFS order.
-                    request = head_request
-                elif head_request.status == RequestStatus.PREEMPTED:
-                    # Resume preempted head requests before allowing LPM to
-                    # bypass them with fresh waiting requests.
-                    request = head_request
-                    ranked_lpm_candidates = None
-                    num_lpm_ranked_windows = 0
-                else:
-                    if ranked_lpm_candidates is None:
-                        ranked_lpm_candidates = self._rank_lpm_waiting_requests(
-                            scheduled_loras)
-                        num_lpm_ranked_windows = 1
-                    lpm_request = self._pop_next_lpm_candidate(
-                        ranked_lpm_candidates, self.waiting)
-                    while (lpm_request is None
-                           and num_lpm_ranked_windows < self._lpm_max_windows):
-                        ranked_lpm_candidates = self._rank_lpm_waiting_requests(
-                            scheduled_loras)
-                        num_lpm_ranked_windows += 1
-                        if not ranked_lpm_candidates:
-                            break
-                        lpm_request = self._pop_next_lpm_candidate(
-                            ranked_lpm_candidates, self.waiting)
-                    if lpm_request is not None:
-                        request = lpm_request
-                        use_lpm_candidate = True
-                    else:
-                        request = head_request
-
+                request = request_queue.peek_request()
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -897,10 +763,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    if use_lpm_candidate:
-                        request_queue.remove_request(request)
-                    else:
-                        request_queue.pop_request()
+                    request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -915,10 +778,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    if use_lpm_candidate:
-                        request_queue.remove_request(request)
-                    else:
-                        request_queue.pop_request()
+                    request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -945,10 +805,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            if use_lpm_candidate:
-                                request_queue.remove_request(request)
-                            else:
-                                request_queue.pop_request()
+                            request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -1101,13 +958,10 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
-                # Remove the request from its queue only after allocation
-                # succeeds. LPM candidates may come from inside the bounded
-                # FCFS window rather than the queue head.
-                if use_lpm_candidate:
-                    request_queue.remove_request(request)
-                else:
-                    request = request_queue.pop_request()
+                # Remove the request only after allocation succeeds. Prefix
+                # policies have already reordered the bounded queue prefix.
+                request = request_queue.pop_request()
+                self._untrack_waiting_request(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1127,7 +981,11 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    # Still pending (not ready) until the remote KVs arrive.
+                    self._track_waiting_request(request)
                     continue
+
+                self._commit_clpm_admission(request.request_id, prefix_rank_plan)
 
                 self.kv_cache_manager.record_local_prefix_cache_hit(
                     request,
@@ -1137,20 +995,29 @@ class Scheduler(SchedulerInterface):
                 local_hit_blocks = num_new_local_computed_tokens // block_size
                 prompt_blocks = len(request.block_hashes)
                 first_missing_block = (
-                    local_hit_blocks if local_hit_blocks < prompt_blocks else -1)
+                    local_hit_blocks if local_hit_blocks < prompt_blocks else -1
+                )
                 logger.info(
                     "admitted_prefix_cache: policy=%s request_id=%s "
                     "prompt_tokens=%d prompt_blocks=%d "
                     "local_hit_tokens=%d local_hit_blocks=%d "
                     "hit_rate=%.6f first_missing_block=%d "
                     "num_new_tokens=%d waiting_after_pop=%d running=%d",
-                    self._eviction_policy, request.request_id,
-                    request.num_tokens, prompt_blocks,
-                    num_new_local_computed_tokens, local_hit_blocks,
-                    (num_new_local_computed_tokens / request.num_tokens
-                     if request.num_tokens > 0 else 0.0),
-                    first_missing_block, num_new_tokens,
-                    len(self.waiting), len(self.running),
+                    self._eviction_policy,
+                    request.request_id,
+                    request.num_tokens,
+                    prompt_blocks,
+                    num_new_local_computed_tokens,
+                    local_hit_blocks,
+                    (
+                        num_new_local_computed_tokens / request.num_tokens
+                        if request.num_tokens > 0
+                        else 0.0
+                    ),
+                    first_missing_block,
+                    num_new_tokens,
+                    len(self.waiting),
+                    len(self.running),
                 )
 
                 self.running.append(request)
@@ -1214,7 +1081,8 @@ class Scheduler(SchedulerInterface):
         for req_id, num_tokens in num_scheduled_tokens.items():
             request = self.requests[req_id]
             remaining_prompt_tokens = max(
-                request.num_prompt_tokens - request.num_computed_tokens, 0)
+                request.num_prompt_tokens - request.num_computed_tokens, 0
+            )
             req_prefill_tokens = min(num_tokens, remaining_prompt_tokens)
             prefill_tokens += req_prefill_tokens
             decode_tokens += num_tokens - req_prefill_tokens
@@ -1224,10 +1092,12 @@ class Scheduler(SchedulerInterface):
         scheduled_requests = len(scheduled_token_values)
         mean_scheduled_tokens = (
             total_num_scheduled_tokens / scheduled_requests
-            if scheduled_requests > 0 else 0.0)
+            if scheduled_requests > 0
+            else 0.0
+        )
         mean_prefill_chunk = (
-            sum(prefill_chunks) / len(prefill_chunks)
-            if prefill_chunks else 0.0)
+            sum(prefill_chunks) / len(prefill_chunks) if prefill_chunks else 0.0
+        )
         logger.info(
             "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
             "running=%d preempted=%d waiting_after=%d running_after=%d "
@@ -1235,11 +1105,18 @@ class Scheduler(SchedulerInterface):
             "prefill_tokens=%d decode_tokens=%d max_scheduled_tokens=%d "
             "mean_scheduled_tokens=%.1f max_prefill_chunk=%d "
             "mean_prefill_chunk=%.1f",
-            self._eviction_policy, scheduled_requests, len(scheduled_new_reqs),
-            len(scheduled_resumed_reqs), len(scheduled_running_reqs),
-            len(preempted_reqs), len(self.waiting), len(self.running),
-            total_num_scheduled_tokens, self.max_num_scheduled_tokens,
-            prefill_tokens, decode_tokens,
+            self._eviction_policy,
+            scheduled_requests,
+            len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs),
+            len(scheduled_running_reqs),
+            len(preempted_reqs),
+            len(self.waiting),
+            len(self.running),
+            total_num_scheduled_tokens,
+            self.max_num_scheduled_tokens,
+            prefill_tokens,
+            decode_tokens,
             max(scheduled_token_values) if scheduled_token_values else 0,
             mean_scheduled_tokens,
             max(prefill_chunks) if prefill_chunks else 0,
@@ -1358,6 +1235,7 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        self._track_waiting_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1942,6 +1820,8 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            for request in stopped_preempted_reqs:
+                self._untrack_waiting_request(request)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -2028,7 +1908,11 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy in (SchedulingPolicy.FCFS, SchedulingPolicy.LPM):
+        if self.policy in (
+            SchedulingPolicy.FCFS,
+            SchedulingPolicy.LPM,
+            SchedulingPolicy.CLPM,
+        ):
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
@@ -2055,6 +1939,7 @@ class Scheduler(SchedulerInterface):
             self.num_waiting_for_streaming_input += 1
 
         self._enqueue_waiting_request(request)
+        self._track_waiting_request(request)
         return False
 
     def _update_request_with_output(
@@ -2174,6 +2059,7 @@ class Scheduler(SchedulerInterface):
             elif update is not None:
                 # Commence next input chunk.
                 self._update_request_as_session(existing, update)
+                self._track_waiting_request(existing)
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -2181,6 +2067,7 @@ class Scheduler(SchedulerInterface):
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
+            self._track_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
@@ -2234,6 +2121,8 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            for request in waiting_requests_to_remove:
+                self._untrack_waiting_request(request)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -2336,6 +2225,8 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful:
+            self._republish_pending_demand()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -2521,6 +2412,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            self._set_waiting_request_ready(request)
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
@@ -2528,6 +2420,7 @@ class Scheduler(SchedulerInterface):
             if not (structured_output_req and structured_output_req.grammar):
                 return False
             request.status = RequestStatus.WAITING
+            self._set_waiting_request_ready(request)
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:

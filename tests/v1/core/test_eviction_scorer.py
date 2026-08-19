@@ -202,6 +202,18 @@ class TestComputeDemandScores:
 
 class TestSelectVictimsScored:
 
+    def test_incremental_demand_count_updates(self):
+        pool = _make_pool(2)
+
+        pool.update_demand_counts({_bh(A): 2, _bh(B): 1}, min_count=2)
+        assert pool._demand_scores == {_bh(A): 2.0}
+
+        pool.update_demand_counts({_bh(A): 1, _bh(B): 2}, min_count=2)
+        assert pool._demand_scores == {_bh(B): 2.0}
+
+        pool.update_demand_counts({_bh(B): 3}, binary=True)
+        assert pool._demand_scores == {_bh(B): 1.0}
+
     def test_zero_demand_evicted_before_demanded(self):
         pool, _ = _pool_with_cached([A, B, C])
         pool.set_demand_scores({_bh(A): 2.0, _bh(B): 1.0})  # C has no demand

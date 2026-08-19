@@ -16,6 +16,7 @@ class SchedulingPolicy(Enum):
     FCFS = "fcfs"
     PRIORITY = "priority"
     LPM = "lpm"
+    CLPM = "clpm"
 
 
 class RequestQueue(ABC):
@@ -135,6 +136,38 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
                 break
             yield request
 
+    def reorder_rankable_prefix(
+        self,
+        window_size: int,
+        ordered_requests: Iterable[Request],
+        rankable_ids: set[str],
+    ) -> None:
+        """Reorder rankable slots in a prefix while preserving every other slot.
+
+        A zero window means the full queue. Unrankable requests and requests
+        beyond the bounded prefix keep their exact positions.
+        """
+        prefix_len = len(self) if window_size == 0 else min(window_size, len(self))
+        prefix = [self.popleft() for _ in range(prefix_len)]
+        ordered = iter(ordered_requests)
+        replaced = 0
+        for pos, request in enumerate(prefix):
+            if request.request_id in rankable_ids:
+                try:
+                    prefix[pos] = next(ordered)
+                except StopIteration as exc:
+                    raise ValueError("Too few ranked requests") from exc
+                replaced += 1
+        try:
+            next(ordered)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("Too many ranked requests")
+        if replaced != len(rankable_ids):
+            raise ValueError("Rankable IDs do not match the queue prefix")
+        self.extendleft(reversed(prefix))
+
 
 class PriorityRequestQueue(RequestQueue):
     """
@@ -210,7 +243,11 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
-    elif policy in (SchedulingPolicy.FCFS, SchedulingPolicy.LPM):
+    elif policy in (
+        SchedulingPolicy.FCFS,
+        SchedulingPolicy.LPM,
+        SchedulingPolicy.CLPM,
+    ):
         return FCFSRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

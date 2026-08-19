@@ -3,7 +3,7 @@
 import json
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -191,11 +191,10 @@ class BlockPool:
         # otherwise.
         self._eviction_policy: str = "lru"
 
-        # Waiting-queue demand scores, published by the scheduler once
-        # per schedule() step. score[h] = sum gamma**p over the
-        # positions p of waiting requests whose contiguous cached prefix
-        # includes h. Higher = reused sooner / by more waiters = keep.
-        # An empty dict degenerates scored eviction to plain LRU.
+        # Waiting-queue demand scores maintained incrementally by the
+        # scheduler. Higher counts mean that more pending requests share the
+        # cumulative prefix ending at that hash. An empty dict degenerates
+        # scored eviction to plain LRU.
         self._demand_scores: dict[BlockHash, float] = {}
         self._evictable_hash_counts: dict[BlockHash, int] = {}
 
@@ -212,8 +211,8 @@ class BlockPool:
         # Scored-eviction effectiveness counters. Pure observability —
         # they do not influence eviction.
         self.scored_hits: int = 0          # hits on positively-scored blocks
-        self.scored_protected: int = 0     # size of last published score dict
-        self.scored_publishes: int = 0
+        self.scored_protected: int = 0     # current protected-hash count
+        self.scored_publishes: int = 0     # full or incremental update batches
 
         self._eviction_trace_path = os.getenv("VLLM_EVICTION_TRACE_PATH")
         self._eviction_trace_seq = 0
@@ -328,6 +327,30 @@ class BlockPool:
         """
         self._demand_scores = scores
         self.scored_protected = len(scores)
+        self.scored_publishes += 1
+
+    def update_demand_counts(
+        self,
+        counts: Mapping[BlockHash, int],
+        *,
+        min_count: int = 1,
+        binary: bool = False,
+    ) -> None:
+        """Incrementally update eviction scores from absolute demand counts.
+
+        ``counts`` only needs to contain hashes changed by a waiting-request
+        insertion, removal, or path update. A count below ``min_count`` removes
+        the hash from the protected set.
+        """
+        if not counts:
+            return
+        min_count = max(1, min_count)
+        for block_hash, count in counts.items():
+            if count < min_count:
+                self._demand_scores.pop(block_hash, None)
+            else:
+                self._demand_scores[block_hash] = 1.0 if binary else float(count)
+        self.scored_protected = len(self._demand_scores)
         self.scored_publishes += 1
 
     def classify_chain(

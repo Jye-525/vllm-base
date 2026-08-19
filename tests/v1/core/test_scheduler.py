@@ -52,6 +52,49 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+def test_pending_prefix_index_tracks_waiting_lifecycle(monkeypatch):
+    monkeypatch.setenv("VLLM_EVICTION_POLICY", "score")
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+    )
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+    )
+
+    for request in requests:
+        scheduler.add_request(request)
+
+    shared_hashes = requests[0].block_hashes
+    assert len(scheduler.pending_prefix_index) == 2
+    assert all(
+        scheduler.pending_prefix_index.pending_count(block_hash) == 2
+        for block_hash in shared_hashes
+    )
+    assert all(
+        scheduler.kv_cache_manager.block_pool._demand_scores[block_hash] == 2.0
+        for block_hash in shared_hashes
+    )
+
+    scheduler.schedule()
+
+    assert len(scheduler.pending_prefix_index) == 1
+    assert all(
+        scheduler.pending_prefix_index.pending_count(block_hash) == 1
+        for block_hash in shared_hashes
+    )
+    assert all(
+        scheduler.kv_cache_manager.block_pool._demand_scores[block_hash] == 1.0
+        for block_hash in shared_hashes
+    )
+
+    scheduler.finish_requests(requests[1].request_id, RequestStatus.FINISHED_ABORTED)
+    assert len(scheduler.pending_prefix_index) == 0
+    assert scheduler.kv_cache_manager.block_pool._demand_scores == {}
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
@@ -125,13 +168,12 @@ def test_lpm_schedules_best_prefix_hit_in_bounded_window():
         requests[3].request_id: 64,
     }
     scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
-        side_effect=lambda req: hit_by_req_id[req.request_id])
+        side_effect=lambda req: hit_by_req_id[req.request_id]
+    )
 
     output = scheduler.schedule()
 
-    assert [req.req_id for req in output.scheduled_new_reqs] == [
-        requests[2].request_id
-    ]
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[2].request_id]
     # The fourth request has the largest hit, but it is outside the LPM window.
     scanned_req_ids = [
         call.args[0].request_id
@@ -159,8 +201,42 @@ def test_lpm_preserves_fcfs_for_equal_prefix_hits():
 
     output = scheduler.schedule()
 
-    assert [req.req_id for req in output.scheduled_new_reqs] == [
-        requests[0].request_id
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
+
+
+def test_lpm_deprioritizes_later_cold_prefix_siblings():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=3,
+    )
+    pioneer, sibling = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["pioneer", "sibling"],
+    )
+    other = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        req_ids=["unused", "other"],
+    )[1]
+    requests = [pioneer, sibling, other]
+    for request in requests:
+        scheduler.add_request(request)
+
+    hit_by_req_id = {"pioneer": 0, "sibling": 32, "other": 16}
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
+        side_effect=lambda req: hit_by_req_id[req.request_id]
+    )
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["other"]
+    assert [request.request_id for request in scheduler.waiting] == [
+        "pioneer",
+        "sibling",
     ]
 
 
@@ -181,9 +257,7 @@ def test_lpm_falls_back_to_fcfs_without_prefix_caching():
 
     output = scheduler.schedule()
 
-    assert [req.req_id for req in output.scheduled_new_reqs] == [
-        requests[0].request_id
-    ]
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
     scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
 
 
