@@ -30,12 +30,12 @@ import ssl
 import time
 import uuid
 import warnings
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import aiohttp
 import numpy as np
@@ -56,6 +56,8 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.network_utils import join_host_port
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
+_T = TypeVar("_T")
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -342,6 +344,35 @@ async def get_request(
             if sleep_interval_s > 0:
                 await asyncio.sleep(sleep_interval_s)
         yield request, request_rates[request_index]
+
+
+async def _execute_request_tasks(
+    task_generator: AsyncGenerator[Awaitable[_T], None],
+    wave_size: int | None,
+) -> list[_T]:
+    """Execute generated request tasks continuously or in complete waves.
+
+    A ``None`` wave size preserves the default serving-benchmark behavior:
+    all tasks are submitted as their configured arrival times are reached and
+    the caller's semaphore controls concurrency. With a positive wave size,
+    the generator is not advanced to the next wave until every task in the
+    current wave has completed.
+    """
+
+    if wave_size is not None and wave_size <= 0:
+        raise ValueError("wave_size must be positive")
+
+    outputs: list[_T] = []
+    pending: list[asyncio.Future[_T]] = []
+    async for task in task_generator:
+        pending.append(asyncio.ensure_future(task))
+        if wave_size is not None and len(pending) == wave_size:
+            outputs.extend(await asyncio.gather(*pending))
+            pending.clear()
+
+    if pending:
+        outputs.extend(await asyncio.gather(*pending))
+    return outputs
 
 
 def calculate_metrics_for_embeddings(
@@ -634,7 +665,16 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    sequential_request_waves: bool = False,
 ):
+    if sequential_request_waves and (
+        max_concurrency is None or max_concurrency <= 0
+    ):
+        raise ValueError(
+            "--sequential-request-waves requires --max-concurrency to set "
+            "the request wave size"
+        )
+
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
     except KeyError:
@@ -785,6 +825,10 @@ async def benchmark(
 
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
+    if sequential_request_waves:
+        print(f"Request scheduling: sequential waves of {max_concurrency}")
+    else:
+        print("Request scheduling: continuous")
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
 
@@ -803,7 +847,6 @@ async def benchmark(
             )
 
     benchmark_start_time = time.perf_counter()
-    tasks: list[asyncio.Task] = []
 
     rps_change_events = []
     last_int_rps = -1
@@ -816,55 +859,61 @@ async def benchmark(
             }
         )
 
-    async for request, current_request_rate in get_request(
-        input_requests,
-        request_rate,
-        burstiness,
-        ramp_up_strategy,
-        ramp_up_start_rps,
-        ramp_up_end_rps,
-    ):
-        if ramp_up_strategy is not None:
-            current_int_rps = int(current_request_rate)
-            if current_int_rps > last_int_rps:
-                timestamp = datetime.now().isoformat()
-                for rps_val in range(last_int_rps + 1, current_int_rps + 1):
-                    rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
-                last_int_rps = current_int_rps
-        prompt, prompt_len, output_len, mm_content, request_id = (
-            request.prompt,
-            request.prompt_len,
-            request.expected_output_len,
-            request.multi_modal_data,
-            request.request_id,
-        )
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
-
-        request_func_input = RequestFuncInput(
-            model=req_model_id,
-            model_name=req_model_name,
-            prompt=prompt,
-            api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            logprobs=logprobs,
-            multi_modal_content=mm_content,
-            ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
-            extra_body=extra_body,
-            request_id=request_id,
-        )
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(
-                    request_func_input=request_func_input, session=session, pbar=pbar
-                )
+    async def request_tasks() -> AsyncGenerator[
+        Awaitable[RequestFuncOutput], None
+    ]:
+        nonlocal last_int_rps
+        async for request, current_request_rate in get_request(
+            input_requests,
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+        ):
+            if ramp_up_strategy is not None:
+                current_int_rps = int(current_request_rate)
+                if current_int_rps > last_int_rps:
+                    timestamp = datetime.now().isoformat()
+                    for rps_val in range(last_int_rps + 1, current_int_rps + 1):
+                        rps_change_events.append(
+                            {"rps": rps_val, "timestamp": timestamp}
+                        )
+                    last_int_rps = current_int_rps
+            prompt, prompt_len, output_len, mm_content, request_id = (
+                request.prompt,
+                request.prompt_len,
+                request.expected_output_len,
+                request.multi_modal_data,
+                request.request_id,
             )
-        )
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                multi_modal_content=mm_content,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
+                request_id=request_id,
+            )
+            yield limited_request_func(
+                request_func_input=request_func_input,
+                session=session,
+                pbar=pbar,
+            )
+
+    wave_size = max_concurrency if sequential_request_waves else None
+    outputs = await _execute_request_tasks(request_tasks(), wave_size)
 
     if pbar is not None:
         pbar.close()
@@ -1226,12 +1275,13 @@ def compute_result_filename(
         if args.max_concurrency is not None
         else ""
     )
+    request_waves_str = "-waves" if args.sequential_request_waves else ""
     label = label or args.backend
 
     if args.ramp_up_strategy is not None:
-        file_name = f"{label}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{label}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}{request_waves_str}-{base_model_id}-{current_dt}.json"  # noqa
     else:
-        file_name = f"{label}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{label}-{args.request_rate}qps{max_concurrency_str}{request_waves_str}-{base_model_id}-{current_dt}.json"  # noqa
 
     if args.result_filename:
         file_name = args.result_filename
@@ -1295,6 +1345,13 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
+    )
+    parser.add_argument(
+        "--sequential-request-waves",
+        action="store_true",
+        help="Submit --max-concurrency requests, wait for every request in "
+        "that wave to complete, and then submit the next wave. By default, "
+        "a new request starts whenever any active request completes.",
     )
 
     parser.add_argument(
@@ -1639,6 +1696,13 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    if args.sequential_request_waves and (
+        args.max_concurrency is None or args.max_concurrency <= 0
+    ):
+        raise ValueError(
+            "--sequential-request-waves requires a positive --max-concurrency"
+        )
+
     # Validate timeline ITL thresholds
     if args.plot_timeline:
         try:
@@ -1846,6 +1910,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
+        sequential_request_waves=args.sequential_request_waves,
     )
 
     # Save config and results to json
@@ -1878,6 +1943,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     )
     result_json["burstiness"] = args.burstiness
     result_json["max_concurrency"] = args.max_concurrency
+    result_json["sequential_request_waves"] = args.sequential_request_waves
 
     if args.ramp_up_strategy is not None:
         result_json["ramp_up_strategy"] = args.ramp_up_strategy
