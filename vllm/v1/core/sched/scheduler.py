@@ -74,6 +74,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self._pd_trace_event("scheduler_start")
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -643,6 +644,7 @@ class Scheduler(SchedulerInterface):
                 new_encoder_compute_budget = encoder_compute_budget
 
                 if load_kv_async:
+                    self._pd_trace_event("remote_kv_wait_begin", request.request_id)
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
@@ -782,6 +784,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                self._pd_trace_event("scheduler_admit", request.request_id,
+                                     previous_status=request.status.name)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -919,7 +923,22 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if scheduler_output.num_scheduled_tokens:
+            self._pd_trace_event(
+                "scheduler_step", request_ids=list(scheduler_output.num_scheduled_tokens),
+                num_scheduled_tokens=dict(scheduler_output.num_scheduled_tokens),
+                batch_id=getattr(scheduler_output.kv_connector_metadata, "batch_id", None),
+            )
         return scheduler_output
+
+    def _pd_trace_event(self, event, request_id=None, **fields):
+        from vllm.pd_trace import get_trace
+        trace = get_trace()
+        if trace is not None:
+            config = self.vllm_config.kv_transfer_config
+            trace.emit(event, request_id=request_id,
+                       role="producer" if config and config.is_kv_producer else "consumer",
+                       **fields)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -938,6 +957,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
+        self._pd_trace_event("scheduler_preempt", request.request_id)
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
@@ -1413,6 +1433,11 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if new_token_ids:
+                self._pd_trace_event("engine_tokens", req_id,
+                                     token_count=len(new_token_ids), stopped=stopped,
+                                     batch_id=getattr(scheduler_output.kv_connector_metadata,
+                                                      "batch_id", None))
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
@@ -1753,6 +1778,7 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        self._pd_trace_event("scheduler_arrival", request.request_id)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2140,6 +2166,7 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            self._pd_trace_event("all_tp_kv_ready_observed", req_id)
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]

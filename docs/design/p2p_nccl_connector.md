@@ -38,6 +38,59 @@ There are three methods for KVCache transfer: PUT, GET, and PUT_ASYNC. These met
 
 Experimental results have shown that the performance of these methods, from highest to lowest, is as follows: PUT_ASYNC → GET → PUT.
 
+### Local post-prefill PUT extensions
+
+This checkout additionally supports `kv_connector_extra_config.send_timing`:
+
+| `send_timing` | `send_type` | Producer behavior |
+| --- | --- | --- |
+| `per_layer` (default) | Existing modes | Existing behavior, unchanged |
+| `post_prefill` | `PUT` | Gather and synchronously push each layer after model forward |
+| `post_prefill` | `PUT_ASYNC` | Gather after model forward, queue owned payloads, and continue later forwards while transport runs |
+
+For example, configure both instances consistently with:
+
+```json
+{"kv_connector": "P2pNcclConnector", "kv_role": "kv_producer", "kv_connector_extra_config": {"send_type": "PUT_ASYNC", "send_timing": "post_prefill", "post_prefill_buffer_size": 1073741824}}
+```
+
+Use `kv_consumer` on the consumer and retain the normal ports/proxy settings.
+Select `PUT` for the synchronous variant. These are local extensions, not
+upstream baseline names. They preserve raw KV precision and individual
+`request_id#layer_name` messages; layers are not bundled. Forward completion
+means the current model batch, before logits/sampling, not all requests in a
+benchmark wave. Token-chunked prefill retains the existing prompt-completion
+eligibility rules. Layer-major submission order is preserved.
+
+The producer async staging budget `post_prefill_buffer_size` is independent
+of the receiver's `kv_buffer_size`. Its default is 1 GiB per rank. It counts
+queued and in-flight payload bytes, reserves before gathering, and blocks
+submission when full. A single layer payload larger than the budget raises
+an error; increase the budget for that workload. This bounds live payload
+storage, not CUDA allocator reservations or transport scratch memory. The
+synchronous variant has at most one gathered payload at a time.
+
+Gathering runs on the model stream and produces owned copies. The send stream
+waits for a CUDA event recorded after gathering. Payloads remain owned until
+NCCL send synchronization completes, so background sends never read recycled
+paged KV blocks. Normal post-forward hooks do not drain the async sender;
+explicit `wait_for_sent()` drains queued and in-flight sends. Sender failures
+are fatal and surfaced on subsequent submission/completion checks. The current
+transport has no timeout for a peer that becomes unresponsive.
+
+Async scheduling and DBO/microbatching are rejected for these new modes because
+their deferred finalization/stream lifetimes need separate support. Existing
+per-layer modes retain their behavior. Timing records include `send_timing`,
+and model-forward timing excludes post-forward extraction and sending.
+
+Before using results in a paper, validate on a producer/consumer GPU pair:
+run identical deterministic requests with per-layer and both post-prefill
+modes, compare generated tokens, run multi-request waves and token-chunked
+prefill, and repeat async runs with a small staging budget. Trace that no
+post-prefill sends begin before the batch forward ends, synchronous sends
+complete before the next forward, and async sends can overlap it when capacity
+permits. CPU unit tests do not establish CUDA/NCCL correctness or performance.
+
 ### P2P Communication via ZMQ & NCCL
 
 As long as the address of the counterpart is known, point-to-point KV cache transfer (using NCCL) can be performed, without being constrained by rank and world size. To support dynamic scaling (expansion and contraction) of instances with PD disaggregation. This means that adding or removing P/D instances does not require a full system restart.

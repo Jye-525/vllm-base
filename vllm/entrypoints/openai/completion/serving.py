@@ -192,6 +192,19 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
 
             request_id_item = f"{request_id}-{i}"
+            from vllm.pd_trace import get_trace
+
+            pd_trace = get_trace()
+            if pd_trace is not None:
+                headers = {} if raw_request is None else raw_request.headers
+                pd_trace.emit(
+                    "api_engine_dispatch", request_id=request_id_item,
+                    api_request_id=request_id,
+                    http_request_id=headers.get("x-request-id"),
+                    user_request_id=headers.get("x-client-request-id"),
+                    dependencies=([headers["x-pd-trace-parent-id"]]
+                                  if headers.get("x-pd-trace-parent-id") else []),
+                )
 
             self._log_inputs(
                 request_id_item,

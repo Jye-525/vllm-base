@@ -3,6 +3,7 @@
 
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -25,9 +26,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_timing import (
     parse_timing_options,
     timing_log_record,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.post_prefill import (
+    parse_send_timing,
+)
 from vllm.distributed.parallel_state import get_tp_group, get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+from vllm.pd_trace import get_trace
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -136,6 +141,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
             role=role,
             kv_cache_config=kv_cache_config,
         )
+        self._send_timing = parse_send_timing(self._kv_transfer_config)
+        if (self._send_timing == "post_prefill"
+                and vllm_config.scheduler_config.async_scheduling):
+            raise ValueError("post_prefill does not support async_scheduling")
+        if self._send_timing == "post_prefill" and (
+            getattr(vllm_config.parallel_config, "enable_dbo", False)
+            or getattr(vllm_config.parallel_config, "ubatch_size", 1) > 1
+        ):
+            raise ValueError("post_prefill does not support microbatching/DBO")
+        self._post_prefill_layers = {}
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
@@ -285,6 +300,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         # Load the KV for each request each layer
+        trace = get_trace()
         for request in metadata.requests:
             request_id = request.request_id
             if self._timing_enabled:
@@ -307,11 +323,22 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                     layer = kv_cache
 
-                    kv_cache = self.p2p_nccl_engine.recv_tensor(
-                        request.request_id + "#" + layer_name, remote_address
-                    )
+                    transfer_id = request_id + "#" + layer_name
+                    fields = {} if trace is None else {
+                        "request_id": request_id, "transfer_id": transfer_id,
+                        "layer_name": layer_name, "role": "consumer",
+                        "tp_rank": self._tp_rank, "tp_size": self._tp_size,
+                        "batch_id": metadata.batch_id,
+                    }
+                    with (trace.host_span("recv_tensor_wait", **fields)
+                          if trace is not None else nullcontext()):
+                        kv_cache = self.p2p_nccl_engine.recv_tensor(
+                            transfer_id, remote_address
+                        )
 
                     if kv_cache is None:
+                        if trace is not None:
+                            trace.emit("remote_load_recompute", **fields)
                         logger.warning("🚧kv_cache is None, %s", request.request_id)
                         continue
 
@@ -320,9 +347,15 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         insertion_span = (
                             self.p2p_nccl_engine.start_cuda_timing_span()
                         )
-                    inject_kv_into_layer(
-                        layer, kv_cache, request.block_ids, request.request_id
-                    )
+                    with (trace.gpu_span(
+                        "other", name="insert_kv_layer", **fields,
+                        requires=[{"event": "nccl_receive",
+                                   "transfer_id": transfer_id,
+                                   "tp_rank": self._tp_rank}],
+                    ) if trace is not None else nullcontext()):
+                        inject_kv_into_layer(
+                            layer, kv_cache, request.block_ids, request.request_id
+                        )
                     if self._timing_enabled:
                         self.p2p_nccl_engine.finish_cuda_timing_span(
                             request_id, "insertion", insertion_span
@@ -341,6 +374,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         self._start_batch_timing()
 
+    def pd_trace_noop_hooks(self) -> frozenset[str]:
+        """Hooks that can remain inside a timeline model interval."""
+        hooks = {"wait_for_layer_load"}
+        if not self.is_producer or getattr(self, "_send_timing", "per_layer") == "post_prefill":
+            hooks.add("save_kv_layer")
+        return frozenset(hooks)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -352,7 +392,28 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
         return
 
+    def abort_kv_save(self) -> None:
+        """Discard this forward's collected layers if model execution failed."""
+        if getattr(self, "_send_timing", "per_layer") == "post_prefill":
+            self._post_prefill_layers.clear()
+            self._post_prefill_aborted = True
+
+    def clear_connector_metadata(self) -> None:
+        self._post_prefill_aborted = False
+        self._post_prefill_layers.clear()
+        super().clear_connector_metadata()
+
     def save_kv_layer(
+        self, layer_name: str, kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata, **kwargs: Any,
+    ) -> None:
+        if self.is_producer and getattr(self, "_send_timing", "per_layer") == "post_prefill":
+            self.p2p_nccl_engine.check_post_prefill_sends()
+            self._post_prefill_layers[layer_name] = (kv_layer, attn_metadata)
+            return
+        self._send_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+
+    def _send_kv_layer(
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
@@ -415,20 +476,44 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 connector_metadata, P2pNcclTimingConnectorMetadata
             )
             timing_metadata = connector_metadata
+        trace = get_trace()
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
-            extraction_span = None
-            if self._timing_enabled:
-                extraction_span = self.p2p_nccl_engine.start_cuda_timing_span()
-            kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            if self._timing_enabled:
-                assert timing_metadata is not None
-                self.p2p_nccl_engine.finish_cuda_timing_span(
-                    request_id, "extraction", extraction_span
+            def prepare():
+                extraction_span = None
+                if self._timing_enabled:
+                    extraction_span = self.p2p_nccl_engine.start_cuda_timing_span()
+                with (trace.gpu_span(
+                    "other", name="extract_kv_layer", role="producer",
+                    request_id=request_id, transfer_id=request_id + "#" + layer_name,
+                    layer_name=layer_name, batch_id=connector_metadata.batch_id,
+                    tp_rank=self._tp_rank, tp_size=self._tp_size,
+                ) if trace is not None else nullcontext()):
+                    kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+                if self._timing_enabled:
+                    assert timing_metadata is not None
+                    self.p2p_nccl_engine.finish_cuda_timing_span(
+                        request_id, "extraction", extraction_span
+                    )
+                return kv_cache
+
+            if getattr(self, "_send_timing", "per_layer") == "post_prefill":
+                block_axis = 0 if (
+                    isinstance(attn_metadata, MLACommonMetadata)
+                    or kv_layer.shape[1] == 2
+                ) else 1
+                size = (kv_layer.numel() // kv_layer.shape[block_axis]
+                        * request.block_ids.numel() * kv_layer.element_size())
+                self.p2p_nccl_engine.send_post_prefill(
+                    request_id + "#" + layer_name, prepare, size,
+                    remote_address, getattr(connector_metadata, "batch_id", None),
                 )
+                continue
+            kv_cache = prepare()
+            if self._timing_enabled:
                 assert timing_metadata is not None
                 self.p2p_nccl_engine.send_tensor(
                     request_id + "#" + layer_name,
@@ -442,9 +527,21 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
 
     def wait_for_save(self):
+        # The runner explicitly marks failed forwards before its finally hook.
+        if getattr(self, "_post_prefill_aborted", False):
+            self._post_prefill_aborted = False
+            return
         self._end_batch_timing()
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
+            if getattr(self, "_send_timing", "per_layer") == "post_prefill":
+                layers, self._post_prefill_layers = self._post_prefill_layers, {}
+                try:
+                    for layer_name, (kv_layer, attn_metadata) in layers.items():
+                        self._send_kv_layer(layer_name, kv_layer, attn_metadata)
+                finally:
+                    layers.clear()
+                self.p2p_nccl_engine.check_post_prefill_sends()
             if self._timing_enabled:
                 metadata = self._get_connector_metadata()
                 assert isinstance(metadata, P2pNcclTimingConnectorMetadata)
@@ -452,7 +549,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     self.p2p_nccl_engine.seal_request_timing(
                         request.request_id, metadata.batch_id
                     )
-            self.p2p_nccl_engine.wait_for_sent()
+            if getattr(self, "_send_timing", "per_layer") == "per_layer":
+                self.p2p_nccl_engine.wait_for_sent()
 
     def on_model_output_ready(self) -> None:
         if not self._timing_enabled:
@@ -780,6 +878,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             "connector": "P2pNcclConnector",
             "role": "producer" if self.is_producer else "consumer",
             "send_type": send_type,
+            "send_timing": getattr(self, "_send_timing", "per_layer"),
             "request_id": (
                 batch_request_ids[0] if len(batch_request_ids) == 1 else None
             ),

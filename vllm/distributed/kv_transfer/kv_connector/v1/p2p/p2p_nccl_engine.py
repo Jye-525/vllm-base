@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_timing import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.tensor_memory_pool import (  # noqa: E501
     TensorMemoryPool,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.post_prefill import (
+    BoundedSender,
+    parse_send_timing,
 )
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
@@ -76,6 +81,8 @@ class SendQueueItem:
     tensor_id: str
     remote_address: str
     tensor: torch.Tensor
+    trace_dependency: str | None = None
+    ready_event: Any = None
 
 
 class P2pNcclEngine:
@@ -89,8 +96,11 @@ class P2pNcclEngine:
         tp_rank: int | None = None,
         tp_size: int = 1,
     ) -> None:
+        self.send_timing = parse_send_timing(config)
         self.config = config
         self.rank = port_offset
+        self.trace_tp_rank = port_offset if tp_rank is None else int(tp_rank)
+        self.trace_tp_size = int(tp_size)
         self.local_rank = local_rank
         self.device = torch.device(f"cuda:{self.local_rank}")
         self.nccl = NCCLLibrary(library_path)
@@ -162,6 +172,7 @@ class P2pNcclEngine:
                     "connector": "P2pNcclConnector",
                     "role": role,
                     "send_type": self.send_type,
+                    "send_timing": self.send_timing,
                     "tp_rank": resolved_tp_rank,
                     "tp_size": int(tp_size),
                     "local_rank": self.local_rank,
@@ -189,7 +200,8 @@ class P2pNcclEngine:
             # PUT or PUT_ASYNC
             # tensor_id: torch.Tensor
             self.send_queue: deque[SendQueueItem] = deque()
-            if self.send_type == "PUT_ASYNC":
+            if (self.send_type == "PUT_ASYNC"
+                and getattr(self, "send_timing", "per_layer") == "per_layer"):
                 self._send_thread = threading.Thread(
                     target=self.send_async, daemon=True
                 )
@@ -205,6 +217,19 @@ class P2pNcclEngine:
         self.buffer_size = 0
         self.buffer_size_threshold = float(self.config.kv_buffer_size)
 
+        self._post_prefill_sender = None
+        if self.send_timing == "post_prefill":
+            capacity = self.config.get_from_extra_config(
+                "post_prefill_buffer_size", 1024**3
+            )
+            if isinstance(capacity, bool) or not isinstance(capacity, (int, float)):
+                raise ValueError("post_prefill_buffer_size must be positive integer bytes")
+            if not math.isfinite(capacity) or capacity <= 0 or int(capacity) != capacity:
+                raise ValueError("post_prefill_buffer_size must be positive integer bytes")
+            self._post_prefill_capacity = int(capacity)
+            if self.send_type == "PUT_ASYNC":
+                self._post_prefill_sender = BoundedSender(int(capacity), self.send_sync)
+
         self.nccl_num_channels = self.config.get_from_extra_config(
             "nccl_num_channels", "8"
         )
@@ -219,6 +244,7 @@ class P2pNcclEngine:
             self._ping_thread = threading.Thread(target=self.ping, daemon=True)
             self._ping_thread.start()
 
+        logger.info("P2PNCCL send_timing=%s", self.send_timing)
         logger.info(
             "💯P2pNcclEngine init, rank:%d, local_rank:%d, http_address:%s, "
             "zmq_address:%s, proxy_address:%s, send_type:%s, buffer_size_"
@@ -266,6 +292,66 @@ class P2pNcclEngine:
 
         return self.socks[remote_address], self.comms[remote_address]
 
+    def _prepare_send_item(
+        self, tensor_id: str, tensor: torch.Tensor, remote_address: str,
+        batch_id: str | None = None,
+    ) -> SendQueueItem:
+        item = SendQueueItem(
+            tensor_id=tensor_id,
+            remote_address=remote_address,
+            tensor=tensor,
+        )
+        from vllm.pd_trace import get_trace
+        trace = get_trace()
+        if trace is not None:
+            with trace.gpu_span("other", name="payload_ready", attribution="milestone",
+                                role="producer", request_id=tensor_id.split("#", 1)[0],
+                                transfer_id=tensor_id, batch_id=batch_id,
+                                tp_rank=self.trace_tp_rank, tp_size=self.trace_tp_size) as mark:
+                pass
+            item.trace_dependency = mark.record["event_id"]
+
+        if self.enable_timing:
+            queued_perf_ns = time.perf_counter_ns()
+            queued_wall_ns = time.time_ns()
+            self._safe_timing_call(
+                self._timing_tracker.enqueue,
+                tensor_id=tensor_id,
+                payload_bytes=tensor.element_size() * tensor.numel(),
+                batch_id=batch_id,
+                queued_perf_ns=queued_perf_ns,
+                queued_wall_ns=queued_wall_ns,
+            )
+
+        return item
+
+    def send_post_prefill(
+        self, tensor_id: str, prepare: Callable[[], torch.Tensor], size: int,
+        remote_address: str, batch_id: str | None = None,
+    ) -> None:
+        if size <= 0 or size > self._post_prefill_capacity:
+            raise ValueError(
+                f"Payload size {size} exceeds post_prefill_buffer_size "
+                f"{self._post_prefill_capacity}, or is empty"
+            )
+        def prepare_owned():
+            tensor = prepare()
+            item = self._prepare_send_item(tensor_id, tensor, remote_address, batch_id)
+            item.ready_event = torch.cuda.Event()
+            item.ready_event.record(torch.cuda.current_stream(self.device))
+            return item
+
+        if getattr(self, "_post_prefill_sender", None) is not None:
+            self._post_prefill_sender.submit(size, prepare_owned)
+        else:
+            item = prepare_owned()
+            if not self.send_sync(item):
+                raise RuntimeError(f"Peer rejected post-prefill transfer {tensor_id}")
+
+    def check_post_prefill_sends(self) -> None:
+        if getattr(self, "_post_prefill_sender", None) is not None:
+            self._post_prefill_sender.check()
+
     def send_tensor(
         self,
         tensor_id: str,
@@ -279,23 +365,7 @@ class P2pNcclEngine:
                 self.recv_store_cv.notify()
             return True
 
-        item = SendQueueItem(
-            tensor_id=tensor_id,
-            remote_address=remote_address,
-            tensor=tensor,
-        )
-
-        if self.enable_timing:
-            queued_perf_ns = time.perf_counter_ns()
-            queued_wall_ns = time.time_ns()
-            self._safe_timing_call(
-                self._timing_tracker.enqueue,
-                tensor_id=tensor_id,
-                payload_bytes=tensor.element_size() * tensor.numel(),
-                batch_id=batch_id,
-                queued_perf_ns=queued_perf_ns,
-                queued_wall_ns=queued_wall_ns,
-            )
+        item = self._prepare_send_item(tensor_id, tensor, remote_address, batch_id)
 
         if self.send_type == "PUT":
             return self.send_sync(item)
@@ -417,6 +487,8 @@ class P2pNcclEngine:
         return tensor
 
     def listen_for_requests(self):
+        from vllm.pd_trace import get_trace
+        trace = get_trace()
         while True:
             socks = dict(self.poller.poll())
             if self.router_socket not in socks:
@@ -510,6 +582,14 @@ class P2pNcclEngine:
                             rank ^ 1,
                             self.recv_stream,
                             timing_span=nccl_span,
+                            **({"trace_fields": {"name": "nccl_receive", "role": "consumer",
+                                "request_id": tensor_id.split("#", 1)[0],
+                                "transfer_id": tensor_id, "tp_rank": self.trace_tp_rank,
+                                "tp_size": self.trace_tp_size,
+                                "attribution": "posted_receive_envelope",
+                                "requires": [{"event": "nccl_send", "transfer_id": tensor_id,
+                                              "tp_rank": self.trace_tp_rank}]}}
+                               if trace is not None else {}),
                         )
                     except BaseException as exc:
                         if self.enable_timing:
@@ -629,6 +709,9 @@ class P2pNcclEngine:
             self.send_sync(item)
 
     def wait_for_sent(self):
+        if getattr(self, "_post_prefill_sender", None) is not None:
+            self._post_prefill_sender.drain()
+            return
         if self.send_type == "PUT_ASYNC":
             start_time = time.time()
             with self.send_queue_cv:
@@ -649,6 +732,10 @@ class P2pNcclEngine:
             self.create_connect(item.remote_address)
 
         tensor = item.tensor
+        if item.ready_event is not None:
+            self.send_stream.wait_event(item.ready_event)
+        from vllm.pd_trace import get_trace
+        trace = get_trace()
 
         sock = self.socks[item.remote_address]
         comm, rank = self.comms[item.remote_address]
@@ -663,6 +750,9 @@ class P2pNcclEngine:
         sock.send(msgpack.dumps(data))
 
         response = sock.recv()
+        if trace is not None:
+            trace.emit("send_control_complete", request_id=item.tensor_id.split("#", 1)[0],
+                       transfer_id=item.tensor_id, role="producer", tp_rank=self.trace_tp_rank)
         if self.enable_timing:
             self._safe_timing_call(
                 self._timing_tracker.update_tensor,
@@ -705,6 +795,12 @@ class P2pNcclEngine:
                 rank ^ 1,
                 self.send_stream,
                 timing_span=nccl_span,
+                **({"trace_fields": {"name": "nccl_send", "role": "producer",
+                    "request_id": item.tensor_id.split("#", 1)[0],
+                    "transfer_id": item.tensor_id, "tp_rank": self.trace_tp_rank,
+                    "tp_size": self.trace_tp_size,
+                    "dependencies": [item.trace_dependency] if item.trace_dependency else []}}
+                   if trace is not None else {}),
             )
         except BaseException as exc:
             if self.enable_timing:
@@ -740,7 +836,8 @@ class P2pNcclEngine:
                 status="ok",
             )
 
-        if self.send_type == "PUT_ASYNC":
+        if (self.send_type == "PUT_ASYNC"
+                and getattr(self, "send_timing", "per_layer") == "per_layer"):
             self.have_sent_tensor_id(item.tensor_id)
 
         return True
@@ -760,6 +857,7 @@ class P2pNcclEngine:
         """
 
         # Clear the buffer upon request completion.
+        self.check_post_prefill_sends()
         for request_id in finished_req_ids:
             for layer_name in no_compile_layers:
                 tensor_id = request_id + "#" + layer_name
@@ -801,6 +899,7 @@ class P2pNcclEngine:
         dst: int,
         stream=None,
         timing_span: CudaEventSpan | None = None,
+        trace_fields: dict | None = None,
     ):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
@@ -810,6 +909,10 @@ class P2pNcclEngine:
             stream = current_stream()
 
         with torch.cuda.stream(stream):
+            from vllm.pd_trace import get_trace
+            trace = get_trace() if trace_fields is not None else None
+            trace_span = None if trace is None else trace.begin_gpu(
+                "communication", stream=stream, **trace_fields)
             if timing_span is not None:
                 timing_span.start.record(stream)
             self.nccl.ncclSend(
@@ -822,6 +925,8 @@ class P2pNcclEngine:
             )
             if timing_span is not None:
                 timing_span.end.record(stream)
+            if trace_span is not None:
+                trace.end_gpu(trace_span)
         stream.synchronize()
 
     def recv(
@@ -831,6 +936,7 @@ class P2pNcclEngine:
         src: int,
         stream=None,
         timing_span: CudaEventSpan | None = None,
+        trace_fields: dict | None = None,
     ):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
@@ -840,6 +946,10 @@ class P2pNcclEngine:
             stream = current_stream()
 
         with torch.cuda.stream(stream):
+            from vllm.pd_trace import get_trace
+            trace = get_trace() if trace_fields is not None else None
+            trace_span = None if trace is None else trace.begin_gpu(
+                "communication", stream=stream, **trace_fields)
             if timing_span is not None:
                 timing_span.start.record(stream)
             self.nccl.ncclRecv(
@@ -852,6 +962,8 @@ class P2pNcclEngine:
             )
             if timing_span is not None:
                 timing_span.end.record(stream)
+            if trace_span is not None:
+                trace.end_gpu(trace_span)
         stream.synchronize()
 
     # ==============================
@@ -942,8 +1054,15 @@ class P2pNcclEngine:
             pass
 
     def close(self) -> None:
+        if getattr(self, "_post_prefill_sender", None) is not None:
+            self._post_prefill_sender.close()
+        if self.send_timing == "post_prefill":
+            # Listener/ping are process-lifetime daemon threads. Unlike the
+            # legacy close path, do not join their infinite service loops.
+            return
         self._listener_thread.join()
-        if self.send_type == "PUT_ASYNC":
+        if (self.send_type == "PUT_ASYNC"
+                and getattr(self, "send_timing", "per_layer") == "per_layer"):
             self._send_thread.join()
         if self._ping_thread is not None:
             self._ping_thread.join()

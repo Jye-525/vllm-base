@@ -96,6 +96,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
+    pd_trace: dict | None = None
 
 
 class RequestFunc(Protocol):
@@ -190,11 +191,38 @@ async def async_request_openai_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
+    from vllm.pd_trace import clock_sample, get_trace
+    trace = get_trace()
+    if trace is not None:
+        import uuid
+
+        trace_request_id = next(
+            (value for key, value in headers.items() if key.lower() == "x-request-id"),
+            None,
+        ) or uuid.uuid4().hex
+        headers = {key: value for key, value in headers.items()
+                   if key.lower() != "x-request-id"}
+        headers["x-request-id"] = trace_request_id
+        output.pd_trace = {"request_id": trace_request_id,
+                           "clock": clock_sample(), "process_id": trace.process_id}
     st = time.perf_counter()
     output.start_time = st
+    if trace is not None:
+        output.pd_trace["send_monotonic_ns"] = int(st * 1e9)
+        trace.emit("client_send", at_ns=int(st * 1e9),
+                   request_id=trace_request_id)
     most_recent_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
+            if trace is not None:
+                engine_id = response.headers.get("x-engine-request-id")
+                output.pd_trace["engine_request_id"] = engine_id
+                output.pd_trace["headers_monotonic_ns"] = time.perf_counter_ns()
+                trace.emit("client_headers", request_id=trace_request_id,
+                           engine_request_id=engine_id,
+                           peer_clock_headers={key: response.headers.get(key) for key in (
+                               "x-pd-trace-ingress-wall-ns", "x-pd-trace-headers-wall-ns",
+                               "x-pd-trace-process-id")}, clock=clock_sample())
             if response.status == 200:
                 first_chunk_received = False
                 handler = StreamedResponseHandler()
@@ -225,10 +253,19 @@ async def async_request_openai_completions(
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
                                 timestamp = time.perf_counter()
+                                if trace is not None:
+                                    token_ns = int(timestamp * 1e9)
+                                    if not first_chunk_received:
+                                        output.pd_trace["first_token_monotonic_ns"] = token_ns
+                                    output.pd_trace["last_token_monotonic_ns"] = token_ns
+                                    trace.emit("client_token", at_ns=token_ns,
+                                               request_id=trace_request_id,
+                                               engine_request_id=output.pd_trace.get("engine_request_id"),
+                                               first=not first_chunk_received)
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
@@ -259,6 +296,10 @@ async def async_request_openai_completions(
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
 
+    if trace is not None:
+        trace.emit("client_complete", request_id=trace_request_id,
+                   success=output.success, latency_ms=output.latency * 1000,
+                   last_token_monotonic_ns=output.pd_trace.get("last_token_monotonic_ns"))
     if pbar:
         pbar.update(1)
     return output

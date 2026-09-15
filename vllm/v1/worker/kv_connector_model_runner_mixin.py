@@ -99,16 +99,42 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
+        from vllm.pd_trace import (
+            begin_forward, end_forward, get_trace,
+        )
+        trace = get_trace()
+        if trace is not None:
+            trace.emit("load_dispatch", request_ids=list(scheduler_output.num_scheduled_tokens),
+                       transfer_request_ids=[r.request_id for r in getattr(
+                           scheduler_output.kv_connector_metadata, "requests", [])])
         kv_connector.start_load_kv(get_forward_context())
+        if trace is not None:
+            trace.emit("load_dispatch_return", request_ids=list(scheduler_output.num_scheduled_tokens))
+        begin_forward(kv_connector, scheduler_output)
         try:
             yield output
+        except BaseException:
+            # Opt-in connectors can discard work collected during a partial
+            # forward. Other connectors retain their existing finalization.
+            abort_save = getattr(kv_connector, "abort_kv_save", None)
+            if abort_save is not None:
+                abort_save()
+            raise
         finally:
+            end_forward()
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )
+            if trace is not None:
+                from vllm.distributed.parallel_state import get_tp_group
+                tp = get_tp_group()
+                trace.emit("worker_kv_completion", tp_rank=tp.rank_in_group,
+                           tp_size=tp.world_size,
+                           finished_sending=sorted(output.finished_sending or ()),
+                           finished_recving=sorted(output.finished_recving or ()))
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()

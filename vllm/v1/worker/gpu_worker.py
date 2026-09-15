@@ -154,6 +154,8 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        if os.environ.get("PD_E2E_TRACE_DIR") and self.use_v2_model_runner:
+            raise ValueError("PD E2E tracing currently requires the V1 model runner")
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -1108,6 +1110,9 @@ class Worker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+
+        from vllm.pd_trace import shutdown_trace
+        shutdown_trace()
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

@@ -1048,6 +1048,8 @@ async def benchmark(
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
             "start_times": [output.start_time for output in outputs],
+            **({"pd_trace_requests": [output.pd_trace for output in outputs]}
+               if any(output.pd_trace is not None for output in outputs) else {}),
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,

@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.utils.torch_utils import _resolve_layer_name
+from vllm.pd_trace import model_hook
 
 
 def maybe_transfer_kv_layer(func: Callable) -> Callable:
@@ -48,13 +49,15 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
             return func(*args, **kwargs)
 
         # Wait for KV layer on entry
-        connector.wait_for_layer_load(layer_name)
+        with model_hook("wait_for_layer_load", layer_name):
+            connector.wait_for_layer_load(layer_name)
 
         # Execute the function
         result = func(*args, **kwargs)
 
         # Save KV cache layer on exit
-        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+        with model_hook("save_kv_layer", layer_name):
+            connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
 
         return result
 

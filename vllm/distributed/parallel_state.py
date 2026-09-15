@@ -532,7 +532,10 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_)
+        from vllm.pd_trace import collective
+
+        with collective(self, "tp_all_reduce"):
+            return self.device_communicator.all_reduce(input_)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -553,7 +556,10 @@ class GroupCoordinator:
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_gather(input_, dim)
+        from vllm.pd_trace import collective
+
+        with collective(self, "tp_all_gather"):
+            return self.device_communicator.all_gather(input_, dim)
 
     def all_gatherv(
         self,
@@ -591,7 +597,10 @@ class GroupCoordinator:
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatter(input_, dim)
+        from vllm.pd_trace import collective
+
+        with collective(self, "tp_reduce_scatter"):
+            return self.device_communicator.reduce_scatter(input_, dim)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

@@ -303,6 +303,9 @@ def build_app(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
+    if os.environ.get("PD_E2E_TRACE_DIR"):
+        from vllm.pd_trace_http import TraceMiddleware
+        app.add_middleware(TraceMiddleware)
     app = sagemaker_standards_bootstrap(app)
     return app
 

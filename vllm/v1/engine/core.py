@@ -598,6 +598,9 @@ class EngineCore:
         if self.scheduler:
             self.scheduler.shutdown()
 
+        from vllm.pd_trace import shutdown_trace
+        shutdown_trace()
+
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
         # visible to the garbage collector again. Without this, deleting
