@@ -1117,6 +1117,11 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if has_kv_transfer_group():
+            invalidate = getattr(get_kv_transfer_group(), "invalidate_kv_attention_read_plans", None)
+            if invalidate is not None:
+                invalidate(scheduler_output.finished_req_ids | (scheduler_output.preempted_req_ids or set()))
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -2419,6 +2424,19 @@ class GPUModelRunner(
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
+
+            if has_kv_transfer_group():
+                get_plan = getattr(get_kv_transfer_group(), "get_kv_attention_read_plan", None)
+                if get_plan is not None:
+                    plans = [get_plan(req_id, kv_cache_gid)
+                             for req_id in self.input_batch.req_ids[:num_reqs]]
+                    if any(plan is not None for plan in plans):
+                        from vllm.v1.attention.kv_read_plan import apply_kv_read_plans
+
+                        if any(plan is not None and plan.block_size != self._kernel_block_sizes[kv_cache_gid]
+                               for plan in plans):
+                            raise ValueError("KV read plans require matching allocation/kernel page sizes")
+                        cm = apply_kv_read_plans(cm, plans)
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:

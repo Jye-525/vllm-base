@@ -53,6 +53,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
+    from vllm.v1.attention.kv_read_plan import KVAttentionReadPlan
     from vllm.config import VllmConfig
     from vllm.distributed.kv_events import KVCacheEvent, KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -287,6 +288,16 @@ class KVConnectorBase_V1(ABC):
         Handle preempted requests or evicted blocks BEFORE they are overwritten.
         Needed for connectors which use async saves (e.g., OffloadingConnector)
         """
+        return
+
+    def get_kv_attention_read_plan(
+        self, request_id: str, kv_cache_group_id: int = 0
+    ) -> "KVAttentionReadPlan | None":
+        """Optional immutable KVAttentionReadPlan; never changes write slots."""
+        return None
+
+    def invalidate_kv_attention_read_plans(self, request_ids: set[str]) -> None:
+        """Discard connector read views before finished/preempted pages are reused."""
         return
 
     @abstractmethod

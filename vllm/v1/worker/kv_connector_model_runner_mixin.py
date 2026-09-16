@@ -38,6 +38,9 @@ class KVConnectorModelRunnerMixin:
     def kv_connector_no_forward(
         scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
     ) -> ModelRunnerOutput:
+        invalidate = getattr(get_kv_transfer_group(), "invalidate_kv_attention_read_plans", None)
+        if invalidate is not None:
+            invalidate(scheduler_output.finished_req_ids | (scheduler_output.preempted_req_ids or set()))
         # KV send/recv even if no work to do.
         with (
             set_forward_context(None, vllm_config),
