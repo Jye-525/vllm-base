@@ -24,6 +24,7 @@
 
 import ctypes
 import functools
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,21 @@ ncclWindow_t = ctypes.c_void_p
 
 class ncclUniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
+
+
+class ncclConfig_v21700(ctypes.Structure):
+    """NCCL 2.17 config ABI prefix; newer libraries accept size/version prefixes."""
+
+    _fields_ = [
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+    ]
 
 
 cudaStream_t = ctypes.c_void_p
@@ -416,13 +432,65 @@ class NCCLLibrary:
         return unique_id
 
     def ncclCommInitRank(
-        self, world_size: int, unique_id: ncclUniqueId, rank: int
+        self,
+        world_size: int,
+        unique_id: ncclUniqueId,
+        rank: int,
+        *,
+        net_name: str | None = None,
     ) -> ncclComm_t:
+        if net_name is not None:
+            return self.ncclCommInitRankWithNet(world_size, unique_id, rank, net_name)
         comm = ncclComm_t()
         self.NCCL_CHECK(
             self._funcs["ncclCommInitRank"](
                 ctypes.byref(comm), world_size, unique_id, rank
             )
+        )
+        return comm
+
+    def ncclCommInitRankWithNet(
+        self, world_size: int, unique_id: ncclUniqueId, rank: int, net_name: str
+    ) -> ncclComm_t:
+        """Select this communicator's network without mutating global NCCL state."""
+        if net_name not in ("IB", "Socket"):
+            raise ValueError(f"Unsupported NCCL network: {net_name!r}")
+        # NCCL_NET overrides config.netName even after earlier communicators
+        # have initialized. Never silently benchmark a different transport.
+        if os.environ.get("NCCL_NET"):
+            raise ValueError("Unset NCCL_NET to use per-communicator network selection")
+        if self.ncclGetRawVersion() < 21700:
+            raise RuntimeError(
+                "Per-communicator network selection requires NCCL >= 2.17"
+            )
+        init = self.lib.ncclCommInitRankConfig
+        init.restype = ncclResult_t
+        init.argtypes = [
+            ctypes.POINTER(ncclComm_t),
+            ctypes.c_int,
+            ncclUniqueId,
+            ctypes.c_int,
+            ctypes.POINTER(ncclConfig_v21700),
+        ]
+        config = ncclConfig_v21700(
+            ctypes.sizeof(ncclConfig_v21700),
+            0xCAFEBEEF,
+            21700,
+            1,
+            -(2**31),
+            -(2**31),
+            -(2**31),
+            net_name.encode("ascii"),
+        )
+        comm = ncclComm_t()
+        logger.info(
+            "Creating NCCL communicator network=%s ranks=%d rank=%d",
+            net_name,
+            world_size,
+            rank,
+        )
+        self.NCCL_CHECK(
+            init(ctypes.byref(comm), world_size, unique_id, rank, ctypes.byref(config))
         )
         return comm
 

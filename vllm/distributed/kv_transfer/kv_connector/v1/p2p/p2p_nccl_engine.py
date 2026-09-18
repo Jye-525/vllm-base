@@ -41,6 +41,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.p2p.post_prefill import (
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
 
+
+def _kv_network_kwargs() -> dict[str, str]:
+    # KV-only setting: never change the process-global policy used by TP.
+    network = os.environ.get("PDQUANT_KV_NCCL_NET")
+    return {"net_name": network} if network else {}
+
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
@@ -281,7 +288,9 @@ class P2pNcclEngine:
             with torch.accelerator.device_index(self.device.index):
                 rank = 0
                 with set_p2p_nccl_context(self.nccl_num_channels):
-                    comm: ncclComm_t = self.nccl.ncclCommInitRank(2, unique_id, rank)
+                    comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                        2, unique_id, rank, **_kv_network_kwargs()
+                    )
                 self.comms[remote_address] = (comm, rank)
                 logger.info(
                     "🤝ncclCommInitRank Success, %s👉%s, MyRank:%s",
@@ -502,7 +511,7 @@ class P2pNcclEngine:
                     rank = 1
                     with set_p2p_nccl_context(self.nccl_num_channels):
                         comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                            2, unique_id, rank
+                            2, unique_id, rank, **_kv_network_kwargs()
                         )
                     self.comms[remote_address.decode()] = (comm, rank)
                     logger.info(
