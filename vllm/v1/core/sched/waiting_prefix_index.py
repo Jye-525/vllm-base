@@ -36,8 +36,16 @@ class PendingPrefixIndex:
         self._request_paths: dict[str, tuple[BlockHash, ...]] = {}
         self._request_ready: dict[str, bool] = {}
         self._pending_counts: dict[BlockHash, int] = {}
+        # PEEK cluster eviction uses the deepest position at which a demanded
+        # hash occurs. Keep the maximum lazily while demand remains positive,
+        # matching PEEK's vLLM implementation.
+        self._pending_max_depths: dict[BlockHash, int] = {}
         self._ready_counts: dict[BlockHash, int] = {}
         self._version = 0
+        self._rank_info_cache_version = 0
+        self._rank_info_cache: dict[
+            tuple[int, bool], dict[str, PendingRankInfo]
+        ] = {}
 
     def __len__(self) -> int:
         return len(self._request_paths)
@@ -53,6 +61,11 @@ class PendingPrefixIndex:
     def demand_counts(self) -> Mapping[BlockHash, int]:
         """Return a read-only live view of per-prefix pending counts."""
         return MappingProxyType(self._pending_counts)
+
+    @property
+    def demand_max_depths(self) -> Mapping[BlockHash, int]:
+        """Return the deepest pending-chain position for each demanded hash."""
+        return MappingProxyType(self._pending_max_depths)
 
     def request_path(self, request_id: str) -> tuple[BlockHash, ...] | None:
         return self._request_paths.get(request_id)
@@ -111,6 +124,13 @@ class PendingPrefixIndex:
 
         self._apply_count_delta(self._pending_counts, old_hashes - new_hashes, -1)
         self._apply_count_delta(self._pending_counts, new_hashes - old_hashes, 1)
+        for block_hash in old_hashes - new_hashes:
+            if block_hash not in self._pending_counts:
+                self._pending_max_depths.pop(block_hash, None)
+        for depth, block_hash in enumerate(new_path, 1):
+            self._pending_max_depths[block_hash] = max(
+                depth, self._pending_max_depths.get(block_hash, 0)
+            )
         if old_ready:
             self._apply_count_delta(self._ready_counts, old_hashes, -1)
         if ready:
@@ -140,6 +160,7 @@ class PendingPrefixIndex:
                 self._pending_counts[block_hash] = count
             else:
                 del self._pending_counts[block_hash]
+                self._pending_max_depths.pop(block_hash, None)
             changed_counts[block_hash] = count
 
         if ready:
@@ -156,6 +177,7 @@ class PendingPrefixIndex:
         self._request_paths.clear()
         self._request_ready.clear()
         self._pending_counts.clear()
+        self._pending_max_depths.clear()
         self._ready_counts.clear()
         self._version += 1
         return changed_counts
@@ -180,10 +202,23 @@ class PendingPrefixIndex:
         self,
         request_ids: Sequence[str],
         claim_depth_blocks: int,
+        *,
+        include_request_score: bool = True,
     ) -> dict[str, PendingRankInfo]:
-        """Build ready-only sharing metadata for a batch of requests."""
-        result: dict[str, PendingRankInfo] = {}
+        """Build ready-only sharing metadata for a batch of requests.
+
+        Sharing metadata remains valid until the indexed waiting set changes.
+        """
+        if self._rank_info_cache_version != self._version:
+            self._rank_info_cache.clear()
+            self._rank_info_cache_version = self._version
+
+        cache = self._rank_info_cache.setdefault(
+            (claim_depth_blocks, include_request_score), {}
+        )
         for request_id in request_ids:
+            if request_id in cache:
+                continue
             path = self._request_paths.get(request_id)
             if path is None or not self._request_ready[request_id]:
                 continue
@@ -205,14 +240,22 @@ class PendingPrefixIndex:
                 if claim_depth_blocks > 0 and len(path) >= claim_depth_blocks
                 else None
             )
-            result[request_id] = PendingRankInfo(
-                request_score=sum(self._ready_counts.get(h, 0) for h in path),
+            cache[request_id] = PendingRankInfo(
+                request_score=(
+                    sum(self._ready_counts.get(h, 0) for h in path)
+                    if include_request_score
+                    else 0
+                ),
                 cluster_hash=cluster_hash,
                 cluster_depth=cluster_depth,
                 cluster_size=cluster_size,
                 claim_hash=claim_hash,
             )
-        return result
+        return {
+            request_id: cache[request_id]
+            for request_id in request_ids
+            if request_id in cache
+        }
 
     def longest_shared_prefix_blocks(self, request_id: str) -> int:
         """Return the deepest prefix shared with another pending request."""

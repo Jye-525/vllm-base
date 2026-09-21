@@ -20,6 +20,9 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm"]
+PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
+KVCacheEvictionPolicy = Literal["lru", "peek"]
+PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 
 
 @config
@@ -113,20 +116,24 @@ class SchedulerConfig:
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
-    - "lpm" means PEEK-style longest prefix match among a bounded FCFS
-      window.
+    - "lpm" orders a bounded waiting window by locally cached prefix length
+      descending, preserving current queue order on ties.
     - "clpm" adds clustered demand and an age-aware fairness lane."""
 
     lpm_window_size: int = Field(default=128, ge=0)
-    """For LPM/cLPM scheduling, the number of waiting requests to reorder per
+    """For LPM/cLPM, the number of waiting requests to reorder per
     scheduler step. Zero means the full waiting queue."""
 
+    lpm_fallback_threshold: int = Field(default=0, ge=0)
+    """For LPM/cLPM, fall back to FCFS when the total waiting
+    queue is larger than this threshold. Zero disables the fallback."""
+
     lpm_check_threshold: int = 32
-    """Requests with at most this many cached tokens are considered cold.
+    """For cLPM, requests with at most this many cached tokens are considered cold.
     A negative value disables cold pioneer/sibling classification."""
 
     lpm_deprioritize_threshold: int = 32
-    """Token depth used for the cold-prefix pioneer claim. A non-positive
+    """Token depth used for cLPM's cold-prefix pioneer claim. A non-positive
     value disables sibling deprioritization."""
 
     clpm_big_lane_share: float = Field(default=0.7, ge=0.0, le=1.0)
@@ -143,6 +150,23 @@ class SchedulerConfig:
 
     clpm_slo_budget_s: float = Field(default=2.0, gt=0.0)
     """Waiting-time budget used to normalize cLPM's dynamic age pressure."""
+
+    kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
+    """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
+    ``peek`` protects blocks demanded by waiting requests."""
+
+    peek_eviction_mode: PeekEvictionMode = "plain"
+    """Protection formula used by Peek eviction."""
+
+    peek_eviction_recency_weight: float = Field(default=100.0, ge=0.0)
+    """Age penalty per second for Peek's recency eviction mode."""
+
+    peek_eviction_decay_tau: float = Field(default=30.0, gt=0.0)
+    """Exponential decay time constant for Peek's decay eviction mode."""
+
+    peek_eviction_scan_cap: int = Field(default=0, ge=0)
+    """Maximum free blocks inspected per Peek eviction call. Zero uses
+    ``max(4 * requested_blocks, 256)``, matching Peek's vLLM integration."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

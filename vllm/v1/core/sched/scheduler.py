@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -45,6 +45,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.preemption_diagnostics import PreemptionDiagnostics
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
@@ -53,9 +54,13 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
-from vllm.v1.core.sched.waiting_ranker import RankPlan, rank_clpm, rank_lpm
+from vllm.v1.core.sched.waiting_ranker import (
+    RankPlan,
+    rank_clpm,
+    rank_lpm,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -167,11 +172,14 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         if (
-            self.policy in (SchedulingPolicy.LPM, SchedulingPolicy.CLPM)
+            self.policy in (
+                SchedulingPolicy.LPM,
+                SchedulingPolicy.CLPM,
+            )
             and not self.cache_config.enable_prefix_caching
         ):
             logger.warning_once(
-                "LPM/cLPM scheduling requires prefix caching. Falling back to FCFS "
+                "LPM/cLPM require prefix caching. Falling back to FCFS "
                 "because prefix caching is disabled."
             )
             self.policy = SchedulingPolicy.FCFS
@@ -259,32 +267,29 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
-        # Waiting-queue-aware eviction. PendingPrefixIndex maintains cumulative
-        # block-hash demand as requests enter and leave the waiting queue. The
-        # block pool consumes only the changed absolute counts.
-        #   VLLM_EVICTION_POLICY : "lru" (default stock baseline)
-        #                          | "score"/"demand_aware" (opt-in)
-        #   VLLM_EVICTION_REUSE_MIN_COUNT : min waiters reusing a block before
-        #                                   it receives a positive score
-        #   VLLM_EVICTION_BINARY_DEMAND : if true, collapse every positive
-        #                                 demand score to 1.0
-        policy = os.environ.get("VLLM_EVICTION_POLICY", "lru").strip().lower()
-        if policy == "demand_aware":
-            policy = "score"
-        if not self.cache_config.enable_prefix_caching:
-            policy = "lru"
-        self._eviction_policy: str = policy if policy in ("score", "lru") else "lru"
-        try:
-            self._eviction_reuse_min_count: int = max(
-                1, int(os.environ.get("VLLM_EVICTION_REUSE_MIN_COUNT", "1"))
+        # Peek eviction consumes cumulative block-hash demand maintained by
+        # PendingPrefixIndex. Keep stock LRU when prefix caching is disabled.
+        policy = self.scheduler_config.kv_cache_eviction_policy
+        if not self.cache_config.enable_prefix_caching and policy != "lru":
+            logger.warning_once(
+                "Peek eviction requires prefix caching. Falling back to LRU "
+                "because prefix caching is disabled."
             )
-        except ValueError:
-            self._eviction_reuse_min_count = 1
-        self._eviction_binary_demand = os.environ.get(
-            "VLLM_EVICTION_BINARY_DEMAND", "0"
-        ).strip().lower() in ("1", "true", "yes", "on")
-        # Tell the block pool which eviction policy to use.
-        self.kv_cache_manager.block_pool._eviction_policy = self._eviction_policy
+            policy = "lru"
+        self._eviction_policy = policy
+        self._peek_eviction_mode = self.scheduler_config.peek_eviction_mode
+        block_pool = self.kv_cache_manager.block_pool
+        block_pool._eviction_policy = self._eviction_policy
+        block_pool._peek_eviction_mode = self._peek_eviction_mode
+        block_pool._peek_eviction_recency_weight = (
+            self.scheduler_config.peek_eviction_recency_weight
+        )
+        block_pool._peek_eviction_decay_tau = (
+            self.scheduler_config.peek_eviction_decay_tau
+        )
+        block_pool._peek_eviction_scan_cap = (
+            self.scheduler_config.peek_eviction_scan_cap
+        )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -321,6 +326,78 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+        # Exact token accounting requires completed, non-overlapping text batches.
+        groups = kv_cache_config.kv_cache_groups
+        self._preemption_cost_supported = not (
+            self.scheduler_config.async_scheduling
+            or type(self).__name__ == "AsyncScheduler"
+            or speculative_config is not None
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.use_pp
+            or self.dcp_world_size > 1
+            or self.pcp_world_size > 1
+            or self.is_encoder_decoder
+            or len(groups) != 1
+            or type(groups[0].kv_cache_spec) is not FullAttentionSpec
+            or groups[0].kv_cache_spec.sliding_window is not None
+            or groups[0].kv_cache_spec.attention_chunk_size is not None
+        )
+        self._completed_token_high: dict[str, int] = {}
+        self._preemption_recovery_high: dict[str, int] = {}
+        self._step_preempted_tokens = 0
+        self._pending_batch_logs: dict[
+            int, tuple[tuple[Any, ...], dict[str, tuple[int, int, int]]]
+        ] = {}
+
+        self.preemption_diagnostics: PreemptionDiagnostics | None = None
+        if directory := envs.VLLM_PREEMPTION_DIAGNOSTICS_DIR:
+            unsupported = []
+            if (
+                self.scheduler_config.async_scheduling
+                or type(self).__name__ == "AsyncScheduler"
+            ):
+                unsupported.append("async_scheduling")
+            if speculative_config is not None:
+                unsupported.append("speculative_decoding")
+            if self.connector is not None or self.ec_connector is not None:
+                unsupported.append("offload_or_transfer")
+            if self.use_pp or self.dcp_world_size > 1 or self.pcp_world_size > 1:
+                unsupported.append("pipeline_or_context_parallelism")
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                len(groups) != 1
+                or type(groups[0].kv_cache_spec) is not FullAttentionSpec
+                or groups[0].kv_cache_spec.sliding_window is not None
+                or groups[0].kv_cache_spec.attention_chunk_size is not None
+            ):
+                unsupported.append("hybrid_or_non_full_attention")
+            if self.is_encoder_decoder:
+                unsupported.append("encoder_decoder")
+            self.preemption_diagnostics = PreemptionDiagnostics(
+                directory,
+                dict(
+                    policy=self.policy.value,
+                    block_size=block_size,
+                    num_blocks=kv_cache_config.num_blocks,
+                    prefix_caching=self.cache_config.enable_prefix_caching,
+                    chunked_prefill=self.scheduler_config.enable_chunked_prefill,
+                    max_num_seqs=self.max_num_running_reqs,
+                    max_num_batched_tokens=self.max_num_scheduled_tokens,
+                    max_model_len=self.max_model_len,
+                    eviction_policy=self._eviction_policy,
+                    peek_eviction_mode=self._peek_eviction_mode,
+                    async_scheduling=self.scheduler_config.async_scheduling,
+                    speculative_decoding=speculative_config is not None,
+                    kv_transfer=self.connector is not None,
+                    kv_cache_groups=len(groups),
+                    pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
+                    decode_context_parallel_size=self.dcp_world_size,
+                    prefill_context_parallel_size=self.pcp_world_size,
+                ),
+                unsupported,
+            )
 
     def _mamba_block_aligned_split(
         self,
@@ -373,12 +450,11 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def _update_pending_demand(self, counts: Mapping[BlockHash, int]) -> None:
-        if self._eviction_policy != "score" or not counts:
+        if self._eviction_policy != "peek" or not counts:
             return
-        self.kv_cache_manager.block_pool.update_demand_counts(
+        self.kv_cache_manager.block_pool.update_peek_demand_counts(
             counts,
-            min_count=self._eviction_reuse_min_count,
-            binary=self._eviction_binary_demand,
+            max_depths=self.pending_prefix_index.demand_max_depths,
         )
 
     def _track_waiting_request(self, request: Request) -> None:
@@ -400,16 +476,15 @@ class Scheduler(SchedulerInterface):
         self._update_pending_demand(counts)
 
     def _republish_pending_demand(self) -> None:
-        if self._eviction_policy != "score":
+        if self._eviction_policy != "peek":
             return
-        min_count = self._eviction_reuse_min_count
-        binary = self._eviction_binary_demand
-        scores = {
-            block_hash: 1.0 if binary else float(count)
+        counts = {
+            block_hash: float(count)
             for block_hash, count in self.pending_prefix_index.demand_counts.items()
-            if count >= min_count
         }
-        self.kv_cache_manager.block_pool.set_demand_scores(scores)
+        self.kv_cache_manager.block_pool.set_peek_demand_counts(
+            counts, self.pending_prefix_index.demand_max_depths
+        )
 
     def _can_rank_waiting_request(
         self,
@@ -440,9 +515,15 @@ class Scheduler(SchedulerInterface):
         scheduled_loras: set[int],
     ) -> RankPlan | None:
         """Reorder rankable slots in one bounded waiting-queue prefix."""
-        if self.policy not in (SchedulingPolicy.LPM, SchedulingPolicy.CLPM):
+        if self.policy not in (
+            SchedulingPolicy.LPM,
+            SchedulingPolicy.CLPM,
+        ):
             return None
         assert isinstance(self.waiting, FCFSRequestQueue)
+        fallback_threshold = self.scheduler_config.lpm_fallback_threshold
+        if fallback_threshold > 0 and len(self.waiting) > fallback_threshold:
+            return None
         window_size = self.scheduler_config.lpm_window_size
         effective_window = len(self.waiting) if window_size == 0 else window_size
         waiting_window = list(self.waiting.iter_first_n(effective_window))
@@ -458,42 +539,44 @@ class Scheduler(SchedulerInterface):
             request.request_id: self.kv_cache_manager.get_computed_prefix_len(request)
             for request in candidates
         }
-        deprioritize_threshold = self.scheduler_config.lpm_deprioritize_threshold
-        claim_depth_blocks = (
-            (deprioritize_threshold + self.block_size - 1) // self.block_size
-            if deprioritize_threshold > 0
-            else 0
-        )
         candidate_ids = [request.request_id for request in candidates]
-        rank_info = self.pending_prefix_index.rank_info_many(
-            candidate_ids, claim_depth_blocks
-        )
-        if len(rank_info) != len(candidates):
-            raise RuntimeError("Prefix index is inconsistent with waiting queue")
-
-        check_threshold = self.scheduler_config.lpm_check_threshold
-        if self.policy == SchedulingPolicy.LPM or not any(
-            info.cluster_size >= 2 for info in rank_info.values()
-        ):
-            plan = rank_lpm(candidates, prefix_hits, rank_info, check_threshold)
+        if self.policy == SchedulingPolicy.LPM:
+            plan = rank_lpm(candidates, prefix_hits)
         else:
-            plan = rank_clpm(
-                candidates,
-                prefix_hits,
-                rank_info,
-                check_threshold=check_threshold,
-                big_lane_share=self.scheduler_config.clpm_big_lane_share,
-                age_alpha=self.scheduler_config.clpm_age_alpha,
-                group_major=self.scheduler_config.clpm_group_major,
-                dynamic_lane=self.scheduler_config.clpm_dynamic_lane,
-                slo_budget_s=self.scheduler_config.clpm_slo_budget_s,
-                previous_b_share=self._clpm_dynamic_b_share,
-                lane_a_pass=self._clpm_lane_a_pass,
-                lane_b_pass=self._clpm_lane_b_pass,
-                now=time.time(),
+            deprioritize_threshold = self.scheduler_config.lpm_deprioritize_threshold
+            claim_depth_blocks = (
+                (deprioritize_threshold + self.block_size - 1) // self.block_size
+                if deprioritize_threshold > 0
+                else 0
             )
-            if plan.dynamic_b_share is not None:
-                self._clpm_dynamic_b_share = plan.dynamic_b_share
+            rank_info = self.pending_prefix_index.rank_info_many(
+                candidate_ids,
+                claim_depth_blocks,
+                include_request_score=not self.scheduler_config.clpm_group_major,
+            )
+            if len(rank_info) != len(candidates):
+                raise RuntimeError("Prefix index is inconsistent with waiting queue")
+
+            if not any(info.cluster_size >= 2 for info in rank_info.values()):
+                plan = rank_lpm(candidates, prefix_hits)
+            else:
+                plan = rank_clpm(
+                    candidates,
+                    prefix_hits,
+                    rank_info,
+                    check_threshold=self.scheduler_config.lpm_check_threshold,
+                    big_lane_share=self.scheduler_config.clpm_big_lane_share,
+                    age_alpha=self.scheduler_config.clpm_age_alpha,
+                    group_major=self.scheduler_config.clpm_group_major,
+                    dynamic_lane=self.scheduler_config.clpm_dynamic_lane,
+                    slo_budget_s=self.scheduler_config.clpm_slo_budget_s,
+                    previous_b_share=self._clpm_dynamic_b_share,
+                    lane_a_pass=self._clpm_lane_a_pass,
+                    lane_b_pass=self._clpm_lane_b_pass,
+                    now=time.time(),
+                )
+                if plan.dynamic_b_share is not None:
+                    self._clpm_dynamic_b_share = plan.dynamic_b_share
 
         self.waiting.reorder_rankable_prefix(
             window_size,
@@ -521,6 +604,16 @@ class Scheduler(SchedulerInterface):
             self._clpm_lane_b_pass -= min_pass
 
     def schedule(self) -> SchedulerOutput:
+        if self._pending_batch_logs:
+            # Overlapping execution cannot use the synchronous accounting path.
+            self._preemption_cost_supported = False
+            for args, _ in self._pending_batch_logs.values():
+                self._log_schedule_batch(args[:-1] + (-1,), -1)
+            self._pending_batch_logs.clear()
+        self._step_preempted_tokens = 0
+        diagnostics = self.preemption_diagnostics
+        if diagnostics is not None:
+            diagnostics.begin_step()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -639,12 +732,21 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        failure_observer=(
+                            diagnostics.allocation_failed if diagnostics else None
+                        ),
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        if diagnostics is not None:
+                            diagnostics.end_episode(proceeded=True)
                         break
 
+                    if diagnostics is not None:
+                        diagnostics.start_episode(
+                            self, request, num_new_tokens, num_scheduled_tokens
+                        )
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -678,6 +780,8 @@ class Scheduler(SchedulerInterface):
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
+                        if diagnostics is not None:
+                            diagnostics.end_episode(proceeded=False)
                         break
 
             if new_blocks is None:
@@ -927,6 +1031,9 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    failure_observer=(
+                        diagnostics.admission_failed if diagnostics else None
+                    ),
                 )
 
                 if new_blocks is None:
@@ -1029,6 +1136,8 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    if diagnostics is not None:
+                        diagnostics.resumed(request, num_new_local_computed_tokens)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -1074,10 +1183,8 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs
         ) <= len(self.running)
 
-        scheduled_token_values = list(num_scheduled_tokens.values())
         prefill_tokens = 0
         decode_tokens = 0
-        prefill_chunks: list[int] = []
         for req_id, num_tokens in num_scheduled_tokens.items():
             request = self.requests[req_id]
             remaining_prompt_tokens = max(
@@ -1086,27 +1193,10 @@ class Scheduler(SchedulerInterface):
             req_prefill_tokens = min(num_tokens, remaining_prompt_tokens)
             prefill_tokens += req_prefill_tokens
             decode_tokens += num_tokens - req_prefill_tokens
-            if req_prefill_tokens > 0:
-                prefill_chunks.append(req_prefill_tokens)
 
-        scheduled_requests = len(scheduled_token_values)
-        mean_scheduled_tokens = (
-            total_num_scheduled_tokens / scheduled_requests
-            if scheduled_requests > 0
-            else 0.0
-        )
-        mean_prefill_chunk = (
-            sum(prefill_chunks) / len(prefill_chunks) if prefill_chunks else 0.0
-        )
-        logger.info(
-            "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
-            "running=%d preempted=%d waiting_after=%d running_after=%d "
-            "token_budget_used=%d token_budget_max=%d "
-            "prefill_tokens=%d decode_tokens=%d max_scheduled_tokens=%d "
-            "mean_scheduled_tokens=%.1f max_prefill_chunk=%d "
-            "mean_prefill_chunk=%.1f",
+        batch_log_args = (
             self._eviction_policy,
-            scheduled_requests,
+            len(num_scheduled_tokens),
             len(scheduled_new_reqs),
             len(scheduled_resumed_reqs),
             len(scheduled_running_reqs),
@@ -1117,10 +1207,7 @@ class Scheduler(SchedulerInterface):
             self.max_num_scheduled_tokens,
             prefill_tokens,
             decode_tokens,
-            max(scheduled_token_values) if scheduled_token_values else 0,
-            mean_scheduled_tokens,
-            max(prefill_chunks) if prefill_chunks else 0,
-            mean_prefill_chunk,
+            self._step_preempted_tokens,
         )
 
         # Get the longest common prefix among all requests in the running queue.
@@ -1205,8 +1292,36 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        self._preemption_cost_supported = self._preemption_cost_supported and all(
+            not request.resumable
+            and request.sampling_params is not None
+            and not request.has_encoder_inputs
+            for request in (self.requests[rid] for rid in num_scheduled_tokens)
+        )
+        cost_supported = self._preemption_cost_supported
+        if cost_supported and total_num_scheduled_tokens:
+            intervals = {
+                rid: (
+                    self.requests[rid].num_computed_tokens,
+                    self.requests[rid].num_computed_tokens + n,
+                    self._preemption_recovery_high.get(rid, 0),
+                )
+                for rid, n in num_scheduled_tokens.items()
+            }
+            self._pending_batch_logs[id(scheduler_output)] = (
+                batch_log_args, intervals
+            )
+        else:
+            if not cost_supported:
+                batch_log_args = batch_log_args[:-1] + (-1,)
+            self._log_schedule_batch(batch_log_args, 0 if cost_supported else -1)
+
+        if diagnostics is not None:
+            diagnostics.scheduled(scheduler_output, self.requests)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if diagnostics is not None:
+            diagnostics.end_step()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1214,7 +1329,41 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    @staticmethod
+    def _log_schedule_batch(args: tuple[Any, ...], recomputed_tokens: int) -> None:
+        logger.info(
+            "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
+            "running=%d preempted=%d waiting_after=%d running_after=%d "
+            "token_budget_used=%d token_budget_max=%d "
+            "prefill_tokens=%d decode_tokens=%d "
+            "preempted_tokens=%d recomputed_tokens=%d",
+            *args,
+            recomputed_tokens,
+        )
+
+    def _complete_batch_log(
+        self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        pending = self._pending_batch_logs.pop(id(scheduler_output), None)
+        if pending is None:
+            return
+        args, intervals = pending
+        recomputed_tokens = 0
+        for rid, (start, end, recovery_high) in intervals.items():
+            if rid not in model_runner_output.req_id_to_index:
+                continue
+            recomputed_tokens += max(0, min(end, recovery_high) - start)
+            if rid in self.requests:
+                self._completed_token_high[rid] = max(
+                    self._completed_token_high.get(rid, 0), end
+                )
+                if end >= recovery_high:
+                    self._preemption_recovery_high.pop(rid, None)
+        self._log_schedule_batch(args, recomputed_tokens)
+
+    def _preempt_request(
+        self, request: Request, timestamp: float, reason: str = "memory_pressure"
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -1223,6 +1372,26 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        diagnostics = self.preemption_diagnostics
+        if diagnostics is not None:
+            free_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if reason == "memory_pressure":
+            if (
+                self._preemption_cost_supported
+                and not request.resumable
+                and request.sampling_params is not None
+                and not request.has_encoder_inputs
+                and self._step_preempted_tokens >= 0
+            ):
+                self._step_preempted_tokens += request.num_computed_tokens
+                self._preemption_recovery_high[request.request_id] = (
+                    self._completed_token_high.get(request.request_id, 0)
+                )
+            else:
+                self._preemption_cost_supported = False
+                self._step_preempted_tokens = -1
+        else:
+            self._preemption_recovery_high.pop(request.request_id, None)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1236,6 +1405,13 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self._track_waiting_request(request)
+        if diagnostics is not None:
+            diagnostics.preempt(
+                request,
+                free_before,
+                self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                reason,
+            )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1574,6 +1750,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._complete_batch_log(scheduler_output, model_runner_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1719,6 +1896,10 @@ class Scheduler(SchedulerInterface):
                     request.resumable = False
                     stopped = True
 
+            if self.preemption_diagnostics is not None:
+                self.preemption_diagnostics.completed(
+                    scheduler_output, request, bool(new_token_ids)
+                )
             routed_experts = None
             if (
                 self.enable_return_routed_experts
@@ -1813,6 +1994,9 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if self.preemption_diagnostics is not None:
+            self.preemption_diagnostics.end_output(scheduler_output)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -2071,6 +2255,8 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
+            if self.preemption_diagnostics is not None:
+                self.preemption_diagnostics.add_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -2143,6 +2329,10 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        self._completed_token_high.pop(request.request_id, None)
+        self._preemption_recovery_high.pop(request.request_id, None)
+        if self.preemption_diagnostics is not None:
+            self.preemption_diagnostics.finish(request)
 
         request_logger = RequestEventLogger.get()
         if request_logger is not None:
@@ -2208,7 +2398,7 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
+                self._preempt_request(request, timestamp, reason="forced_prefix_reset")
                 # For async scheduling, any output frames already in flight at
                 # preemption time are now stale and must be discarded when they
                 # return. num_output_placeholders is exactly that count: 0 if
@@ -2238,6 +2428,8 @@ class Scheduler(SchedulerInterface):
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
 
+        if self.preemption_diagnostics is not None:
+            self.preemption_diagnostics.cache_reset(reset_successful)
         return reset_successful
 
     def reset_connector_cache(self) -> bool:
@@ -2320,6 +2512,11 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        for args, _ in self._pending_batch_logs.values():
+            self._log_schedule_batch(args, -1)
+        self._pending_batch_logs.clear()
+        if self.preemption_diagnostics is not None:
+            self.preemption_diagnostics.shutdown()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

@@ -52,11 +52,11 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
-def test_pending_prefix_index_tracks_waiting_lifecycle(monkeypatch):
-    monkeypatch.setenv("VLLM_EVICTION_POLICY", "score")
+def test_pending_prefix_index_tracks_waiting_lifecycle():
     scheduler = create_scheduler(
         max_num_seqs=1,
         enable_prefix_caching=True,
+        kv_cache_eviction_policy="peek",
     )
     requests = create_requests(
         num_requests=2,
@@ -74,7 +74,7 @@ def test_pending_prefix_index_tracks_waiting_lifecycle(monkeypatch):
         for block_hash in shared_hashes
     )
     assert all(
-        scheduler.kv_cache_manager.block_pool._demand_scores[block_hash] == 2.0
+        scheduler.kv_cache_manager.block_pool._demand_counts[block_hash] == 2.0
         for block_hash in shared_hashes
     )
 
@@ -86,13 +86,30 @@ def test_pending_prefix_index_tracks_waiting_lifecycle(monkeypatch):
         for block_hash in shared_hashes
     )
     assert all(
-        scheduler.kv_cache_manager.block_pool._demand_scores[block_hash] == 1.0
+        scheduler.kv_cache_manager.block_pool._demand_counts[block_hash] == 1.0
         for block_hash in shared_hashes
     )
 
     scheduler.finish_requests(requests[1].request_id, RequestStatus.FINISHED_ABORTED)
     assert len(scheduler.pending_prefix_index) == 0
-    assert scheduler.kv_cache_manager.block_pool._demand_scores == {}
+    assert scheduler.kv_cache_manager.block_pool._demand_counts == {}
+
+
+@pytest.mark.parametrize("mode", ["plain", "cluster", "recency", "decay"])
+def test_eviction_mode_configuration(mode):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        kv_cache_eviction_policy="peek",
+        peek_eviction_mode=mode,
+        peek_eviction_recency_weight=17.5,
+        peek_eviction_decay_tau=8.0,
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+
+    assert scheduler._peek_eviction_mode == mode
+    assert pool._peek_eviction_mode == mode
+    assert pool._peek_eviction_recency_weight == 17.5
+    assert pool._peek_eviction_decay_tau == 8.0
 
 
 def test_finish_request():
@@ -204,7 +221,7 @@ def test_lpm_preserves_fcfs_for_equal_prefix_hits():
     assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
 
 
-def test_lpm_deprioritizes_later_cold_prefix_siblings():
+def test_lpm_prefers_larger_hit_even_for_shared_prefix_siblings():
     scheduler = create_scheduler(
         max_num_seqs=1,
         enable_prefix_caching=True,
@@ -233,10 +250,10 @@ def test_lpm_deprioritizes_later_cold_prefix_siblings():
 
     output = scheduler.schedule()
 
-    assert [req.req_id for req in output.scheduled_new_reqs] == ["other"]
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["sibling"]
     assert [request.request_id for request in scheduler.waiting] == [
+        "other",
         "pioneer",
-        "sibling",
     ]
 
 

@@ -44,6 +44,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ServerTimingInfo,
     ToolCall,
     UsageInfo,
 )
@@ -77,6 +78,38 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _server_timing_from_output(output: RequestOutput) -> ServerTimingInfo | None:
+    metrics = output.metrics
+    if metrics is None:
+        return None
+
+    queued_ts = metrics.queued_ts
+    scheduled_ts = metrics.scheduled_ts
+    first_token_ts = metrics.first_token_ts
+    last_token_ts = metrics.last_token_ts
+    if not 0 < queued_ts <= scheduled_ts <= first_token_ts <= last_token_ts:
+        return None
+
+    intervals = sorted(metrics.inter_token_latencies)
+    count = len(intervals)
+    output_intervals = metrics.num_generation_tokens - 1
+    return ServerTimingInfo(
+        queue_wait_ms=(scheduled_ts - queued_ts) * 1000,
+        prefill_ms=(first_token_ts - scheduled_ts) * 1000,
+        decode_ms=(last_token_ts - first_token_ts) * 1000,
+        inference_ms=(last_token_ts - scheduled_ts) * 1000,
+        ttft_ms=metrics.first_token_latency * 1000,
+        tpot_ms=(
+            (last_token_ts - first_token_ts) * 1000 / output_intervals
+            if output_intervals > 0 else None
+        ),
+        itl_mean_ms=sum(intervals) * 1000 / count if count else None,
+        itl_p95_ms=intervals[int(0.95 * (count - 1))] * 1000 if count else None,
+        itl_p99_ms=intervals[int(0.99 * (count - 1))] * 1000 if count else None,
+        itl_samples=count,
+    )
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -491,9 +524,11 @@ class OpenAIServingChat(OpenAIServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        final_res: RequestOutput | None = None
 
         try:
             async for res in result_generator:
+                final_res = res
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -941,12 +976,21 @@ class OpenAIServingChat(OpenAIServing):
             # is sent, send the usage
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
+                server_timing = (
+                    _server_timing_from_output(final_res)
+                    if final_res is not None and num_choices == 1
+                    else None
+                )
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
+                    server_timing=server_timing,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
+                if (
+                    self.enable_prompt_tokens_details
+                    and num_cached_tokens is not None
+                ):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
@@ -971,6 +1015,11 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
+                server_timing=(
+                    _server_timing_from_output(final_res)
+                    if final_res is not None and num_choices == 1
+                    else None
+                ),
             )
 
             # Log complete streaming response if output logging is enabled
@@ -1354,10 +1403,15 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if (
+            self.enable_prompt_tokens_details
+            and final_res.num_cached_tokens is not None
+        ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
             )
+        if len(final_res.outputs) == 1:
+            usage.server_timing = _server_timing_from_output(final_res)
 
         request_metadata.final_usage_info = usage
 

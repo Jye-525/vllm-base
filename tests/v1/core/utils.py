@@ -59,6 +59,7 @@ def create_scheduler(
     ec_role: str | None = None,
     scheduling_policy: str = "fcfs",
     lpm_window_size: int = SchedulerConfig.lpm_window_size,
+    lpm_fallback_threshold: int = SchedulerConfig.lpm_fallback_threshold,
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold,
     lpm_deprioritize_threshold: int = SchedulerConfig.lpm_deprioritize_threshold,
     clpm_big_lane_share: float = SchedulerConfig.clpm_big_lane_share,
@@ -66,6 +67,13 @@ def create_scheduler(
     clpm_group_major: bool = SchedulerConfig.clpm_group_major,
     clpm_dynamic_lane: bool = SchedulerConfig.clpm_dynamic_lane,
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s,
+    kv_cache_eviction_policy: str = SchedulerConfig.kv_cache_eviction_policy,
+    peek_eviction_mode: str = SchedulerConfig.peek_eviction_mode,
+    peek_eviction_recency_weight: float = (
+        SchedulerConfig.peek_eviction_recency_weight
+    ),
+    peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau,
+    peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -100,6 +108,7 @@ def create_scheduler(
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=scheduling_policy,
         lpm_window_size=lpm_window_size,
+        lpm_fallback_threshold=lpm_fallback_threshold,
         lpm_check_threshold=lpm_check_threshold,
         lpm_deprioritize_threshold=lpm_deprioritize_threshold,
         clpm_big_lane_share=clpm_big_lane_share,
@@ -107,6 +116,11 @@ def create_scheduler(
         clpm_group_major=clpm_group_major,
         clpm_dynamic_lane=clpm_dynamic_lane,
         clpm_slo_budget_s=clpm_slo_budget_s,
+        kv_cache_eviction_policy=kv_cache_eviction_policy,
+        peek_eviction_mode=peek_eviction_mode,
+        peek_eviction_recency_weight=peek_eviction_recency_weight,
+        peek_eviction_decay_tau=peek_eviction_decay_tau,
+        peek_eviction_scan_cap=peek_eviction_scan_cap,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

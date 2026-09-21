@@ -52,22 +52,9 @@ def _sections(
 def rank_lpm(
     requests: list[Request],
     prefix_hits: dict[str, int],
-    rank_info: dict[str, PendingRankInfo],
-    check_threshold: int,
 ) -> RankPlan:
-    """PEEK LPM: prefix hits first, but keep cold sibling bursts at the tail."""
-    sections = _sections(requests, prefix_hits, rank_info, check_threshold)
-    positions = {request.request_id: pos for pos, request in enumerate(requests)}
-    ordered = sorted(
-        requests,
-        key=lambda request: (
-            1 if sections[request.request_id] == 2 else 0,
-            0
-            if sections[request.request_id] == 2
-            else -prefix_hits[request.request_id],
-            positions[request.request_id],
-        ),
-    )
+    """Order by prefix hits, preserving current queue order on ties."""
+    ordered = sorted(requests, key=lambda request: -prefix_hits[request.request_id])
     return RankPlan(ordered, {})
 
 
@@ -139,9 +126,11 @@ def rank_clpm(
     def cache_key(request: Request) -> tuple:
         request_id = request.request_id
         info = rank_info[request_id]
-        effective_hit = prefix_hits[request_id] + int(
-            age_alpha * max(0.0, now - request.arrival_time)
-        )
+        effective_hit = prefix_hits[request_id]
+        if age_alpha > 0.0:
+            effective_hit += int(
+                age_alpha * max(0.0, now - request.arrival_time)
+            )
         return (
             sections[request_id],
             -effective_hit,
@@ -149,21 +138,6 @@ def rank_clpm(
             -info.cluster_size,
             positions[request_id],
         )
-
-    lane_a = (
-        _group_major_order(requests, sections, prefix_hits, rank_info, positions)
-        if group_major
-        else sorted(requests, key=cache_key)
-    )
-    lane_b = sorted(
-        requests,
-        key=lambda request: (
-            sections[request.request_id],
-            request.arrival_time,
-            -prefix_hits[request.request_id],
-            positions[request.request_id],
-        ),
-    )
 
     b_share = 1.0 - big_lane_share
     next_dynamic_b_share = None
@@ -187,19 +161,41 @@ def rank_clpm(
         next_dynamic_b_share = b_share
     a_share = 1.0 - b_share
 
+    def order_lane_a() -> list[Request]:
+        if group_major:
+            return _group_major_order(
+                requests, sections, prefix_hits, rank_info, positions
+            )
+        return sorted(requests, key=cache_key)
+
+    def order_lane_b() -> list[Request]:
+        return sorted(
+            requests,
+            key=lambda request: (
+                sections[request.request_id],
+                request.arrival_time,
+                -prefix_hits[request.request_id],
+                positions[request.request_id],
+            ),
+        )
+
     if a_share <= 0.0:
+        lane_b = order_lane_b()
         return RankPlan(
             lane_b,
             {r.request_id: LaneCredit("b", 1.0) for r in lane_b},
             next_dynamic_b_share,
         )
     if b_share <= 0.0:
+        lane_a = order_lane_a()
         return RankPlan(
             lane_a,
             {r.request_id: LaneCredit("a", 1.0) for r in lane_a},
             next_dynamic_b_share,
         )
 
+    lane_a = order_lane_a()
+    lane_b = order_lane_b()
     a_stride = 1.0 / a_share
     b_stride = 1.0 / b_share
     local_a_pass = lane_a_pass

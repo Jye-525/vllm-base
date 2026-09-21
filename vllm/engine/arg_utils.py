@@ -91,7 +91,12 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import (
+    KVCacheEvictionPolicy,
+    PeekEvictionMode,
+    PolicyProfile,
+    SchedulerPolicy,
+)
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
@@ -593,14 +598,23 @@ class EngineArgs:
 
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
-    lpm_window_size: int = SchedulerConfig.lpm_window_size
+    policy_profile: PolicyProfile | None = None
+    lpm_window_size: int | None = None
+    lpm_fallback_threshold: int | None = None
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
     lpm_deprioritize_threshold: int = SchedulerConfig.lpm_deprioritize_threshold
     clpm_big_lane_share: float = SchedulerConfig.clpm_big_lane_share
     clpm_age_alpha: float = SchedulerConfig.clpm_age_alpha
-    clpm_group_major: bool = SchedulerConfig.clpm_group_major
-    clpm_dynamic_lane: bool = SchedulerConfig.clpm_dynamic_lane
+    clpm_group_major: bool | None = None
+    clpm_dynamic_lane: bool | None = None
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
+    kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
+    peek_eviction_mode: PeekEvictionMode | None = None
+    peek_eviction_recency_weight: float = (
+        SchedulerConfig.peek_eviction_recency_weight
+    )
+    peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau
+    peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
 
@@ -639,7 +653,7 @@ class EngineArgs:
         ObservabilityConfig.enable_logging_iteration_details
     )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
-    scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    scheduling_policy: SchedulerPolicy | None = None
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -718,6 +732,7 @@ class EngineArgs:
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
     def __post_init__(self):
+        self._resolve_policy_profile()
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
@@ -768,6 +783,66 @@ class EngineArgs:
                         tokenizer_id,
                         self.tokenizer,
                     )
+
+    def _resolve_policy_profile(self) -> None:
+        """Resolve a named experiment profile, then apply explicit overrides."""
+        if self.policy_profile == "kvreuse":
+            raise ValueError(
+                "The 'kvreuse' policy profile is reserved for a future "
+                "KVReuse scheduler and eviction policy and is not implemented yet."
+            )
+
+        defaults = {
+            "scheduling_policy": SchedulerConfig.policy,
+            "lpm_window_size": SchedulerConfig.lpm_window_size,
+            "lpm_fallback_threshold": SchedulerConfig.lpm_fallback_threshold,
+            "clpm_group_major": SchedulerConfig.clpm_group_major,
+            "clpm_dynamic_lane": SchedulerConfig.clpm_dynamic_lane,
+            "kv_cache_eviction_policy": SchedulerConfig.kv_cache_eviction_policy,
+            "peek_eviction_mode": SchedulerConfig.peek_eviction_mode,
+        }
+        if self.policy_profile == "lpm":
+            defaults["scheduling_policy"] = "lpm"
+        elif self.policy_profile == "peek":
+            defaults.update(
+                scheduling_policy="clpm",
+                lpm_window_size=0,
+                lpm_fallback_threshold=0,
+                clpm_group_major=True,
+                clpm_dynamic_lane=True,
+                kv_cache_eviction_policy="peek",
+                peek_eviction_mode="cluster",
+            )
+        elif self.policy_profile not in (None, "vllm"):
+            raise ValueError(f"Unknown policy profile: {self.policy_profile}")
+
+        for name, default in defaults.items():
+            if getattr(self, name) is None:
+                setattr(self, name, default)
+
+        if self.policy_profile in ("lpm", "peek"):
+            if self.enable_prefix_caching is False:
+                raise ValueError(
+                    f"The '{self.policy_profile}' policy profile requires "
+                    "prefix caching. Remove --no-enable-prefix-caching."
+                )
+            if self.enable_prefix_caching is None:
+                self.enable_prefix_caching = True
+
+        if self.policy_profile is not None:
+            logger.info(
+                "Resolved policy profile %s: scheduling=%s, lpm_window=%d, "
+                "lpm_fallback=%d, group_major=%s, dynamic_lane=%s, "
+                "eviction=%s, peek_mode=%s",
+                self.policy_profile,
+                self.scheduling_policy,
+                self.lpm_window_size,
+                self.lpm_fallback_threshold,
+                self.clpm_group_major,
+                self.clpm_dynamic_lane,
+                self.kv_cache_eviction_policy,
+                self.peek_eviction_mode,
+            )
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -1371,10 +1446,25 @@ class EngineArgs:
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
-            "--scheduling-policy", **scheduler_kwargs["policy"]
+            "--policy-profile",
+            choices=["vllm", "lpm", "peek", "kvreuse"],
+            default=None,
+            help=(
+                "Named scheduling/eviction bundle. Explicit policy options "
+                "override profile defaults. The kvreuse profile is reserved."
+            ),
         )
         scheduler_group.add_argument(
-            "--lpm-window-size", **scheduler_kwargs["lpm_window_size"]
+            "--scheduling-policy",
+            **{**scheduler_kwargs["policy"], "default": None},
+        )
+        scheduler_group.add_argument(
+            "--lpm-window-size",
+            **{**scheduler_kwargs["lpm_window_size"], "default": None},
+        )
+        scheduler_group.add_argument(
+            "--lpm-fallback-threshold",
+            **{**scheduler_kwargs["lpm_fallback_threshold"], "default": None},
         )
         scheduler_group.add_argument(
             "--lpm-check-threshold", **scheduler_kwargs["lpm_check_threshold"]
@@ -1390,13 +1480,38 @@ class EngineArgs:
             "--clpm-age-alpha", **scheduler_kwargs["clpm_age_alpha"]
         )
         scheduler_group.add_argument(
-            "--clpm-group-major", **scheduler_kwargs["clpm_group_major"]
+            "--clpm-group-major",
+            **{**scheduler_kwargs["clpm_group_major"], "default": None},
         )
         scheduler_group.add_argument(
-            "--clpm-dynamic-lane", **scheduler_kwargs["clpm_dynamic_lane"]
+            "--clpm-dynamic-lane",
+            **{**scheduler_kwargs["clpm_dynamic_lane"], "default": None},
         )
         scheduler_group.add_argument(
             "--clpm-slo-budget-s", **scheduler_kwargs["clpm_slo_budget_s"]
+        )
+        scheduler_group.add_argument(
+            "--kv-cache-eviction-policy",
+            **{
+                **scheduler_kwargs["kv_cache_eviction_policy"],
+                "default": None,
+            },
+        )
+        scheduler_group.add_argument(
+            "--peek-eviction-mode",
+            **{**scheduler_kwargs["peek_eviction_mode"], "default": None},
+        )
+        scheduler_group.add_argument(
+            "--peek-eviction-recency-weight",
+            **scheduler_kwargs["peek_eviction_recency_weight"],
+        )
+        scheduler_group.add_argument(
+            "--peek-eviction-decay-tau",
+            **scheduler_kwargs["peek_eviction_decay_tau"],
+        )
+        scheduler_group.add_argument(
+            "--peek-eviction-scan-cap",
+            **scheduler_kwargs["peek_eviction_scan_cap"],
         )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
@@ -2046,6 +2161,7 @@ class EngineArgs:
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
             lpm_window_size=self.lpm_window_size,
+            lpm_fallback_threshold=self.lpm_fallback_threshold,
             lpm_check_threshold=self.lpm_check_threshold,
             lpm_deprioritize_threshold=self.lpm_deprioritize_threshold,
             clpm_big_lane_share=self.clpm_big_lane_share,
@@ -2053,6 +2169,11 @@ class EngineArgs:
             clpm_group_major=self.clpm_group_major,
             clpm_dynamic_lane=self.clpm_dynamic_lane,
             clpm_slo_budget_s=self.clpm_slo_budget_s,
+            kv_cache_eviction_policy=self.kv_cache_eviction_policy,
+            peek_eviction_mode=self.peek_eviction_mode,
+            peek_eviction_recency_weight=self.peek_eviction_recency_weight,
+            peek_eviction_decay_tau=self.peek_eviction_decay_tau,
+            peek_eviction_scan_cap=self.peek_eviction_scan_cap,
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,

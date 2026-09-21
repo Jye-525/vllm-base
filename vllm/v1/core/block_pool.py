@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import math
 import os
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -184,35 +185,37 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Eviction policy: "score" uses waiting-queue-aware victim
-        # selection (_select_victims_scored); "lru" uses stock popleft_n
-        # (the baseline). Set by the scheduler at startup; defaults to
-        # plain LRU so the pool behaves like stock vLLM until told
-        # otherwise.
+        # Peek eviction uses waiting-queue-aware victim selection; LRU uses
+        # stock popleft_n. The scheduler configures this at startup.
         self._eviction_policy: str = "lru"
 
-        # Waiting-queue demand scores maintained incrementally by the
+        # Waiting-queue demand maintained incrementally by the
         # scheduler. Higher counts mean that more pending requests share the
         # cumulative prefix ending at that hash. An empty dict degenerates
-        # scored eviction to plain LRU.
-        self._demand_scores: dict[BlockHash, float] = {}
-        self._evictable_hash_counts: dict[BlockHash, int] = {}
+        # Peek eviction to plain LRU.
+        self._demand_counts: dict[BlockHash, float] = {}
+        self._demand_max_depths: dict[BlockHash, int] = {}
+        self._block_hash_last_access: dict[BlockHash, float] = {}
+        self._peek_eviction_mode: str = "plain"
+        self._peek_eviction_recency_weight: float = 100.0
+        self._peek_eviction_decay_tau: float = 30.0
+        self._peek_eviction_scan_cap: int = 0
 
         # Orphan tracking is intentionally disabled for the demand-aware
         # experiment. vLLM already frees request blocks in reverse order, so
         # suffix blocks normally become eviction candidates before prefix
         # blocks. Keeping an explicit orphan heuristic adds stale-state risk
-        # and can conflict with the demand score.
+        # and can conflict with Peek's demand priority.
         #
         # OrphanKey = tuple[BlockHash, int]
         # self._children: dict[OrphanKey, set[OrphanKey]] = defaultdict(set)
         # self._orphaned: set[OrphanKey] = set()
 
-        # Scored-eviction effectiveness counters. Pure observability —
+        # Peek-eviction effectiveness counters. Pure observability —
         # they do not influence eviction.
-        self.scored_hits: int = 0          # hits on positively-scored blocks
-        self.scored_protected: int = 0     # current protected-hash count
-        self.scored_publishes: int = 0     # full or incremental update batches
+        self.peek_hits: int = 0
+        self.peek_protected: int = 0
+        self.peek_publishes: int = 0
 
         self._eviction_trace_path = os.getenv("VLLM_EVICTION_TRACE_PATH")
         self._eviction_trace_seq = 0
@@ -259,15 +262,19 @@ class BlockPool:
                 get_block_hash(block.block_hash)
                 if block.block_hash is not None else None
             )
-            score = (
-                self._demand_scores.get(raw_hash, 0.0)
+            demand = (
+                self._demand_counts.get(raw_hash, 0.0)
+                if raw_hash is not None else 0.0
+            )
+            priority = (
+                self._get_peek_eviction_priority(raw_hash)
                 if raw_hash is not None else 0.0
             )
             if block.block_hash is None:
                 tier = "uncached"
-            elif self._eviction_policy == "score" and score > 0.0:
+            elif self._eviction_policy == "peek" and demand > 0.0:
                 tier = "demanded"
-            elif self._eviction_policy == "score":
+            elif self._eviction_policy == "peek":
                 tier = "zero_demand"
             else:
                 tier = "lru_cached"
@@ -276,7 +283,8 @@ class BlockPool:
                 "block_id": block.block_id,
                 "block_hash": self._trace_block_hash(block),
                 "tier": tier,
-                "score": score,
+                "demand": demand,
+                "priority": priority,
                 "ref_cnt": block.ref_cnt,
             })
         record = {
@@ -288,8 +296,8 @@ class BlockPool:
             "selected_blocks": len(victims),
             "walked_blocks": walked,
             "free_blocks_before_reuse": self.free_block_queue.num_free_blocks,
-            "scored_protected": self.scored_protected,
-            "scored_publishes": self.scored_publishes,
+            "peek_protected": self.peek_protected,
+            "peek_publishes": self.peek_publishes,
             **self._eviction_trace_context,
             "victims": rows,
         }
@@ -299,114 +307,78 @@ class BlockPool:
         with open(self._eviction_trace_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
-    def _mark_evictable(self, block_hash: BlockHashWithGroupId | None) -> None:
-        if block_hash is None:
-            return
-        raw_hash = get_block_hash(block_hash)
-        self._evictable_hash_counts[raw_hash] = (
-            self._evictable_hash_counts.get(raw_hash, 0) + 1)
-
-    def _unmark_evictable(self, block_hash: BlockHashWithGroupId | None) -> None:
-        if block_hash is None:
-            return
-        raw_hash = get_block_hash(block_hash)
-        count = self._evictable_hash_counts.get(raw_hash, 0)
-        if count <= 1:
-            self._evictable_hash_counts.pop(raw_hash, None)
-        else:
-            self._evictable_hash_counts[raw_hash] = count - 1
-
-    def is_hash_evictable(self, block_hash: BlockHash) -> bool:
-        return self._evictable_hash_counts.get(block_hash, 0) > 0
-
-    def set_demand_scores(self, scores: dict[BlockHash, float]) -> None:
-        """Publish the per-block demand scores used by scored eviction.
+    def set_peek_demand_counts(
+        self,
+        counts: dict[BlockHash, float],
+        max_depths: Mapping[BlockHash, int] | None = None,
+    ) -> None:
+        """Publish per-block demand counts used by PEEK eviction modes.
 
         Pass an empty dict to fall back to plain LRU ordering (e.g. when
         the waiting queue is empty).
         """
-        self._demand_scores = scores
-        self.scored_protected = len(scores)
-        self.scored_publishes += 1
+        self._demand_counts = counts
+        self._demand_max_depths = (
+            {h: int(depth) for h, depth in max_depths.items() if h in counts}
+            if max_depths is not None else {}
+        )
+        self.peek_protected = len(counts)
+        self.peek_publishes += 1
 
-    def update_demand_counts(
+    def update_peek_demand_counts(
         self,
         counts: Mapping[BlockHash, int],
         *,
-        min_count: int = 1,
-        binary: bool = False,
+        max_depths: Mapping[BlockHash, int] | None = None,
     ) -> None:
-        """Incrementally update eviction scores from absolute demand counts.
+        """Incrementally update eviction state from absolute demand counts.
 
         ``counts`` only needs to contain hashes changed by a waiting-request
-        insertion, removal, or path update. A count below ``min_count`` removes
-        the hash from the protected set.
+        insertion, removal, or path update. ``max_depths`` supplies PEEK's
+        lazily maintained deepest chain position for cluster mode.
         """
         if not counts:
             return
-        min_count = max(1, min_count)
         for block_hash, count in counts.items():
-            if count < min_count:
-                self._demand_scores.pop(block_hash, None)
+            if count <= 0:
+                self._demand_counts.pop(block_hash, None)
+                self._demand_max_depths.pop(block_hash, None)
             else:
-                self._demand_scores[block_hash] = 1.0 if binary else float(count)
-        self.scored_protected = len(self._demand_scores)
-        self.scored_publishes += 1
+                self._demand_counts[block_hash] = float(count)
+                if max_depths is not None:
+                    depth = max_depths.get(block_hash)
+                    if depth is not None:
+                        self._demand_max_depths[block_hash] = int(depth)
+        self.peek_protected = len(self._demand_counts)
+        self.peek_publishes += 1
 
-    def classify_chain(
+    def _get_peek_eviction_priority(
         self,
-        hashes: Sequence[BlockHash],
-        kv_cache_group_ids: Sequence[int] = (0,),
-    ) -> tuple[int, int, list[BlockHash]]:
-        """Single-pass classifier for a waiter's prefix chain.
-
-        Returns (cached_prefix_len, active_hits, evictable_hashes):
-          cached_prefix_len: length of the longest *contiguous* prefix of
-                             `hashes` for which every hash is cached in
-                             every group in `kv_cache_group_ids`. vLLM v1
-                             only reuses contiguous prefixes, so this is
-                             the safe truncation point for protection.
-          active_hits:       count of hashes *within* the contiguous
-                             cached prefix whose block (in the first
-                             group) has ref_cnt > 0 — cached and held by
-                             a running request, therefore NOT in the
-                             free queue. Used by the scheduler to
-                             discount free-queue cost. Hashes past the
-                             first miss are excluded because the waiter
-                             will allocate fresh blocks for those
-                             positions regardless of what is cached
-                             downstream (contiguous-only matching).
-          evictable_hashes:  hashes within the contiguous cached prefix that
-                             have at least one cached block with ref_cnt == 0.
-                             Demand scores only affect free-queue eviction
-                             candidates, so publishing pinned-only hashes adds
-                             scheduler overhead without changing victim choice.
-        """
-        cached_prefix_len = 0
-        active_hits = 0
-        first_group = kv_cache_group_ids[0]
-        cache = self.cached_block_hash_to_block
-        evictable_hashes: list[BlockHash] = []
-        for h in hashes:
-            block_in_first_group: KVCacheBlock | None = None
-            cached_all_groups = True
-            for gid in kv_cache_group_ids:
-                key = make_block_hash_with_group_id(h, gid)
-                blk = cache.get_one_block(key)
-                if gid == first_group:
-                    block_in_first_group = blk
-                if blk is None:
-                    cached_all_groups = False
-                    break
-            if not cached_all_groups:
-                break
-            cached_prefix_len += 1
-            if (block_in_first_group is not None
-                    and block_in_first_group.ref_cnt > 0):
-                active_hits += 1
-            if self.is_hash_evictable(h):
-                evictable_hashes.append(h)
-        return cached_prefix_len, active_hits, evictable_hashes
+        block_hash: BlockHash,
+        now: float | None = None,
+    ) -> float:
+        """Return PEEK's mode-specific protection priority for a hash."""
+        demand = self._demand_counts.get(block_hash, 0.0)
+        if demand <= 0.0:
+            return 0.0
+        if self._peek_eviction_mode == "cluster":
+            depth = self._demand_max_depths.get(block_hash, 1)
+            return demand * (1 + depth)
+        if self._peek_eviction_mode == "recency":
+            last_access = self._block_hash_last_access.get(block_hash)
+            current_time = now if now is not None else time.time()
+            age = max(0.0, current_time - last_access) if last_access else 0.0
+            return float(int(demand - self._peek_eviction_recency_weight * age))
+        if self._peek_eviction_mode == "decay":
+            last_access = self._block_hash_last_access.get(block_hash)
+            current_time = now if now is not None else time.time()
+            age = max(0.0, current_time - last_access) if last_access else 0.0
+            decay = (
+                math.exp(-age / self._peek_eviction_decay_tau)
+                if self._peek_eviction_decay_tau > 0.0 else 1.0
+            )
+            return float(int(demand * decay * 1000))
+        return demand
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -433,8 +405,8 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
-        if block_hash in self._demand_scores:
-            self.scored_hits += 1
+        if block_hash in self._demand_counts:
+            self.peek_hits += 1
         return cached_blocks
 
     def is_cached_block(self, block_hash: BlockHash,
@@ -508,6 +480,8 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        track_last_access = self._peek_eviction_mode in ("recency", "decay")
+        now = time.time() if track_last_access else 0.0
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -523,8 +497,8 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-            if blk.ref_cnt == 0:
-                self._mark_evictable(block_hash_with_group_id)
+            if track_last_access:
+                self._block_hash_last_access[block_hash] = now
 
             # Orphan tracking disabled; keep this as historical reference.
             # block_key = (block_hash, kv_cache_group_id)
@@ -604,11 +578,11 @@ class BlockPool:
 
         Note that we do not check block cache in this function.
 
-        Under the "score" eviction policy, positive-demand blocks are
+        Under Peek eviction, positive-demand blocks are
         protected first because the current waiting queue can reuse them.
         Blocks with no published demand are cheap victims and are evicted in
         LRU order. If those cheap victims are insufficient, demanded blocks
-        are evicted by ascending score. Under "lru" (the baseline), blocks
+        are evicted by ascending priority. Under "lru" (the baseline), blocks
         are evicted in plain free-queue order.
 
         Args:
@@ -621,8 +595,8 @@ class BlockPool:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
 
-        if self.enable_caching and self._eviction_policy == "score":
-            ret = self._select_victims_scored(num_blocks)
+        if self.enable_caching and self._eviction_policy == "peek":
+            ret = self._select_victims_peek(num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
             self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
@@ -643,111 +617,81 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
-    def _select_victims_scored(
+    def _select_victims_peek(
         self, num_blocks: int
     ) -> list[KVCacheBlock]:
-        """Select ``num_blocks`` eviction victims using the published
-        per-block demand scores fused with LRU history.
+        """Select victims using Peek's bounded demand-aware free-list scan.
 
-        Eviction priority (evict first -> last):
-          * "Cheap" blocks — uncached, zero-demand (no waiting request
-            needs them) — taken in LRU order (free-queue head -> tail).
-          * Demanded blocks (score > 0) — only under pressure, in
-            ascending score order (lowest protected-value first); LRU
-            breaks exact ties.
-
-        The free list is traversed once from the head (LRU order) without
-        mutating it. Cheap victims (tiers 1-2) are collected in queue
-        order; if they alone satisfy the request the walk stops early and
-        demanded blocks are never disturbed (common fast path). Only under
-        pressure do we sort the demanded candidates and evict the
-        lowest-scoring ones. Chosen victims are unlinked with
-        ``FreeKVCacheBlockQueue.remove()`` so survivors keep their LRU
-        position.
+        Uncached and zero-demand blocks are selected first in LRU order.
+        If the bounded scan finds too few, demanded blocks in the scanned
+        prefix are selected by ascending mode-specific protection priority,
+        with LRU position breaking ties. This mirrors Peek's vLLM hook.
         """
         t0 = time.perf_counter()
         queue = self.free_block_queue
-        scores = self._demand_scores
+        if not self._demand_counts:
+            victims = queue.popleft_n(num_blocks)
+            self._trace_eviction_selection(num_blocks, victims, walked=num_blocks)
+            return victims
 
+        cap = (
+            self._peek_eviction_scan_cap
+            if self._peek_eviction_scan_cap > 0
+            else max(num_blocks * 4, 256)
+        )
         victims: list[KVCacheBlock] = []
-        # (block, score) for cached blocks with positive demand, in LRU order.
-        demanded: list[tuple[KVCacheBlock, float]] = []
-        zero_demand_cached = 0
-        uncached_seen = 0
-
-        # Traverse head -> tail. The fake tail has next_free_block is None.
-        walked = 0
+        demanded: list[tuple[float, int, KVCacheBlock]] = []
         block = queue.fake_free_list_head.next_free_block
-        while (block is not None and block.next_free_block is not None
-               and len(victims) < num_blocks):
-            nxt = block.next_free_block
-            walked += 1
-            bh = block.block_hash
-            if bh is None:
-                # Uncached — safe to reuse immediately.
-                uncached_seen += 1
+        tail = queue.fake_free_list_tail
+        walked = 0
+        while (
+            block is not None
+            and block is not tail
+            and len(victims) < num_blocks
+            and walked < cap
+        ):
+            block_hash = block.block_hash
+            if block_hash is None:
                 victims.append(block)
             else:
-                raw_hash = get_block_hash(bh)
-                score = scores.get(raw_hash, 0.0)
-                if score > 0.0:
-                    demanded.append((block, score))  # tier 3 candidate
+                raw_hash = get_block_hash(block_hash)
+                demand = self._demand_counts.get(raw_hash, 0.0)
+                if demand <= 0.0:
+                    victims.append(block)
                 else:
-                    zero_demand_cached += 1
-                    victims.append(block)            # tier 1: zero demand (LRU)
-            block = nxt
+                    priority = self._get_peek_eviction_priority(raw_hash)
+                    demanded.append((priority, walked, block))
+            block = block.next_free_block
+            walked += 1
 
-        # Tier 3: only consumed when cheap victims were insufficient. In
-        # that case the loop above ran to the tail, so `demanded` holds
-        # every demanded block. Sort ascending by score (stable sort keeps
-        # LRU order among ties) and evict the lowest-scoring ones.
-        still_needed = num_blocks - len(victims)
-        used_demanded = 0
-        demanded_victim_scores: list[float] = []
-        if still_needed > 0 and demanded:
-            demanded.sort(key=lambda t: t[1])
-            take_with_scores = demanded[:still_needed]
-            take = [blk for blk, _ in take_with_scores]
-            demanded_victim_scores = [score for _, score in take_with_scores]
-            victims.extend(take)
-            used_demanded = len(take)
+        if len(victims) < num_blocks:
+            demanded.sort(key=lambda item: (item[0], item[1]))
+            needed = num_blocks - len(victims)
+            victims.extend(block for _, _, block in demanded[:needed])
 
-        # Unlink victims; survivors retain their LRU position.
-        for blk in victims:
-            queue.remove(blk)
+        if len(victims) < num_blocks:
+            # Defensive fallback for a corrupted or unexpectedly short scan.
+            return queue.popleft_n(num_blocks)
+
+        for block in victims:
+            queue.remove(block)
 
         self._trace_eviction_selection(num_blocks, victims, walked=walked)
 
-        if demanded:
-            demanded_scores = [score for _, score in demanded]
-            demanded_min = min(demanded_scores)
-            demanded_avg = sum(demanded_scores) / len(demanded_scores)
-            demanded_max = max(demanded_scores)
-        else:
-            demanded_min = demanded_avg = demanded_max = 0.0
-        if demanded_victim_scores:
-            victim_score_min = min(demanded_victim_scores)
-            victim_score_avg = (
-                sum(demanded_victim_scores) / len(demanded_victim_scores))
-            victim_score_max = max(demanded_victim_scores)
-        else:
-            victim_score_min = victim_score_avg = victim_score_max = 0.0
-
         elapsed_us = (time.perf_counter() - t0) * 1e6
         logger.info(
-            "scored_eviction: %.1f us | requested=%d walked=%d "
-            "demanded_seen=%d demanded_evicted=%d free_remaining=%d "
-            "uncached_seen=%d zero_demand_cached=%d "
-            "demanded_score_min=%.6f demanded_score_avg=%.6f "
-            "demanded_score_max=%.6f victim_score_min=%.6f "
-            "victim_score_avg=%.6f victim_score_max=%.6f "
-            "scored_protected=%d scored_hits=%d publishes=%d",
-            elapsed_us, num_blocks, walked,
-            len(demanded), used_demanded, queue.num_free_blocks,
-            uncached_seen, zero_demand_cached, demanded_min, demanded_avg,
-            demanded_max, victim_score_min, victim_score_avg,
-            victim_score_max,
-            self.scored_protected, self.scored_hits, self.scored_publishes,
+            "peek_eviction: %.1f us | requested=%d walked=%d cap=%d "
+            "demanded_seen=%d free_remaining=%d protected=%d hits=%d "
+            "publishes=%d",
+            elapsed_us,
+            num_blocks,
+            walked,
+            cap,
+            len(demanded),
+            queue.num_free_blocks,
+            self.peek_protected,
+            self.peek_hits,
+            self.peek_publishes,
         )
 
         return victims
@@ -777,13 +721,11 @@ class BlockPool:
             # eviction is not needed
             return False
 
-        if block.ref_cnt == 0:
-            self._unmark_evictable(block_hash)
         block.reset_hash()
 
         # Orphan tracking disabled for demand-aware eviction. Historical
         # implementation kept per-group parent->child state here, but the
-        # heuristic can become stale and conflict with demand scores.
+        # heuristic can become stale and conflict with Peek demand.
         # raw_hash = get_block_hash(block_hash)
         # group_id = get_group_id(block_hash)
         # block_key = (raw_hash, group_id)
@@ -815,12 +757,15 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        track_last_access = self._peek_eviction_mode in ("recency", "decay")
+        now = time.time() if track_last_access else 0.0
         for block in blocks:
+            if track_last_access and block.block_hash is not None:
+                self._block_hash_last_access[get_block_hash(block.block_hash)] = now
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
-                self._unmark_evictable(block.block_hash)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -836,11 +781,7 @@ class BlockPool:
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
-            was_in_use = block.ref_cnt > 0
             block.ref_cnt -= 1
-            if (was_in_use and block.ref_cnt == 0 and not block.is_null
-                    and block.block_hash is not None):
-                self._mark_evictable(block.block_hash)
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -885,11 +826,12 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Clear published demand scores. Orphan tracking is disabled.
+        # Clear published Peek demand. Orphan tracking is disabled.
         # self._children.clear()
         # self._orphaned.clear()
-        self._demand_scores = {}
-        self._evictable_hash_counts = {}
+        self._demand_counts = {}
+        self._demand_max_depths = {}
+        self._block_hash_last_access = {}
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

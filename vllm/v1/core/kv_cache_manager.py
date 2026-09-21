@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -285,6 +285,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
+        failure_observer: Callable[[str, int, int], None] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -310,6 +311,8 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
+
+            failure_observer: Optional diagnostic callback at the capacity check.
 
         Blocks layout:
         ```
@@ -425,7 +428,12 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        available_blocks = self.block_pool.get_num_free_blocks()
+        if num_blocks_to_allocate > available_blocks:
+            if failure_observer is not None:
+                failure_observer(
+                    request.request_id, num_blocks_to_allocate, available_blocks
+                )
             # Cannot allocate new blocks
             return None
 

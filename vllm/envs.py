@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
+    VLLM_PREEMPTION_DIAGNOSTICS_DIR: str | None = None
     VLLM_USE_AOT_COMPILE: bool = False
     VLLM_USE_BYTECODE_HOOK: bool = True
     VLLM_FORCE_AOT_LOAD: bool = False
@@ -970,6 +971,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.
     "VLLM_LORA_RESOLVER_CACHE_DIR": lambda: os.getenv(
         "VLLM_LORA_RESOLVER_CACHE_DIR", None
+    ),
+    # Opt-in scheduler-owned preemption diagnostics.
+    "VLLM_PREEMPTION_DIAGNOSTICS_DIR": lambda: os.getenv(
+        "VLLM_PREEMPTION_DIAGNOSTICS_DIR"
     ),
     # A remote HF repo(s) containing one or more LoRA adapters, which
     # may be downloaded and leveraged as needed. Only works if plugins

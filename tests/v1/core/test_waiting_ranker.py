@@ -14,37 +14,38 @@ def _request(request_id: str, arrival_time: float = 0.0):
 
 
 def _info(
-    *, score: int = 1, size: int = 1, claim: bytes | None = None
+    *, score: int = 1, size: int = 1, depth: int = 1, claim: bytes | None = None
 ) -> PendingRankInfo:
     block_hash = BlockHash(claim) if claim is not None else None
     return PendingRankInfo(
         request_score=score,
         cluster_hash=block_hash if size >= 2 else None,
-        cluster_depth=1 if size >= 2 else 0,
+        cluster_depth=depth if size >= 2 else 0,
         cluster_size=size,
         claim_hash=block_hash,
     )
 
 
-def test_lpm_keeps_one_cold_pioneer_and_deprioritizes_siblings() -> None:
-    pioneer = _request("pioneer")
-    sibling = _request("sibling")
-    other = _request("other")
-    requests = [pioneer, sibling, other]
-    hits = {"pioneer": 0, "sibling": 32, "other": 16}
-    infos = {
-        "pioneer": _info(score=4, size=2, claim=b"shared"),
-        "sibling": _info(score=4, size=2, claim=b"shared"),
-        "other": _info(claim=b"other"),
-    }
+def test_lpm_orders_only_by_prefix_hits() -> None:
+    requests = [_request("first"), _request("second"), _request("third")]
+    hits = {"first": 0, "second": 32, "third": 16}
 
-    plan = rank_lpm(requests, hits, infos, check_threshold=32)
+    plan = rank_lpm(requests, hits)
 
     assert [r.request_id for r in plan.ordered_requests] == [
-        "other",
-        "pioneer",
-        "sibling",
+        "second",
+        "third",
+        "first",
     ]
+    assert plan.lane_credit == {}
+
+
+def test_lpm_ties_preserve_queue_order_not_arrival() -> None:
+    requests = [_request("young", 20), _request("old", 10)]
+
+    plan = rank_lpm(requests, {"young": 64, "old": 64})
+
+    assert [r.request_id for r in plan.ordered_requests] == ["young", "old"]
 
 
 def test_clpm_interleaves_cache_and_age_lanes() -> None:
