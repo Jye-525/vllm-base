@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm import envs
@@ -46,6 +46,10 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.preemption_diagnostics import PreemptionDiagnostics
+from vllm.v1.core.sched.predictive_admission import (
+    PredictiveAdmissionController,
+    RequestSnapshot,
+)
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
@@ -70,6 +74,13 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class _PredictiveAdmissionState:
+    running: list[RequestSnapshot]
+    block_ref_counts: dict[int, int]
+    pinned_block_count: int
 
 
 class Scheduler(SchedulerInterface):
@@ -302,6 +313,49 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.predictive_admission: PredictiveAdmissionController | None = None
+        if self.scheduler_config.admission_policy == "pkas":
+            unsupported = []
+            if self.policy != SchedulingPolicy.LPM:
+                unsupported.append("scheduling_policy_must_be_lpm")
+            if not self.cache_config.enable_prefix_caching:
+                unsupported.append("prefix_caching_disabled")
+            if (
+                self.scheduler_config.async_scheduling
+                or type(self).__name__ == "AsyncScheduler"
+            ):
+                unsupported.append("async_scheduling")
+            if speculative_config is not None:
+                unsupported.append("speculative_decoding")
+            if self.connector is not None or self.ec_connector is not None:
+                unsupported.append("offload_or_transfer")
+            if self.use_pp or self.dcp_world_size > 1 or self.pcp_world_size > 1:
+                unsupported.append("pipeline_or_context_parallelism")
+            if self.scheduler_config.runner_type != "generate":
+                unsupported.append("non_generation_runner")
+            if self.is_encoder_decoder or self.scheduler_config.is_multimodal_model:
+                unsupported.append("encoder_or_multimodal")
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                len(groups) != 1
+                or type(groups[0].kv_cache_spec) is not FullAttentionSpec
+                or groups[0].kv_cache_spec.sliding_window is not None
+                or groups[0].kv_cache_spec.attention_chunk_size is not None
+            ):
+                unsupported.append("hybrid_or_non_full_attention")
+            if unsupported:
+                raise ValueError(
+                    "PKAS predictive admission does not support: "
+                    + ", ".join(unsupported)
+                )
+            self.predictive_admission = PredictiveAdmissionController(
+                block_size=self.block_size,
+                capacity_blocks=block_pool.num_gpu_blocks - 1,
+                token_budget=self.max_num_scheduled_tokens,
+                long_prefill_token_threshold=(
+                    self.scheduler_config.long_prefill_token_threshold
+                ),
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -603,6 +657,123 @@ class Scheduler(SchedulerInterface):
             self._clpm_lane_a_pass -= min_pass
             self._clpm_lane_b_pass -= min_pass
 
+    def _build_predictive_admission_state(
+        self, num_scheduled_tokens: Mapping[str, int]
+    ) -> _PredictiveAdmissionState | None:
+        if self.predictive_admission is None:
+            return None
+
+        running: list[RequestSnapshot] = []
+        ref_counts: dict[int, int] = {}
+        for active in self.running:
+            blocks = self.kv_cache_manager.get_blocks(active.request_id).blocks[0]
+            block_ids = tuple(
+                block.block_id for block in blocks if not block.is_null
+            )
+            for block in blocks:
+                if not block.is_null:
+                    ref_counts[block.block_id] = block.ref_cnt
+            running.append(
+                RequestSnapshot(
+                    request_id=active.request_id,
+                    prompt_tokens=active.num_prompt_tokens,
+                    computed_tokens=(
+                        active.num_computed_tokens
+                        + num_scheduled_tokens.get(active.request_id, 0)
+                    ),
+                    output_tokens=active.num_output_tokens,
+                    max_output_tokens=active.max_tokens,
+                    block_ids=block_ids,
+                )
+            )
+        return _PredictiveAdmissionState(
+            running=running,
+            block_ref_counts=ref_counts,
+            pinned_block_count=sum(count > 0 for count in ref_counts.values()),
+        )
+
+    def _update_predictive_admission_state(
+        self,
+        state: _PredictiveAdmissionState | None,
+        request: Request,
+        computed_tokens: int,
+        request_blocks: KVCacheBlocks,
+    ) -> None:
+        if state is None:
+            return
+
+        blocks = request_blocks.blocks[0]
+        block_ids = tuple(block.block_id for block in blocks if not block.is_null)
+        for block in blocks:
+            if block.is_null:
+                continue
+            old_count = state.block_ref_counts.get(block.block_id, 0)
+            new_count = block.ref_cnt
+            if old_count == 0 and new_count > 0:
+                state.pinned_block_count += 1
+            elif old_count > 0 and new_count == 0:
+                state.pinned_block_count -= 1
+            state.block_ref_counts[block.block_id] = new_count
+        state.running.append(
+            RequestSnapshot(
+                request_id=request.request_id,
+                prompt_tokens=request.num_prompt_tokens,
+                computed_tokens=computed_tokens,
+                output_tokens=request.num_output_tokens,
+                max_output_tokens=request.max_tokens,
+                block_ids=block_ids,
+            )
+        )
+
+    def _predictive_admission_allows(
+        self,
+        state: _PredictiveAdmissionState | None,
+        request: Request,
+        computed_blocks: KVCacheBlocks,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> bool:
+        controller = self.predictive_admission
+        if controller is None:
+            return True
+        assert state is not None
+
+        hit_blocks = computed_blocks.blocks[0]
+        hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
+        for block in hit_blocks:
+            if block.is_null or block.block_id in state.block_ref_counts:
+                continue
+            state.block_ref_counts[block.block_id] = block.ref_cnt
+            if block.ref_cnt > 0:
+                state.pinned_block_count += 1
+
+        decision = controller.evaluate(
+            state.running,
+            RequestSnapshot(
+                request_id=request.request_id,
+                prompt_tokens=request.num_prompt_tokens,
+                computed_tokens=num_computed_tokens + num_new_tokens,
+                output_tokens=request.num_output_tokens,
+                max_output_tokens=request.max_tokens,
+                block_ids=(),
+            ),
+            candidate_hit_block_ids=hit_ids,
+            block_ref_counts=state.block_ref_counts,
+            initial_pinned_blocks=state.pinned_block_count,
+        )
+        logger.debug(
+            "predictive_admission: request_id=%s feasible=%s "
+            "predicted_output_tokens=%d prefix_hit_blocks=%d "
+            "peak_pinned_blocks=%d capacity_blocks=%d",
+            request.request_id,
+            decision.feasible,
+            decision.predicted_output_tokens,
+            decision.prefix_hit_blocks,
+            decision.peak_pinned_blocks,
+            decision.capacity_blocks,
+        )
+        return decision.feasible
+
     def schedule(self) -> SchedulerOutput:
         if self._pending_batch_logs:
             # Overlapping execution cannot use the synchronous accounting path.
@@ -848,6 +1019,15 @@ class Scheduler(SchedulerInterface):
             # once per step; admission below still pops from the queue head.
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
 
+            predictive_admission_state = None
+            if (
+                (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+                and len(self.running) < self.max_num_running_reqs
+            ):
+                predictive_admission_state = self._build_predictive_admission_state(
+                    num_scheduled_tokens
+                )
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -1000,6 +1180,15 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
+                if not self._predictive_admission_allows(
+                    predictive_admission_state,
+                    request,
+                    new_computed_blocks,
+                    num_computed_tokens,
+                    num_new_tokens,
+                ):
+                    break
+
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
@@ -1150,6 +1339,12 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._update_predictive_admission_state(
+                    predictive_admission_state,
+                    request,
+                    num_computed_tokens + num_new_tokens,
+                    req_to_new_blocks[request.request_id],
+                )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -2233,6 +2428,15 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if self.predictive_admission is not None and (
+            request.resumable
+            or request.sampling_params is None
+            or request.has_encoder_inputs
+        ):
+            raise ValueError(
+                "PKAS predictive admission supports only non-streaming, "
+                "decoder-only generation requests"
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2329,6 +2533,11 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        if self.predictive_admission is not None and request.status in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            self.predictive_admission.observe_completion(request.num_output_tokens)
         self._completed_token_high.pop(request.request_id, None)
         self._preemption_recovery_high.pop(request.request_id, None)
         if self.preemption_diagnostics is not None:

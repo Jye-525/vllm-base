@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
+AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 
@@ -119,6 +120,10 @@ class SchedulerConfig:
     - "lpm" orders a bounded waiting window by locally cached prefix length
       descending, preserving current queue order on ties.
     - "clpm" adds clustered demand and an age-aware fairness lane."""
+
+    admission_policy: AdmissionPolicy = "none"
+    """Waiting-request admission policy. ``none`` uses stock vLLM admission;
+    ``pkas`` applies prefix-aware predictive admission after LPM ranking."""
 
     lpm_window_size: int = Field(default=128, ge=0)
     """For LPM/cLPM, the number of waiting requests to reorder per

@@ -469,6 +469,39 @@ def test_prefix_cache_default():
     assert not engine_args.enable_prefix_caching
 
 
+def test_kvreuse_policy_profile_and_explicit_overrides():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--policy-profile", "kvreuse"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.scheduling_policy == "lpm"
+    assert engine_args.admission_policy == "pkas"
+    assert engine_args.kv_cache_eviction_policy == "lru"
+    assert engine_args.enable_prefix_caching
+
+    args = parser.parse_args(
+        [
+            "--policy-profile",
+            "kvreuse",
+            "--admission-policy",
+            "none",
+            "--kv-cache-eviction-policy",
+            "peek",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.admission_policy == "none"
+    assert engine_args.kv_cache_eviction_policy == "peek"
+
+
+def test_kvreuse_policy_profile_requires_prefix_caching():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--policy-profile", "kvreuse", "--no-enable-prefix-caching"]
+    )
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        EngineArgs.from_cli_args(args=args)
+
+
 @pytest.mark.parametrize(
     ("arg", "expected", "option"),
     [

@@ -92,6 +92,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import (
+    AdmissionPolicy,
     KVCacheEvictionPolicy,
     PeekEvictionMode,
     PolicyProfile,
@@ -599,6 +600,7 @@ class EngineArgs:
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
     policy_profile: PolicyProfile | None = None
+    admission_policy: AdmissionPolicy | None = None
     lpm_window_size: int | None = None
     lpm_fallback_threshold: int | None = None
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
@@ -786,14 +788,9 @@ class EngineArgs:
 
     def _resolve_policy_profile(self) -> None:
         """Resolve a named experiment profile, then apply explicit overrides."""
-        if self.policy_profile == "kvreuse":
-            raise ValueError(
-                "The 'kvreuse' policy profile is reserved for a future "
-                "KVReuse scheduler and eviction policy and is not implemented yet."
-            )
-
         defaults = {
             "scheduling_policy": SchedulerConfig.policy,
+            "admission_policy": SchedulerConfig.admission_policy,
             "lpm_window_size": SchedulerConfig.lpm_window_size,
             "lpm_fallback_threshold": SchedulerConfig.lpm_fallback_threshold,
             "clpm_group_major": SchedulerConfig.clpm_group_major,
@@ -803,6 +800,12 @@ class EngineArgs:
         }
         if self.policy_profile == "lpm":
             defaults["scheduling_policy"] = "lpm"
+        elif self.policy_profile == "kvreuse":
+            defaults.update(
+                scheduling_policy="lpm",
+                admission_policy="pkas",
+                kv_cache_eviction_policy="lru",
+            )
         elif self.policy_profile == "peek":
             defaults.update(
                 scheduling_policy="clpm",
@@ -820,7 +823,7 @@ class EngineArgs:
             if getattr(self, name) is None:
                 setattr(self, name, default)
 
-        if self.policy_profile in ("lpm", "peek"):
+        if self.policy_profile in ("lpm", "peek", "kvreuse"):
             if self.enable_prefix_caching is False:
                 raise ValueError(
                     f"The '{self.policy_profile}' policy profile requires "
@@ -831,11 +834,13 @@ class EngineArgs:
 
         if self.policy_profile is not None:
             logger.info(
-                "Resolved policy profile %s: scheduling=%s, lpm_window=%d, "
+                "Resolved policy profile %s: scheduling=%s, admission=%s, "
+                "lpm_window=%d, "
                 "lpm_fallback=%d, group_major=%s, dynamic_lane=%s, "
                 "eviction=%s, peek_mode=%s",
                 self.policy_profile,
                 self.scheduling_policy,
+                self.admission_policy,
                 self.lpm_window_size,
                 self.lpm_fallback_threshold,
                 self.clpm_group_major,
@@ -1451,12 +1456,16 @@ class EngineArgs:
             default=None,
             help=(
                 "Named scheduling/eviction bundle. Explicit policy options "
-                "override profile defaults. The kvreuse profile is reserved."
+                "override profile defaults."
             ),
         )
         scheduler_group.add_argument(
             "--scheduling-policy",
             **{**scheduler_kwargs["policy"], "default": None},
+        )
+        scheduler_group.add_argument(
+            "--admission-policy",
+            **{**scheduler_kwargs["admission_policy"], "default": None},
         )
         scheduler_group.add_argument(
             "--lpm-window-size",
@@ -2160,6 +2169,7 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            admission_policy=self.admission_policy,
             lpm_window_size=self.lpm_window_size,
             lpm_fallback_threshold=self.lpm_fallback_threshold,
             lpm_check_threshold=self.lpm_check_threshold,

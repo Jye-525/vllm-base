@@ -25,6 +25,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.predictive_admission import AdmissionDecision
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -276,6 +277,82 @@ def test_lpm_falls_back_to_fcfs_without_prefix_caching():
 
     assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
     scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
+
+
+def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        lpm_window_size=2,
+    )
+    first, best = create_requests(num_requests=2)
+    scheduler.add_request(first)
+    scheduler.add_request(best)
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
+        side_effect=lambda request: 16 if request is best else 0
+    )
+    assert scheduler.predictive_admission is not None
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(False, 1, 0, 10, 9)
+    )
+
+    output = scheduler.schedule()
+
+    assert not output.scheduled_new_reqs
+    assert [request.request_id for request in scheduler.waiting] == [
+        best.request_id,
+        first.request_id,
+    ]
+    assert len(scheduler.pending_prefix_index) == 2
+    assert all(
+        block.is_null or block.ref_cnt == 0
+        for block in scheduler.kv_cache_manager.block_pool.blocks
+    )
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+
+
+def test_pkas_admission_acceptance_uses_normal_allocation_path():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        lpm_window_size=2,
+    )
+    first, best = create_requests(num_requests=2)
+    scheduler.add_request(first)
+    scheduler.add_request(best)
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
+        side_effect=lambda request: 16 if request is best else 0
+    )
+    assert scheduler.predictive_admission is not None
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(True, 1, 0, 2, 99)
+    )
+
+    output = scheduler.schedule()
+
+    assert [request.req_id for request in output.scheduled_new_reqs] == [
+        best.request_id
+    ]
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+
+
+def test_pkas_admission_requires_lpm_and_prefix_caching():
+    with pytest.raises(ValueError, match="scheduling_policy_must_be_lpm"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy="fcfs",
+            admission_policy="pkas",
+        )
+    with pytest.raises(ValueError, match="prefix_caching_disabled"):
+        create_scheduler(
+            enable_prefix_caching=False,
+            scheduling_policy="lpm",
+            admission_policy="pkas",
+        )
 
 
 def test_schedule_multimodal_requests():
