@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right, insort
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -90,25 +90,38 @@ class BatchCostModel:
         return int(budget), saving
 
 
-class OnlineOutputLengthEstimator:
-    """PKAS moving estimator using completed output lengths."""
+class CausalOutputLengthEstimator:
+    """Upper-quantile forecast from recent completed outputs only."""
 
     def __init__(self) -> None:
-        self.count = 0
-        self.mean = 0.0
-        self.m2 = 0.0
+        self.history: deque[int] = deque()
+        self.sorted_lengths: list[int] = []
+
+    @property
+    def count(self) -> int:
+        return len(self.history)
 
     def observe(self, output_tokens: int) -> None:
-        self.count += 1
-        delta = output_tokens - self.mean
-        self.mean += delta / self.count
-        self.m2 += delta * (output_tokens - self.mean)
+        if len(self.history) == 256:
+            oldest = self.history.popleft()
+            self.sorted_lengths.pop(bisect_left(self.sorted_lengths, oldest))
+        self.history.append(output_tokens)
+        insort(self.sorted_lengths, output_tokens)
 
     def predict(self) -> int:
-        if self.count <= 1:
-            return 1
-        sample_stddev = math.sqrt(self.m2 / (self.count - 1))
-        return math.ceil(abs(self.mean - sample_stddev))
+        if self.count < 32:
+            return 512
+        return max(1, self.sorted_lengths[int(0.9 * (self.count - 1))])
+
+    def target(self, observed_tokens: int) -> int:
+        predicted = self.predict()
+        if observed_tokens < predicted:
+            return predicted
+        first = bisect_right(self.sorted_lengths, observed_tokens)
+        survivors = self.count - first
+        if survivors >= 8:
+            return self.sorted_lengths[first + int(0.9 * (survivors - 1))]
+        return observed_tokens + predicted
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +130,6 @@ class RequestSnapshot:
     prompt_tokens: int
     computed_tokens: int
     output_tokens: int
-    max_output_tokens: int
     block_ids: tuple[int, ...]
 
 
@@ -161,7 +173,7 @@ class PredictiveAdmissionController:
         self.token_budget = token_budget
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.max_model_len = max_model_len
-        self.estimator = OnlineOutputLengthEstimator()
+        self.estimator = CausalOutputLengthEstimator()
 
     def observe_completion(self, output_tokens: int) -> None:
         self.estimator.observe(output_tokens)
@@ -201,10 +213,7 @@ class PredictiveAdmissionController:
                 live_blocks -= 1
 
         def target_for(request: RequestSnapshot) -> int:
-            total_output_target = min(
-                request.max_output_tokens,
-                max(predicted, request.output_tokens + 1),
-            )
+            total_output_target = self.estimator.target(request.output_tokens)
             return min(
                 request.prompt_tokens + total_output_target - 1,
                 self.max_model_len - 1,

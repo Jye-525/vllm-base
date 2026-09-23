@@ -34,6 +34,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     FunctionDefinition,
     GenerationError,
+    ServerTimingInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
@@ -54,6 +55,7 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.outputs import RequestOutput
 from vllm.renderers import ChatParams, TokenizeParams
 from vllm.renderers.inputs.preprocess import (
     extract_prompt_components,
@@ -85,6 +87,38 @@ class RendererChatRequest(RendererRequest, Protocol):
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
         raise NotImplementedError
+
+
+def server_timing_from_output(output: RequestOutput) -> ServerTimingInfo | None:
+    metrics = output.metrics
+    if metrics is None:
+        return None
+
+    queued_ts = metrics.queued_ts
+    scheduled_ts = metrics.scheduled_ts
+    first_token_ts = metrics.first_token_ts
+    last_token_ts = metrics.last_token_ts
+    if not 0 < queued_ts <= scheduled_ts <= first_token_ts <= last_token_ts:
+        return None
+
+    intervals = sorted(metrics.inter_token_latencies)
+    count = len(intervals)
+    output_intervals = metrics.num_generation_tokens - 1
+    return ServerTimingInfo(
+        queue_wait_ms=(scheduled_ts - queued_ts) * 1000,
+        prefill_ms=(first_token_ts - scheduled_ts) * 1000,
+        decode_ms=(last_token_ts - first_token_ts) * 1000,
+        inference_ms=(last_token_ts - scheduled_ts) * 1000,
+        ttft_ms=metrics.first_token_latency * 1000,
+        tpot_ms=(
+            (last_token_ts - first_token_ts) * 1000 / output_intervals
+            if output_intervals > 0 else None
+        ),
+        itl_mean_ms=sum(intervals) * 1000 / count if count else None,
+        itl_p95_ms=intervals[int(0.95 * (count - 1))] * 1000 if count else None,
+        itl_p99_ms=intervals[int(0.99 * (count - 1))] * 1000 if count else None,
+        itl_samples=count,
+    )
 
 
 CompletionLikeRequest: TypeAlias = (

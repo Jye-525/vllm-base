@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
-
 import pytest
 
 from vllm.v1.core.sched.predictive_admission import (
     BatchCostModel,
-    OnlineOutputLengthEstimator,
+    CausalOutputLengthEstimator,
     PredictiveAdmissionController,
     RequestSnapshot,
 )
@@ -22,47 +20,68 @@ def make_request(
     computed: int,
     blocks: tuple[int, ...] = (),
     output: int = 0,
-    max_output: int = 16,
 ) -> RequestSnapshot:
     return RequestSnapshot(
         request_id=request_id,
         prompt_tokens=prompt,
         computed_tokens=computed,
         output_tokens=output,
-        max_output_tokens=max_output,
         block_ids=blocks,
     )
 
 
-def make_controller(capacity: int) -> PredictiveAdmissionController:
-    return PredictiveAdmissionController(
+def train(controller: PredictiveAdmissionController, output: int) -> None:
+    for _ in range(32):
+        controller.observe_completion(output)
+
+
+def make_controller(capacity: int, predicted: int = 1) -> PredictiveAdmissionController:
+    controller = PredictiveAdmissionController(
         block_size=4,
         capacity_blocks=capacity,
         token_budget=8,
         long_prefill_token_threshold=0,
         max_model_len=128,
     )
+    train(controller, predicted)
+    return controller
 
 
-def test_online_estimator_matches_pkas_rule():
-    estimator = OnlineOutputLengthEstimator()
-    assert estimator.predict() == 1
-    estimator.observe(10)
-    assert estimator.predict() == 1
-    estimator.observe(14)
-    expected = math.ceil(abs(12 - math.sqrt(8)))
-    assert estimator.predict() == expected
+def test_causal_estimator_uses_completed_lengths_and_survival():
+    estimator = CausalOutputLengthEstimator()
+    assert estimator.predict() == 512
+    for length in range(1, 32):
+        estimator.observe(length)
+    assert estimator.predict() == 512
+    estimator = CausalOutputLengthEstimator()
+    for length in range(1, 101):
+        estimator.observe(length)
+    assert estimator.count == 100
+    assert estimator.predict() == 90
+    assert estimator.target(0) == 90
+    assert estimator.target(90) == 99
+    assert estimator.target(100) == 190
+    for _ in range(256):
+        estimator.observe(20)
+    assert estimator.count == 256
+    assert estimator.predict() == 20
 
-    zero_estimator = OnlineOutputLengthEstimator()
-    zero_estimator.observe(0)
-    zero_estimator.observe(0)
-    assert zero_estimator.predict() == 0
+
+def test_causal_admission_uses_cold_forecast():
+    controller = PredictiveAdmissionController(
+        block_size=4, capacity_blocks=2, token_budget=8,
+        long_prefill_token_threshold=0, max_model_len=128,
+    )
+    decision = controller.evaluate(
+        [], make_request("candidate", prompt=4, computed=4),
+        candidate_hit_block_ids=(), block_ref_counts={},
+    )
+    assert decision.predicted_output_tokens == 512
+    assert not decision.feasible
 
 
 def test_candidate_growth_is_rejected_at_capacity_peak():
-    controller = make_controller(capacity=2)
-    controller.observe_completion(2)
-    controller.observe_completion(2)
+    controller = make_controller(capacity=2, predicted=2)
     decision = controller.evaluate(
         [],
         make_request("candidate", prompt=8, computed=8),
@@ -87,9 +106,7 @@ def test_shared_prefix_is_counted_once():
 
 
 def test_unpinned_prefix_hit_becomes_pinned():
-    controller = make_controller(capacity=1)
-    controller.observe_completion(2)
-    controller.observe_completion(2)
+    controller = make_controller(capacity=1, predicted=2)
     decision = controller.evaluate(
         [],
         make_request("candidate", prompt=4, computed=4),
@@ -108,6 +125,7 @@ def test_chunked_prefill_then_decode_is_simulated():
         long_prefill_token_threshold=4,
         max_model_len=128,
     )
+    train(controller, 1)
     decision = controller.evaluate(
         [],
         make_request("candidate", prompt=8, computed=4),
@@ -126,6 +144,7 @@ def test_completed_request_releases_blocks_before_later_growth():
         long_prefill_token_threshold=0,
         max_model_len=128,
     )
+    train(controller, 1)
     decision = controller.evaluate(
         [make_request("running", prompt=4, computed=4, blocks=(7,))],
         make_request("candidate", prompt=8, computed=4),
@@ -139,12 +158,10 @@ def test_completed_request_releases_blocks_before_later_growth():
 @pytest.mark.parametrize("prompt,output", [(4, 1), (1, 4)])
 @pytest.mark.parametrize("use_bound", [False, True])
 def test_last_sampled_token_needs_no_kv_slot(prompt, output, use_bound):
-    controller = make_controller(1)
-    controller.observe_completion(output)
-    controller.observe_completion(output)
+    controller = make_controller(1, predicted=output)
     decision = controller.evaluate(
         [],
-        make_request("candidate", prompt=prompt, computed=prompt, max_output=output),
+        make_request("candidate", prompt=prompt, computed=prompt),
         candidate_hit_block_ids=(),
         block_ref_counts={},
         use_capacity_bound=use_bound,
@@ -156,8 +173,8 @@ def test_last_sampled_token_needs_no_kv_slot(prompt, output, use_bound):
 def test_current_step_peak_precedes_completion_release():
     controller = make_controller(1)
     decision = controller.evaluate(
-        [make_request("running", prompt=4, computed=4, blocks=(7,), max_output=1)],
-        make_request("candidate", prompt=4, computed=4, max_output=1),
+        [make_request("running", prompt=4, computed=4, blocks=(7,))],
+        make_request("candidate", prompt=4, computed=4),
         candidate_hit_block_ids=(),
         block_ref_counts={7: 1},
     )
@@ -168,8 +185,8 @@ def test_current_step_peak_precedes_completion_release():
 def test_upper_bound_failure_uses_completion_releases():
     controller = make_controller(2)
     decision = controller.evaluate(
-        [make_request("running", prompt=4, computed=4, blocks=(7,), max_output=1)],
-        make_request("candidate", prompt=8, computed=4, max_output=1),
+        [make_request("running", prompt=4, computed=4, blocks=(7,))],
+        make_request("candidate", prompt=8, computed=4),
         candidate_hit_block_ids=(),
         block_ref_counts={7: 1},
     )
@@ -181,8 +198,6 @@ def test_upper_bound_failure_uses_completion_releases():
 def test_model_length_caps_predicted_growth():
     controller = make_controller(1)
     controller.max_model_len = 5
-    controller.observe_completion(16)
-    controller.observe_completion(16)
     decision = controller.evaluate(
         [],
         make_request("candidate", prompt=4, computed=4),
@@ -211,10 +226,8 @@ def test_fast_forward_matches_stepwise_simulation():
         for predicted in (1, 4, 9):
             for capacity in range(2, 11):
                 for progress in (4, 6, 8):
-                    controller = make_controller(capacity)
+                    controller = make_controller(capacity, predicted=predicted)
                     controller.token_budget = budget
-                    controller.observe_completion(predicted)
-                    controller.observe_completion(predicted)
                     running = [
                         make_request(
                             "running", prompt=4, computed=4, blocks=(7,), output=1
@@ -253,12 +266,12 @@ def test_shared_block_survives_until_last_reference_finishes(capacity, feasible)
     controller = make_controller(capacity)
     decision = controller.evaluate(
         [
-            make_request("first", prompt=4, computed=4, blocks=(7,), max_output=1),
+            make_request("first", prompt=4, computed=4, blocks=(7,)),
             make_request(
-                "last", prompt=4, computed=4, blocks=(7,), output=1, max_output=3
+                "last", prompt=4, computed=4, blocks=(7,), output=1
             ),
         ],
-        make_request("candidate", prompt=12, computed=4, max_output=1),
+        make_request("candidate", prompt=12, computed=4),
         candidate_hit_block_ids=(),
         block_ref_counts={7: 2},
         use_capacity_bound=False,
@@ -271,9 +284,7 @@ def test_shared_block_survives_until_last_reference_finishes(capacity, feasible)
 
 @pytest.mark.parametrize("budget,allowed", [(0, False), (4, False), (5, True)])
 def test_replay_budget_prices_private_tail_and_restart(budget, allowed):
-    controller = make_controller(3)
-    controller.observe_completion(4)
-    controller.observe_completion(4)
+    controller = make_controller(3, predicted=4)
     decision = controller.evaluate(
         [make_request("running", prompt=4, computed=4, blocks=(7,))],
         make_request("candidate", prompt=4, computed=4),
@@ -302,9 +313,7 @@ def test_replay_budget_never_overrides_current_step_capacity():
 
 
 def test_replay_budget_cannot_rescue_oversized_solo_request():
-    controller = make_controller(1)
-    controller.observe_completion(4)
-    controller.observe_completion(4)
+    controller = make_controller(1, predicted=4)
     decision = controller.evaluate(
         [],
         make_request("candidate", prompt=4, computed=4),
@@ -316,10 +325,8 @@ def test_replay_budget_cannot_rescue_oversized_solo_request():
 
 
 def test_replay_estimate_includes_shared_suffix_after_first_missing_block():
-    controller = make_controller(3)
+    controller = make_controller(3, predicted=4)
     controller.token_budget = 4
-    controller.observe_completion(4)
-    controller.observe_completion(4)
     decision = controller.evaluate(
         [make_request("running", prompt=12, computed=4, blocks=(8,))],
         make_request("candidate", prompt=8, computed=8, output=1),
@@ -335,9 +342,7 @@ def test_replay_estimate_includes_shared_suffix_after_first_missing_block():
 
 
 def test_replay_budget_rejects_when_tail_cannot_cover_deficit():
-    controller = make_controller(2)
-    controller.observe_completion(4)
-    controller.observe_completion(4)
+    controller = make_controller(2, predicted=4)
     decision = controller.evaluate(
         [make_request("running", prompt=12, computed=4, blocks=(7,))],
         make_request("candidate", prompt=4, computed=4, output=1),
@@ -351,9 +356,7 @@ def test_replay_budget_rejects_when_tail_cannot_cover_deficit():
 def test_cost_fast_forward_locates_first_overflow_like_stepwise():
     for capacity in range(2, 12):
         for budget in (1, 5, 20, 100):
-            controller = make_controller(capacity)
-            controller.observe_completion(16)
-            controller.observe_completion(16)
+            controller = make_controller(capacity, predicted=16)
             args = (
                 [make_request("running", prompt=4, computed=4, blocks=(7,))],
                 make_request("candidate", prompt=4, computed=4),

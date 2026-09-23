@@ -44,7 +44,6 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
-    ServerTimingInfo,
     ToolCall,
     UsageInfo,
 )
@@ -52,6 +51,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    server_timing_from_output,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -78,38 +78,6 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
-
-
-def _server_timing_from_output(output: RequestOutput) -> ServerTimingInfo | None:
-    metrics = output.metrics
-    if metrics is None:
-        return None
-
-    queued_ts = metrics.queued_ts
-    scheduled_ts = metrics.scheduled_ts
-    first_token_ts = metrics.first_token_ts
-    last_token_ts = metrics.last_token_ts
-    if not 0 < queued_ts <= scheduled_ts <= first_token_ts <= last_token_ts:
-        return None
-
-    intervals = sorted(metrics.inter_token_latencies)
-    count = len(intervals)
-    output_intervals = metrics.num_generation_tokens - 1
-    return ServerTimingInfo(
-        queue_wait_ms=(scheduled_ts - queued_ts) * 1000,
-        prefill_ms=(first_token_ts - scheduled_ts) * 1000,
-        decode_ms=(last_token_ts - first_token_ts) * 1000,
-        inference_ms=(last_token_ts - scheduled_ts) * 1000,
-        ttft_ms=metrics.first_token_latency * 1000,
-        tpot_ms=(
-            (last_token_ts - first_token_ts) * 1000 / output_intervals
-            if output_intervals > 0 else None
-        ),
-        itl_mean_ms=sum(intervals) * 1000 / count if count else None,
-        itl_p95_ms=intervals[int(0.95 * (count - 1))] * 1000 if count else None,
-        itl_p99_ms=intervals[int(0.99 * (count - 1))] * 1000 if count else None,
-        itl_samples=count,
-    )
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -977,7 +945,7 @@ class OpenAIServingChat(OpenAIServing):
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 server_timing = (
-                    _server_timing_from_output(final_res)
+                    server_timing_from_output(final_res)
                     if final_res is not None and num_choices == 1
                     else None
                 )
@@ -1016,7 +984,7 @@ class OpenAIServingChat(OpenAIServing):
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
                 server_timing=(
-                    _server_timing_from_output(final_res)
+                    server_timing_from_output(final_res)
                     if final_res is not None and num_choices == 1
                     else None
                 ),
@@ -1411,7 +1379,7 @@ class OpenAIServingChat(OpenAIServing):
                 cached_tokens=final_res.num_cached_tokens
             )
         if len(final_res.outputs) == 1:
-            usage.server_timing = _server_timing_from_output(final_res)
+            usage.server_timing = server_timing_from_output(final_res)
 
         request_metadata.final_usage_info = usage
 

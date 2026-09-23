@@ -4670,6 +4670,8 @@ def test_pkas_real_gate_accepts_one_block_one_output():
         scheduling_policy="lpm",
         admission_policy="pkas",
     )
+    for _ in range(32):
+        scheduler.predictive_admission.observe_completion(1)
     (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=1)
     scheduler.add_request(request)
     output = scheduler.schedule()
@@ -4680,12 +4682,14 @@ def test_pkas_real_gate_accepts_one_block_one_output():
 
 def test_pkas_real_gate_skips_candidate_that_exceeds_capacity():
     scheduler = create_scheduler(
-        num_blocks=5,
+        num_blocks=4,
         max_num_seqs=1,
         enable_prefix_caching=True,
         scheduling_policy="lpm",
         admission_policy="pkas",
     )
+    for _ in range(32):
+        scheduler.predictive_admission.observe_completion(1)
     (large,) = create_requests(num_requests=1, num_tokens=80, req_ids=["large"])
     (small,) = create_requests(num_requests=1, num_tokens=16, req_ids=["small"])
     scheduler.add_request(large)
@@ -4759,8 +4763,8 @@ def test_pkas_replay_cost_requires_lru():
         )
 
 
-@pytest.mark.parametrize("ratio,admitted", [(0, True), (0.5, False)])
-def test_pkas_cost_gate_preserves_recovery_before_bypassing(ratio, admitted):
+def test_pkas_cost_gate_preserves_recovery_before_bypassing():
+    ratio = 0.5
     scheduler = create_scheduler(
         max_num_seqs=1, enable_prefix_caching=True,
         scheduling_policy="lpm", admission_policy="pkas",
@@ -4785,12 +4789,36 @@ def test_pkas_cost_gate_preserves_recovery_before_bypassing(ratio, admitted):
 
     scheduler.predictive_admission.evaluate = Mock(side_effect=evaluate)
     output = scheduler.schedule()
-    assert bool(output.scheduled_new_reqs) is admitted
-    assert scheduler._pkas_step_stats["recovery_stops"] == int(not admitted)
-    if ratio:
-        assert seen_budgets == [int(ratio * 33)]
-        assert list(scheduler.waiting) == [first, second]
-        assert scheduler._pkas_step_stats["skipped"] == 0
+    assert not output.scheduled_new_reqs
+    assert scheduler._pkas_step_stats["recovery_stops"] == 1
+    assert seen_budgets == [int(ratio * 33)]
+    assert list(scheduler.waiting) == [first, second]
+    assert scheduler._pkas_step_stats["skipped"] == 0
+
+
+def test_pkas_gate_preserves_recovery_without_cost_mode():
+    scheduler = create_scheduler(
+        max_num_seqs=1, enable_prefix_caching=True,
+        scheduling_policy="lpm", admission_policy="pkas",
+    )
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, ModelRunnerOutput(
+        req_ids=[first.request_id], req_id_to_index={first.request_id: 0},
+        sampled_token_ids=[[1]], logprobs=None, prompt_logprobs_dict={},
+        pooler_output=[],
+    ))
+    scheduler.running.remove(first)
+    scheduler._preempt_request(first, 0.0)
+    scheduler.add_request(second)
+    scheduler.predictive_admission.evaluate = Mock(return_value=AdmissionDecision(
+        False, 512, 1, 1, 1,
+    ))
+    output = scheduler.schedule()
+    assert not output.scheduled_new_reqs
+    assert list(scheduler.waiting) == [first, second]
+    assert scheduler._pkas_step_stats["recovery_stops"] == 1
 
 
 def test_pkas_batch_cost_observes_prefill_and_decode_before_output_update():

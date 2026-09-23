@@ -344,6 +344,7 @@ class Scheduler(SchedulerInterface):
             BatchCostModel() if self.scheduler_config.pkas_batch_cost else None
         )
         self._pkas_recovery_started: dict[str, float] = {}
+        self._pkas_last_gate_target: dict[str, int] = {}
         if self.scheduler_config.admission_policy == "pkas":
             unsupported = []
             if self.policy != SchedulingPolicy.LPM:
@@ -731,7 +732,6 @@ class Scheduler(SchedulerInterface):
                         + num_scheduled_tokens.get(active.request_id, 0)
                     ),
                     output_tokens=active.num_output_tokens,
-                    max_output_tokens=active.max_tokens,
                     block_ids=block_ids,
                 )
             )
@@ -768,7 +768,6 @@ class Scheduler(SchedulerInterface):
                 prompt_tokens=request.num_prompt_tokens,
                 computed_tokens=computed_tokens,
                 output_tokens=request.num_output_tokens,
-                max_output_tokens=request.max_tokens,
                 block_ids=block_ids,
             )
         )
@@ -827,7 +826,6 @@ class Scheduler(SchedulerInterface):
                 prompt_tokens=request.num_prompt_tokens,
                 computed_tokens=num_computed_tokens + num_new_tokens,
                 output_tokens=request.num_output_tokens,
-                max_output_tokens=request.max_tokens,
                 block_ids=(),
             ),
             candidate_hit_block_ids=hit_ids,
@@ -865,6 +863,20 @@ class Scheduler(SchedulerInterface):
             decision.replay_allowed,
             decision.estimated_replay_tokens,
         )
+        if allowed:
+            target = controller.estimator.target(request.num_output_tokens)
+            self._pkas_last_gate_target[request.request_id] = target
+            logger.info(
+                "pkas_gate_allow: request_id=%s observed_output_tokens=%d "
+                "target_output_tokens=%d completed_samples=%d "
+                "peak_pinned_blocks=%d capacity_blocks=%d",
+                request.request_id,
+                request.num_output_tokens,
+                target,
+                controller.estimator.count,
+                decision.peak_pinned_blocks,
+                decision.capacity_blocks,
+            )
         return allowed
 
     def schedule(self) -> SchedulerOutput:
@@ -1324,8 +1336,7 @@ class Scheduler(SchedulerInterface):
                     stats = self._pkas_step_stats
                     assert stats is not None
                     if (
-                        self.scheduler_config.pkas_max_replay_ratio > 0
-                        and request.num_preemptions > 0
+                        request.num_preemptions > 0
                         and num_computed_tokens > 0
                     ):
                         # Bypassing recovery can evict the prefix that made
@@ -1789,6 +1800,17 @@ class Scheduler(SchedulerInterface):
         if reason == "memory_pressure":
             if self.predictive_admission is not None:
                 self._pkas_recovery_started[request.request_id] = time.perf_counter()
+                estimator = self.predictive_admission.estimator
+                logger.info(
+                    "pkas_preemption: request_id=%s output_tokens=%d "
+                    "last_gate_target_output_tokens=%d "
+                    "current_target_output_tokens=%d preemptions=%d",
+                    request.request_id,
+                    request.num_output_tokens,
+                    self._pkas_last_gate_target.get(request.request_id, -1),
+                    estimator.target(request.num_output_tokens),
+                    request.num_preemptions + 1,
+                )
             if (
                 self._preemption_cost_supported
                 and not request.resumable
@@ -2755,6 +2777,7 @@ class Scheduler(SchedulerInterface):
         self._pkas_block_ids.pop(request.request_id, None)
         self._pkas_bypass_counts.pop(request.request_id, None)
         self._pkas_recovery_started.pop(request.request_id, None)
+        self._pkas_last_gate_target.pop(request.request_id, None)
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,
             RequestStatus.FINISHED_LENGTH_CAPPED,

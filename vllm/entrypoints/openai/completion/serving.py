@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    server_timing_from_output,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
@@ -292,6 +293,7 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        final_res: RequestOutput | None = None
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -300,6 +302,8 @@ class OpenAIServingCompletion(OpenAIServing):
 
         try:
             async for prompt_idx, res in result_generator:
+                if num_prompts == 1 and num_choices == 1 and res.finished:
+                    final_res = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
@@ -438,6 +442,10 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                server_timing=(
+                    server_timing_from_output(final_res)
+                    if final_res is not None else None
+                ),
             )
 
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
@@ -562,6 +570,11 @@ class OpenAIServingCompletion(OpenAIServing):
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
+            server_timing=(
+                server_timing_from_output(final_res_batch[0])
+                if len(final_res_batch) == 1 and len(final_res_batch[0].outputs) == 1
+                else None
+            ),
         )
 
         if (
