@@ -601,6 +601,9 @@ class EngineArgs:
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
     policy_profile: PolicyProfile | None = None
     admission_policy: AdmissionPolicy | None = None
+    pkas_max_candidate_skips: int = SchedulerConfig.pkas_max_candidate_skips
+    pkas_batch_cost: bool = SchedulerConfig.pkas_batch_cost
+    pkas_max_replay_ratio: float = SchedulerConfig.pkas_max_replay_ratio
     lpm_window_size: int | None = None
     lpm_fallback_threshold: int | None = None
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
@@ -612,9 +615,7 @@ class EngineArgs:
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
     peek_eviction_mode: PeekEvictionMode | None = None
-    peek_eviction_recency_weight: float = (
-        SchedulerConfig.peek_eviction_recency_weight
-    )
+    peek_eviction_recency_weight: float = SchedulerConfig.peek_eviction_recency_weight
     peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau
     peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap
 
@@ -1468,6 +1469,17 @@ class EngineArgs:
             **{**scheduler_kwargs["admission_policy"], "default": None},
         )
         scheduler_group.add_argument(
+            "--pkas-max-candidate-skips",
+            **scheduler_kwargs["pkas_max_candidate_skips"],
+        )
+        scheduler_group.add_argument(
+            "--pkas-batch-cost", **scheduler_kwargs["pkas_batch_cost"],
+        )
+        scheduler_group.add_argument(
+            "--pkas-max-replay-ratio",
+            **scheduler_kwargs["pkas_max_replay_ratio"],
+        )
+        scheduler_group.add_argument(
             "--lpm-window-size",
             **{**scheduler_kwargs["lpm_window_size"], "default": None},
         )
@@ -2170,6 +2182,9 @@ class EngineArgs:
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
             admission_policy=self.admission_policy,
+            pkas_max_candidate_skips=self.pkas_max_candidate_skips,
+            pkas_max_replay_ratio=self.pkas_max_replay_ratio,
+            pkas_batch_cost=self.pkas_batch_cost,
             lpm_window_size=self.lpm_window_size,
             lpm_fallback_threshold=self.lpm_fallback_threshold,
             lpm_check_threshold=self.lpm_check_threshold,

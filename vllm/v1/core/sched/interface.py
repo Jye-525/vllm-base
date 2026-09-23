@@ -74,6 +74,12 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def observe_batch_execution(
+        self, scheduler_output: "SchedulerOutput", seconds: float
+    ) -> None:
+        """Receive synchronous execute/sample wall time, excluding scheduling."""
+        pass
+
     @abstractmethod
     def get_grammar_bitmask(
         self, scheduler_output: "SchedulerOutput"

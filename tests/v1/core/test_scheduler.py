@@ -285,6 +285,7 @@ def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
         enable_prefix_caching=True,
         scheduling_policy="lpm",
         admission_policy="pkas",
+        pkas_max_candidate_skips=0,
         lpm_window_size=2,
     )
     first, best = create_requests(num_requests=2)
@@ -4538,3 +4539,295 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_pkas_skip_rejection_then_admit_and_clean_up():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        lpm_window_size=2,
+    )
+    first, second = create_requests(num_requests=2)
+    for request in (first, second):
+        scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(
+        side_effect=[
+            AdmissionDecision(False, 1, 0, 10, 9),
+            AdmissionDecision(True, 1, 0, 2, 9, peak_is_upper_bound=True),
+        ]
+    )
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [second.request_id]
+    assert list(scheduler.waiting) == [first]
+    assert len(scheduler.pending_prefix_index) == 1
+    assert scheduler._pkas_bypass_counts == {first.request_id: 1}
+    stats = scheduler._pkas_step_stats
+    assert stats["evaluations"] == 2
+    assert stats["skipped"] == stats["admitted_after_skip"] == 1
+    assert stats["bound_accepts"] == 1
+    scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    assert scheduler._pkas_bypass_counts == {}
+    assert len(scheduler.pending_prefix_index) == 0
+
+
+@pytest.mark.parametrize(
+    "skips,window,fallback,expected_calls",
+    [
+        (0, 0, 0, 1),
+        (1, 0, 0, 2),
+        (8, 2, 0, 2),
+        (8, 0, 0, 3),
+        (8, 0, 1, 1),
+    ],
+)
+def test_pkas_scan_limits_preserve_queue_and_references(
+    skips, window, fallback, expected_calls
+):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_max_candidate_skips=skips,
+        lpm_window_size=window,
+        lpm_fallback_threshold=fallback,
+    )
+    requests = create_requests(num_requests=3)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(False, 1, 0, 10, 9)
+    )
+    output = scheduler.schedule()
+    assert not output.scheduled_new_reqs
+    assert list(scheduler.waiting) == requests
+    assert scheduler.predictive_admission.evaluate.call_count == expected_calls
+    assert len(scheduler.pending_prefix_index) == 3
+    assert scheduler._pkas_bypass_counts == {}
+    assert all(
+        block.is_null or block.ref_cnt == 0
+        for block in scheduler.kv_cache_manager.block_pool.blocks
+    )
+
+
+def test_pkas_bypass_fairness_stops_at_eight():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+    )
+    first, second = create_requests(num_requests=2)
+    for request in (first, second):
+        scheduler.add_request(request)
+    scheduler._pkas_bypass_counts[first.request_id] = 8
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(False, 1, 0, 10, 9)
+    )
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+    assert list(scheduler.waiting) == [first, second]
+    assert scheduler._pkas_step_stats["fairness_stops"] == 1
+    assert scheduler._pkas_step_stats["blocked_budget"] > 0
+
+
+def test_pkas_skip_updates_state_between_successful_admissions():
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+    )
+    requests = create_requests(num_requests=3)
+    for request in requests:
+        scheduler.add_request(request)
+    snapshots = []
+
+    def evaluate(running, candidate, **kwargs):
+        snapshots.append((candidate.request_id, len(running)))
+        return AdmissionDecision(
+            candidate.request_id != requests[0].request_id, 1, 0, 2, 99
+        )
+
+    scheduler.predictive_admission.evaluate = Mock(side_effect=evaluate)
+    output = scheduler.schedule()
+    assert snapshots == [
+        (requests[0].request_id, 0),
+        (requests[1].request_id, 0),
+        (requests[2].request_id, 1),
+    ]
+    assert len(output.scheduled_new_reqs) == 2
+    assert output.total_num_scheduled_tokens == sum(
+        output.num_scheduled_tokens.values()
+    )
+    assert scheduler._pkas_bypass_counts == {requests[0].request_id: 1}
+
+
+def test_pkas_real_gate_accepts_one_block_one_output():
+    scheduler = create_scheduler(
+        num_blocks=2,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=1)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [request.request_id]
+    assert output.total_num_scheduled_tokens == 16
+    assert scheduler._pkas_step_stats["bound_accepts"] == 1
+
+
+def test_pkas_real_gate_skips_candidate_that_exceeds_capacity():
+    scheduler = create_scheduler(
+        num_blocks=5,
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+    )
+    (large,) = create_requests(num_requests=1, num_tokens=80, req_ids=["large"])
+    (small,) = create_requests(num_requests=1, num_tokens=16, req_ids=["small"])
+    scheduler.add_request(large)
+    scheduler.add_request(small)
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [small.request_id]
+    assert list(scheduler.waiting) == [large]
+    assert scheduler._pkas_bypass_counts == {large.request_id: 1}
+    assert scheduler._pkas_step_stats["rejections"] == 1
+    assert scheduler._pkas_step_stats["bound_accepts"] == 1
+
+
+def test_pkas_cached_snapshot_matches_physical_state_and_invalidates():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, scheduling_policy="lpm", admission_policy="pkas",
+    )
+    first, second = create_requests(num_requests=2, num_tokens=32, same_prompt=True)
+    for request in (first, second):
+        scheduler.add_request(request)
+    scheduler.schedule()
+    state = scheduler._build_predictive_admission_state({})
+    pool = scheduler.kv_cache_manager.block_pool
+    assert any(b.ref_cnt == 2 for b in pool.blocks)
+    assert state.pinned_block_count == sum(b.ref_cnt > 0 for b in pool.blocks)
+    for snapshot in state.running:
+        blocks = scheduler.kv_cache_manager.get_blocks(snapshot.request_id).blocks[0]
+        assert snapshot.block_ids == tuple(b.block_id for b in blocks)
+        assert all(state.block_ref_counts[b.block_id] == b.ref_cnt for b in blocks)
+    again = scheduler._build_predictive_admission_state({})
+    assert again.running[0].block_ids is state.running[0].block_ids
+
+    scheduler.kv_cache_manager.allocate_slots(first, 1)
+    grown = scheduler._build_predictive_admission_state({})
+    assert len(grown.running[0].block_ids) == len(state.running[0].block_ids) + 1
+    scheduler.running.remove(first)
+    scheduler._preempt_request(first, 0.0)
+    assert first.request_id not in scheduler._pkas_block_ids
+    scheduler.finish_requests(second.request_id, RequestStatus.FINISHED_ABORTED)
+    assert not scheduler._pkas_block_ids
+    assert scheduler._predictive_pinned_blocks() == 0
+
+
+def test_pkas_cost_acceptance_uses_real_allocation_and_records_cost():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, scheduling_policy="lpm", admission_policy="pkas",
+        pkas_max_replay_ratio=0.1,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(return_value=AdmissionDecision(
+        False, 128, 0, 101, 100, replay_allowed=True, estimated_replay_tokens=1,
+    ))
+    output = scheduler.schedule()
+    assert [r.req_id for r in output.scheduled_new_reqs] == [request.request_id]
+    assert scheduler.predictive_admission.evaluate.call_args.kwargs[
+        "replay_budget_tokens"
+    ] == 3
+    assert scheduler._pkas_step_stats["cost_accepts"] == 1
+    assert scheduler._pkas_step_stats["estimated_replay_tokens"] == 1
+    assert scheduler._pkas_step_stats["rejections"] == 0
+
+
+def test_pkas_replay_cost_requires_lru():
+    with pytest.raises(ValueError, match="replay_cost_requires_lru"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy="lpm",
+            admission_policy="pkas",
+            pkas_max_replay_ratio=0.05,
+            kv_cache_eviction_policy="peek",
+        )
+
+
+@pytest.mark.parametrize("ratio,admitted", [(0, True), (0.5, False)])
+def test_pkas_cost_gate_preserves_recovery_before_bypassing(ratio, admitted):
+    scheduler = create_scheduler(
+        max_num_seqs=1, enable_prefix_caching=True,
+        scheduling_policy="lpm", admission_policy="pkas",
+        pkas_max_replay_ratio=ratio,
+    )
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, ModelRunnerOutput(
+        req_ids=[first.request_id], req_id_to_index={first.request_id: 0},
+        sampled_token_ids=[[1]], logprobs=None, prompt_logprobs_dict={},
+        pooler_output=[],
+    ))
+    scheduler.running.remove(first)
+    scheduler._preempt_request(first, 0.0)
+    scheduler.add_request(second)
+    seen_budgets = []
+
+    def evaluate(running, candidate, **kwargs):
+        seen_budgets.append(kwargs["replay_budget_tokens"])
+        return AdmissionDecision(candidate.request_id == second.request_id, 16, 0, 1, 1)
+
+    scheduler.predictive_admission.evaluate = Mock(side_effect=evaluate)
+    output = scheduler.schedule()
+    assert bool(output.scheduled_new_reqs) is admitted
+    assert scheduler._pkas_step_stats["recovery_stops"] == int(not admitted)
+    if ratio:
+        assert seen_budgets == [int(ratio * 33)]
+        assert list(scheduler.waiting) == [first, second]
+        assert scheduler._pkas_step_stats["skipped"] == 0
+
+
+def test_pkas_batch_cost_observes_prefill_and_decode_before_output_update():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, scheduling_policy="lpm", admission_policy="pkas",
+        pkas_max_replay_ratio=0.05, pkas_batch_cost=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    model = scheduler._pkas_batch_cost
+    model.observe = Mock(wraps=model.observe)
+    output = scheduler.schedule()
+    scheduler.observe_batch_execution(output, 0.1)
+    model.observe.assert_called_once_with(32, 0, 0.1)
+    assert scheduler._pkas_step_stats["execution_ns"] == 100_000_000
+    scheduler.update_from_output(output, ModelRunnerOutput(
+        req_ids=[request.request_id], req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1]], logprobs=None, prompt_logprobs_dict={},
+        pooler_output=[],
+    ))
+    output = scheduler.schedule()
+    scheduler.observe_batch_execution(output, 0.02)
+    model.observe.assert_called_with(0, 1, 0.02)
+
+
+def test_pkas_batch_cost_blocks_extra_risk_during_recovery():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, scheduling_policy="lpm", admission_policy="pkas",
+        pkas_max_replay_ratio=0.05, pkas_batch_cost=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduler._preemption_recovery_high["recovering"] = 128
+    scheduler._pkas_batch_cost.replay_budget = Mock(return_value=(100, 0.1))
+    evaluate = scheduler.predictive_admission.evaluate
+    scheduler.predictive_admission.evaluate = Mock(wraps=evaluate)
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_args.kwargs[
+        "replay_budget_tokens"
+    ] == 0

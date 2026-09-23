@@ -646,3 +646,46 @@ def test_ir_op_priority():
 )
 def test_expand_json_human_readable_numbers(input_json, expected_json):
     assert _expand_json_human_readable_numbers(input_json) == expected_json
+
+
+def test_pkas_candidate_skip_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default = EngineArgs.from_cli_args(
+        parser.parse_args(["--policy-profile", "kvreuse"])
+    )
+    assert default.pkas_max_candidate_skips == 8
+    disabled = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--policy-profile",
+                "kvreuse",
+                "--pkas-max-candidate-skips",
+                "0",
+            ]
+        )
+    )
+    assert disabled.pkas_max_candidate_skips == 0
+
+
+def test_pkas_replay_ratio_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default = EngineArgs.from_cli_args(
+        parser.parse_args(["--policy-profile", "kvreuse"])
+    )
+    assert default.pkas_max_replay_ratio == 0
+    cost = EngineArgs.from_cli_args(parser.parse_args([
+        "--policy-profile", "kvreuse", "--pkas-max-replay-ratio", "0.05",
+    ]))
+    assert cost.pkas_max_replay_ratio == 0.05
+
+
+def test_pkas_batch_cost_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default = EngineArgs.from_cli_args(parser.parse_args([]))
+    assert not default.pkas_batch_cost
+    batch = EngineArgs.from_cli_args(parser.parse_args([
+        "--policy-profile", "kvreuse", "--pkas-max-replay-ratio", "0.05",
+        "--pkas-batch-cost",
+    ]))
+    assert batch.pkas_batch_cost
+    assert batch.pkas_max_replay_ratio == 0.05

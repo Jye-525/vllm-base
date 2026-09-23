@@ -125,6 +125,21 @@ class SchedulerConfig:
     """Waiting-request admission policy. ``none`` uses stock vLLM admission;
     ``pkas`` applies prefix-aware predictive admission after LPM ranking."""
 
+    pkas_max_candidate_skips: int = Field(default=8, ge=0)
+    """Maximum PKAS-rejected candidates to skip per scheduling step.
+    Zero stops waiting-request admission at the first rejection."""
+
+    pkas_max_replay_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Allow a predicted tail preemption when estimated replay plus a one-block
+    restart charge fits this fraction of scheduled tokens plus any recovered
+    prefix tokens on resumption.
+    Zero preserves strict predictive admission. Cost estimation requires LRU."""
+
+    pkas_batch_cost: bool = False
+    """Use measured batch latency and observed replay amplification to price
+    cost admission. Requires a positive replay ratio; missing measurements
+    fall back to strict admission. False retains the token-budget policy."""
+
     lpm_window_size: int = Field(default=128, ge=0)
     """For LPM/cLPM, the number of waiting requests to reorder per
     scheduler step. Zero means the full waiting queue."""

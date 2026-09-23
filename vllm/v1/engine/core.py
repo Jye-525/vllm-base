@@ -439,6 +439,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        execution_start = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -448,6 +449,10 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        self.scheduler.observe_batch_execution(
+            scheduler_output, time.perf_counter() - execution_start
+        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
