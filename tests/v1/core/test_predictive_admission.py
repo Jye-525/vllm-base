@@ -67,6 +67,56 @@ def test_causal_estimator_uses_completed_lengths_and_survival():
     assert estimator.predict() == 20
 
 
+def test_causal_estimator_quantile_history_and_reset():
+    median = CausalOutputLengthEstimator(quantile=0.5)
+    for length in range(1, 101):
+        median.observe(length)
+    assert median.predict() == 50
+    assert median.target(50) == 75
+
+    recent = CausalOutputLengthEstimator(quantile=0.9, history=16)
+    assert recent.min_samples == 8
+    for _ in range(7):
+        recent.observe(3000)
+    assert recent.predict() == 512
+    recent.observe(3000)
+    assert recent.predict() == 3000
+    for _ in range(16):
+        recent.observe(64)
+    assert recent.count == 16
+    assert recent.predict() == 64
+
+    recent.reset()
+    assert recent.count == 0
+    assert recent.sorted_lengths == []
+    assert recent.predict() == 512
+
+
+def test_controller_passes_estimator_settings_and_resets():
+    controller = PredictiveAdmissionController(
+        block_size=4,
+        capacity_blocks=8,
+        token_budget=8,
+        long_prefill_token_threshold=0,
+        max_model_len=128,
+        output_quantile=0.5,
+        output_history=32,
+    )
+    assert controller.estimator.quantile == 0.5
+    assert controller.estimator.max_history == 32
+    train(controller, 7)
+    assert controller.estimator.predict() == 7
+    controller.reset_history()
+    assert controller.estimator.count == 0
+
+
+@pytest.mark.parametrize("kwargs", [{"quantile": 0.0}, {"quantile": 1.5},
+                                    {"history": 4}])
+def test_causal_estimator_rejects_invalid_settings(kwargs):
+    with pytest.raises(ValueError):
+        CausalOutputLengthEstimator(**kwargs)
+
+
 def test_causal_admission_uses_cold_forecast():
     controller = PredictiveAdmissionController(
         block_size=4, capacity_blocks=2, token_budget=8,

@@ -4859,3 +4859,105 @@ def test_pkas_batch_cost_blocks_extra_risk_during_recovery():
     assert scheduler.predictive_admission.evaluate.call_args.kwargs[
         "replay_budget_tokens"
     ] == 0
+
+
+def test_pkas_rejection_cache_reuses_rejection_until_expiry():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_max_candidate_skips=0,
+        pkas_reject_cache_steps=2,
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(False, 1, 0, 10, 9)
+    )
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert not output.scheduled_new_reqs
+        assert scheduler._pkas_step_stats["cached_rejections"] == 1
+        assert scheduler._pkas_step_stats["rejections"] == 1
+        assert scheduler._pkas_step_stats["evaluations"] == 0
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 2
+    assert list(scheduler.waiting) == [request]
+
+
+def test_pkas_rejection_cache_disabled_with_zero_steps():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_max_candidate_skips=0,
+        pkas_reject_cache_steps=0,
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(False, 1, 0, 10, 9)
+    )
+    for _ in range(3):
+        scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 3
+    assert scheduler._pkas_reject_cache == {}
+
+
+def test_pkas_rejection_cache_invalidated_by_finished_request():
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_max_candidate_skips=0,
+    )
+    running, waiting = create_requests(num_requests=2)
+    for request in (running, waiting):
+        scheduler.add_request(request)
+    scheduler.predictive_admission.evaluate = Mock(
+        side_effect=lambda running_reqs, candidate, **kwargs: AdmissionDecision(
+            candidate.request_id == running.request_id, 1, 0, 2, 99
+        )
+    )
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [running.request_id]
+    assert scheduler.predictive_admission.evaluate.call_count == 2
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 2
+    assert scheduler._pkas_step_stats["cached_rejections"] == 1
+
+    scheduler.finish_requests(running.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.predictive_admission.evaluate.call_count == 3
+    assert scheduler._pkas_step_stats["cached_rejections"] == 0
+
+
+def test_pkas_prefix_reset_clears_estimator_and_rejection_cache():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_output_quantile=0.5,
+        pkas_output_history=64,
+    )
+    controller = scheduler.predictive_admission
+    assert controller.estimator.quantile == 0.5
+    assert controller.estimator.max_history == 64
+    for _ in range(32):
+        controller.observe_completion(3072)
+    assert controller.estimator.predict() == 3072
+    scheduler._pkas_reject_cache["stale"] = (scheduler._pkas_epoch, 10**9)
+    epoch = scheduler._pkas_epoch
+
+    assert scheduler.reset_prefix_cache()
+    assert controller.estimator.count == 32
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert controller.estimator.count == 0
+    assert controller.estimator.predict() == 512
+    assert scheduler._pkas_reject_cache == {}
+    assert scheduler._pkas_epoch > epoch

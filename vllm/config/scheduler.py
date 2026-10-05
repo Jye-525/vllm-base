@@ -140,6 +140,19 @@ class SchedulerConfig:
     cost admission. Requires a positive replay ratio; missing measurements
     fall back to strict admission. False retains the token-budget policy."""
 
+    pkas_output_quantile: float = Field(default=0.9, gt=0.0, le=1.0)
+    """Quantile of recent completed output lengths that PKAS reserves KV for.
+    Lower values admit more aggressively and rely on preemption/replay when a
+    request outgrows its forecast."""
+
+    pkas_output_history: int = Field(default=256, ge=8)
+    """Number of recent completed outputs used by the PKAS length forecast."""
+
+    pkas_reject_cache_steps: int = Field(default=16, ge=0)
+    """Reuse a PKAS rejection for up to this many scheduling steps unless a
+    request is admitted, finishes, or is preempted. Zero re-simulates every
+    rejected candidate on every step."""
+
     lpm_window_size: int = Field(default=128, ge=0)
     """For LPM/cLPM, the number of waiting requests to reorder per
     scheduler step. Zero means the full waiting queue."""

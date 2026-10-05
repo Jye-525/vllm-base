@@ -601,9 +601,12 @@ class EngineArgs:
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
     policy_profile: PolicyProfile | None = None
     admission_policy: AdmissionPolicy | None = None
-    pkas_max_candidate_skips: int = SchedulerConfig.pkas_max_candidate_skips
+    pkas_max_candidate_skips: int | None = None
     pkas_batch_cost: bool = SchedulerConfig.pkas_batch_cost
     pkas_max_replay_ratio: float = SchedulerConfig.pkas_max_replay_ratio
+    pkas_output_quantile: float = SchedulerConfig.pkas_output_quantile
+    pkas_output_history: int = SchedulerConfig.pkas_output_history
+    pkas_reject_cache_steps: int = SchedulerConfig.pkas_reject_cache_steps
     lpm_window_size: int | None = None
     lpm_fallback_threshold: int | None = None
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
@@ -792,6 +795,7 @@ class EngineArgs:
         defaults = {
             "scheduling_policy": SchedulerConfig.policy,
             "admission_policy": SchedulerConfig.admission_policy,
+            "pkas_max_candidate_skips": SchedulerConfig.pkas_max_candidate_skips,
             "lpm_window_size": SchedulerConfig.lpm_window_size,
             "lpm_fallback_threshold": SchedulerConfig.lpm_fallback_threshold,
             "clpm_group_major": SchedulerConfig.clpm_group_major,
@@ -805,6 +809,9 @@ class EngineArgs:
             defaults.update(
                 scheduling_policy="lpm",
                 admission_policy="pkas",
+                # Skipped candidates were rejected as well in controlled runs;
+                # scanning past the LPM head only added scheduler latency.
+                pkas_max_candidate_skips=0,
                 kv_cache_eviction_policy="lru",
             )
         elif self.policy_profile == "peek":
@@ -1470,7 +1477,7 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--pkas-max-candidate-skips",
-            **scheduler_kwargs["pkas_max_candidate_skips"],
+            **{**scheduler_kwargs["pkas_max_candidate_skips"], "default": None},
         )
         scheduler_group.add_argument(
             "--pkas-batch-cost", **scheduler_kwargs["pkas_batch_cost"],
@@ -1478,6 +1485,18 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--pkas-max-replay-ratio",
             **scheduler_kwargs["pkas_max_replay_ratio"],
+        )
+        scheduler_group.add_argument(
+            "--pkas-output-quantile",
+            **scheduler_kwargs["pkas_output_quantile"],
+        )
+        scheduler_group.add_argument(
+            "--pkas-output-history",
+            **scheduler_kwargs["pkas_output_history"],
+        )
+        scheduler_group.add_argument(
+            "--pkas-reject-cache-steps",
+            **scheduler_kwargs["pkas_reject_cache_steps"],
         )
         scheduler_group.add_argument(
             "--lpm-window-size",
@@ -2185,6 +2204,9 @@ class EngineArgs:
             pkas_max_candidate_skips=self.pkas_max_candidate_skips,
             pkas_max_replay_ratio=self.pkas_max_replay_ratio,
             pkas_batch_cost=self.pkas_batch_cost,
+            pkas_output_quantile=self.pkas_output_quantile,
+            pkas_output_history=self.pkas_output_history,
+            pkas_reject_cache_steps=self.pkas_reject_cache_steps,
             lpm_window_size=self.lpm_window_size,
             lpm_fallback_threshold=self.lpm_fallback_threshold,
             lpm_check_threshold=self.lpm_check_threshold,

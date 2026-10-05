@@ -345,6 +345,12 @@ class Scheduler(SchedulerInterface):
         )
         self._pkas_recovery_started: dict[str, float] = {}
         self._pkas_last_gate_target: dict[str, int] = {}
+        # Rejections are reused until an admission, completion, or preemption
+        # changes the epoch, or until the step-based expiry lets waiting time
+        # (running requests nearing completion) change the outcome.
+        self._pkas_step = 0
+        self._pkas_epoch = 0
+        self._pkas_reject_cache: dict[str, tuple[int, int]] = {}
         if self.scheduler_config.admission_policy == "pkas":
             unsupported = []
             if self.policy != SchedulingPolicy.LPM:
@@ -392,6 +398,8 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold=(
                     self.scheduler_config.long_prefill_token_threshold
                 ),
+                output_quantile=self.scheduler_config.pkas_output_quantile,
+                output_history=self.scheduler_config.pkas_output_history,
             )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -785,6 +793,16 @@ class Scheduler(SchedulerInterface):
         if controller is None:
             return True
         assert state is not None
+        assert self._pkas_step_stats is not None
+
+        cached = self._pkas_reject_cache.get(request.request_id)
+        if cached is not None:
+            epoch, expires = cached
+            if epoch == self._pkas_epoch and self._pkas_step <= expires:
+                self._pkas_step_stats["cached_rejections"] += 1
+                self._pkas_step_stats["rejections"] += 1
+                return False
+            del self._pkas_reject_cache[request.request_id]
 
         hit_blocks = computed_blocks.blocks[0]
         hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
@@ -841,6 +859,12 @@ class Scheduler(SchedulerInterface):
         stats["simulations"] += int(not decision.peak_is_upper_bound)
         allowed = decision.feasible or decision.replay_allowed
         stats["rejections"] += int(not allowed)
+        cache_steps = self.scheduler_config.pkas_reject_cache_steps
+        if not allowed and cache_steps > 0:
+            self._pkas_reject_cache[request.request_id] = (
+                self._pkas_epoch,
+                self._pkas_step + cache_steps,
+            )
         stats["cost_accepts"] += int(decision.replay_allowed)
         if decision.replay_allowed:
             stats["estimated_replay_tokens"] += decision.estimated_replay_tokens
@@ -887,10 +911,12 @@ class Scheduler(SchedulerInterface):
                 self._log_schedule_batch(args[:-1] + (-1,), -1)
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
+        self._pkas_step += 1
         self._pkas_step_stats = (
             dict.fromkeys(
                 (
                     "evaluations",
+                    "cached_rejections",
                     "bound_accepts",
                     "cost_accepts",
                     "estimated_replay_tokens",
@@ -1427,6 +1453,8 @@ class Scheduler(SchedulerInterface):
                 # policies have already reordered the bounded queue prefix.
                 request = request_queue.pop_request()
                 self._pkas_bypass_counts.pop(request.request_id, None)
+                self._pkas_reject_cache.pop(request.request_id, None)
+                self._pkas_epoch += 1
                 if pkas_skipped:
                     self._pkas_step_stats["admitted_after_skip"] += 1
                     pkas_bypassed_ids.update(req.request_id for req in pkas_skipped)
@@ -1828,6 +1856,8 @@ class Scheduler(SchedulerInterface):
         else:
             self._preemption_recovery_high.pop(request.request_id, None)
         self._pkas_block_ids.pop(request.request_id, None)
+        self._pkas_reject_cache.pop(request.request_id, None)
+        self._pkas_epoch += 1
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -2778,6 +2808,8 @@ class Scheduler(SchedulerInterface):
         self._pkas_bypass_counts.pop(request.request_id, None)
         self._pkas_recovery_started.pop(request.request_id, None)
         self._pkas_last_gate_target.pop(request.request_id, None)
+        self._pkas_reject_cache.pop(request.request_id, None)
+        self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,
             RequestStatus.FINISHED_LENGTH_CAPPED,
@@ -2871,6 +2903,14 @@ class Scheduler(SchedulerInterface):
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_successful:
             self._republish_pending_demand()
+            if reset_running_requests and self.predictive_admission is not None:
+                # Benchmarks reset between warmup and measurement; completed
+                # warmup lengths must not shape the measured forecast. Batch
+                # latency curves stay valid and are kept.
+                self.predictive_admission.reset_history()
+                self._pkas_reject_cache.clear()
+                self._pkas_epoch += 1
+                logger.info("pkas_estimator_reset: reason=prefix_cache_reset")
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
