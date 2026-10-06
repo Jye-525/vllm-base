@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -51,6 +52,7 @@ from vllm.v1.core.sched.predictive_admission import (
     RequestSnapshot,
 )
 from vllm.v1.core.sched.preemption_diagnostics import PreemptionDiagnostics
+from vllm.v1.core.sched.survival_diagnostics import SurvivalRecorder
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
@@ -496,6 +498,22 @@ class Scheduler(SchedulerInterface):
                     prefill_context_parallel_size=self.pcp_world_size,
                 ),
                 unsupported,
+            )
+        self.survival_diagnostics: SurvivalRecorder | None = None
+        if self.preemption_diagnostics is not None and not unsupported:
+            # A subdirectory keeps survival records out of tools that read
+            # every preemption-diagnostics JSONL file in the parent directory.
+            self.survival_diagnostics = SurvivalRecorder(
+                os.path.join(envs.VLLM_PREEMPTION_DIAGNOSTICS_DIR, "survival"),
+                self.kv_cache_manager,
+                dict(
+                    policy=self.policy.value,
+                    eviction_policy=self._eviction_policy,
+                    block_size=block_size,
+                    num_blocks=kv_cache_config.num_blocks,
+                    prefix_caching=self.cache_config.enable_prefix_caching,
+                    predictive_admission=self.predictive_admission is not None,
+                ),
             )
 
     def _mamba_block_aligned_split(
@@ -944,6 +962,9 @@ class Scheduler(SchedulerInterface):
         diagnostics = self.preemption_diagnostics
         if diagnostics is not None:
             diagnostics.begin_step()
+        survival = self.survival_diagnostics
+        if survival is not None:
+            survival.begin_step()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1567,6 +1588,8 @@ class Scheduler(SchedulerInterface):
                 )
 
                 self.running.append(request)
+                if survival is not None:
+                    survival.admitted(request, num_new_local_computed_tokens)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1781,6 +1804,8 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         if diagnostics is not None:
             diagnostics.end_step()
+        if survival is not None:
+            survival.end_step()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1809,10 +1834,12 @@ class Scheduler(SchedulerInterface):
         if pending is None:
             return
         args, intervals = pending
+        work = self._execution_work(intervals)
         logger.info(
             "batch_execution: scheduled=%d prefill_tokens=%d decode_tokens=%d "
-            "execution_ns=%d",
-            args[1], args[10], args[11], int(seconds * 1e9),
+            "execution_ns=%d exec_prefill_tokens=%d exec_decode_tokens=%d "
+            "prefill_attention=%d decode_context=%d",
+            args[1], args[10], args[11], int(seconds * 1e9), *work,
         )
         stats = args[-2]
         if stats is not None:
@@ -1830,6 +1857,30 @@ class Scheduler(SchedulerInterface):
                 prefill += n
                 decode += end - start - n
             self._pkas_batch_cost.observe(prefill, decode, seconds)
+
+    def _execution_work(
+        self, intervals: dict[str, tuple[int, int, int]]
+    ) -> tuple[int, int, int, int]:
+        """Work of one batch for the step cost model.
+
+        Tokens below a request's prompt-or-output high mark execute as
+        prefill (this includes replayed output after preemption); the rest are
+        decode. A token at position p attends to p + 1 keys, so the attention
+        terms are the sums of p + 1 over the prefill and decode tokens.
+        """
+        prefill = decode = prefill_attention = decode_context = 0
+        for rid, (start, end, _) in intervals.items():
+            request = self.requests.get(rid)
+            if request is None:
+                continue
+            split = start + min(end - start, max(
+                0, max(request.num_prompt_tokens, request.num_tokens - 1) - start
+            ))
+            prefill += split - start
+            decode += end - split
+            prefill_attention += (split * (split + 1) - start * (start + 1)) // 2
+            decode_context += (end * (end + 1) - split * (split + 1)) // 2
+        return prefill, decode, prefill_attention, decode_context
 
     def _complete_batch_log(
         self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
@@ -1900,7 +1951,15 @@ class Scheduler(SchedulerInterface):
         self._pkas_block_ids.pop(request.request_id, None)
         self._pkas_reject_cache.pop(request.request_id, None)
         self._pkas_epoch += 1
+        survival = self.survival_diagnostics
+        victim = (
+            survival.capture_victim(request)
+            if survival is not None and reason == "memory_pressure"
+            else None
+        )
         self.kv_cache_manager.free(request)
+        if survival is not None:
+            survival.preempted(request, victim)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -2774,6 +2833,8 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.preemption_diagnostics is not None:
                 self.preemption_diagnostics.add_request(request)
+            if self.survival_diagnostics is not None:
+                self.survival_diagnostics.request_waiting(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -2861,6 +2922,8 @@ class Scheduler(SchedulerInterface):
         self._preemption_recovery_high.pop(request.request_id, None)
         if self.preemption_diagnostics is not None:
             self.preemption_diagnostics.finish(request)
+        if self.survival_diagnostics is not None:
+            self.survival_diagnostics.finished(request)
 
         request_logger = RequestEventLogger.get()
         if request_logger is not None:
@@ -2966,6 +3029,8 @@ class Scheduler(SchedulerInterface):
 
         if self.preemption_diagnostics is not None:
             self.preemption_diagnostics.cache_reset(reset_successful)
+        if self.survival_diagnostics is not None:
+            self.survival_diagnostics.cache_reset(reset_successful)
         return reset_successful
 
     def reset_connector_cache(self) -> bool:
@@ -3053,6 +3118,8 @@ class Scheduler(SchedulerInterface):
         self._pending_batch_logs.clear()
         if self.preemption_diagnostics is not None:
             self.preemption_diagnostics.shutdown()
+        if self.survival_diagnostics is not None:
+            self.survival_diagnostics.shutdown()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

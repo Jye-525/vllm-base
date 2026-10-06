@@ -186,6 +186,11 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Optional observational hook (survival diagnostics). It must provide
+        # on_allocate(num_blocks) and on_evict(raw_block_hash) and must not
+        # change allocation or eviction decisions.
+        self.observer: Any | None = None
+
         # Peek eviction uses waiting-queue-aware victim selection; LRU uses
         # stock popleft_n. The scheduler configures this at startup.
         self._eviction_policy: str = "lru"
@@ -607,6 +612,8 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
+        if self.observer is not None:
+            self.observer.on_allocate(num_blocks)
 
         if self.enable_caching and self._eviction_policy == "peek":
             ret = self._select_victims_peek(num_blocks)
@@ -733,6 +740,14 @@ class BlockPool:
             # block not found in cached_block_hash_to_block,
             # eviction is not needed
             return False
+
+        # Blocks are not de-duplicated: report a hash only when its last
+        # cached copy goes, i.e. when the content stops being reusable.
+        if (
+            self.observer is not None
+            and self.cached_block_hash_to_block.get_one_block(block_hash) is None
+        ):
+            self.observer.on_evict(get_block_hash(block_hash))
 
         block.reset_hash()
 
