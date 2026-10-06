@@ -1285,6 +1285,12 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                        if (request_logger := RequestEventLogger.get()) is not None:
+                            request_logger.record_prefill(
+                                request.request_id,
+                                num_computed_tokens,
+                                num_external_computed_tokens,
+                            )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.

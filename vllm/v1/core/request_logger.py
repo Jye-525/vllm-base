@@ -31,6 +31,10 @@ class RequestEventLogger:
     def __init__(self, path: str):
         self._file = open(path, "w", buffering=1)
         self._write_lock = threading.Lock()
+        # request_id -> (num_cached_tokens, num_external_computed_tokens),
+        # captured at the request's first scheduled prefill. Upstream vLLM
+        # no longer keeps these counts on Request (see PrefillStats).
+        self._prefill: dict[str, tuple[int, int]] = {}
         atexit.register(self._close)
 
     @classmethod
@@ -46,8 +50,26 @@ class RequestEventLogger:
                 cls._instance = cls(path)
         return cls._instance
 
+    def record_prefill(
+        self,
+        request_id: str,
+        num_cached_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """Remember prefix-cache hit counts from the first scheduled prefill."""
+        with self._write_lock:
+            self._prefill[request_id] = (
+                num_cached_tokens,
+                num_external_computed_tokens,
+            )
+
     def log_request(self, request: "Request") -> None:
         finish_reason = request.get_finished_reason()
+        with self._write_lock:
+            # Defaults match the old Request fields for never-scheduled requests.
+            num_cached_tokens, num_external_computed_tokens = self._prefill.pop(
+                request.request_id, (-1, 0)
+            )
         record = {
             "request_id": request.request_id,
             "client_index": request.client_index,
@@ -61,9 +83,8 @@ class RequestEventLogger:
             "status": str(request.status),
             "num_prompt_tokens": request.num_prompt_tokens,
             "num_output_tokens": request.num_output_tokens,
-            "num_cached_tokens": request.num_cached_tokens,
-            "num_external_computed_tokens":
-                request.num_external_computed_tokens,
+            "num_cached_tokens": num_cached_tokens,
+            "num_external_computed_tokens": num_external_computed_tokens,
             "num_preemptions": request.num_preemptions,
             "prompt_token_ids":
                 list(request.prompt_token_ids)
