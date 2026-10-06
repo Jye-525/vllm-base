@@ -712,3 +712,21 @@ def test_pkas_output_estimator_and_reject_cache_cli():
     assert tuned.pkas_output_history == 64
     assert tuned.pkas_reject_cache_steps == 0
     assert tuned.pkas_max_candidate_skips == 8
+
+
+def test_full_isl_reservation_default_follows_admission_policy():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    def resolve(*cli_args):
+        return EngineArgs.from_cli_args(
+            parser.parse_args(list(cli_args))
+        ).scheduler_reserve_full_isl
+
+    assert resolve() is True
+    assert resolve("--policy-profile", "lpm") is True
+    assert resolve("--policy-profile", "kvreuse") is False
+    assert resolve("--admission-policy", "pkas") is False
+    assert resolve(
+        "--policy-profile", "kvreuse", "--scheduler-reserve-full-isl"
+    ) is True
+    assert resolve("--no-scheduler-reserve-full-isl") is False

@@ -4572,6 +4572,53 @@ def test_pkas_skip_rejection_then_admit_and_clean_up():
     assert len(scheduler.pending_prefix_index) == 0
 
 
+def test_full_isl_reservation_defaults_off_under_pkas():
+    assert create_scheduler().scheduler_reserve_full_isl
+    pkas = create_scheduler(enable_prefix_caching=True, admission_policy="pkas")
+    assert not pkas.scheduler_reserve_full_isl
+
+
+def test_pkas_full_isl_check_runs_before_gate_and_skips():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        lpm_window_size=2,
+        scheduler_reserve_full_isl=True,
+    )
+    first, second = create_requests(num_requests=2)
+    for request in (first, second):
+        scheduler.add_request(request)
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(
+        side_effect=[(False, 10, 1), (True, 2, 9)]
+    )
+    scheduler.predictive_admission.evaluate = Mock(
+        return_value=AdmissionDecision(True, 1, 0, 2, 9, peak_is_upper_bound=True)
+    )
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [second.request_id]
+    assert list(scheduler.waiting) == [first]
+    # The ISL-rejected head never reached the PKAS simulation.
+    assert scheduler.predictive_admission.evaluate.call_count == 1
+    stats = scheduler._pkas_step_stats
+    assert stats["isl_rejections"] == 1
+    assert stats["evaluations"] == 1
+    assert stats["skipped"] == stats["admitted_after_skip"] == 1
+
+
+def test_full_isl_rejection_without_pkas_stops_admission():
+    scheduler = create_scheduler(max_num_seqs=2)
+    requests = create_requests(num_requests=2)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(return_value=(False, 10, 1))
+    output = scheduler.schedule()
+    assert not output.scheduled_new_reqs
+    assert scheduler.kv_cache_manager.full_sequence_fits.call_count == 1
+    assert list(scheduler.waiting) == requests
+
+
 @pytest.mark.parametrize(
     "skips,window,fallback,expected_calls",
     [

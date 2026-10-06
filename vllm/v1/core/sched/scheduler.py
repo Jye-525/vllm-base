@@ -934,6 +934,7 @@ class Scheduler(SchedulerInterface):
                     "snapshot_ns",
                     "evaluate_ns",
                     "blocked_budget",
+                    "isl_rejections",
                 ),
                 0,
             )
@@ -1357,7 +1358,50 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
-                if not self._predictive_admission_allows(
+                # Determine if we need to allocate cross-attention blocks.
+                num_encoder_tokens = 0
+                if (
+                    self.is_encoder_decoder
+                    and request.has_encoder_inputs
+                    and encoder_inputs_to_schedule
+                ):
+                    num_encoder_tokens = sum(
+                        request.get_num_encoder_embeds(i)
+                        for i in encoder_inputs_to_schedule
+                    )
+
+                # Full-ISL admission check (upstream scheduler_reserve_full_isl;
+                # off by default under PKAS). It is cheap and a necessary
+                # condition, so run it before the PKAS gate: infeasible requests
+                # never reach the PKAS simulation or count as PKAS accepts.
+                isl_rejected = False
+                if self.scheduler_reserve_full_isl:
+                    fits, required_blocks, free_blocks = (
+                        self.kv_cache_manager.full_sequence_fits(
+                            request,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            num_encoder_tokens=num_encoder_tokens,
+                        )
+                    )
+                    if not fits:
+                        if diagnostics is not None:
+                            diagnostics.admission_failed(
+                                request_id, required_blocks, free_blocks
+                            )
+                        if self.predictive_admission is None:
+                            # Upstream behaviour: stop admitting this step.
+                            if request.has_encoder_inputs:
+                                self.encoder_cache_manager.free(request)
+                            break
+                        assert self._pkas_step_stats is not None
+                        self._pkas_step_stats["isl_rejections"] += 1
+                        isl_rejected = True
+
+                # Under PKAS, a full-ISL rejection takes the same path as a
+                # PKAS rejection (recovery stop, fairness cap, candidate skip).
+                if isl_rejected or not self._predictive_admission_allows(
                     predictive_admission_state,
                     request,
                     new_computed_blocks,
@@ -1365,6 +1409,10 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     num_scheduled_tokens,
                 ):
+                    # Release encoder-cache references taken while checking
+                    # this request, as the allocation-failure path does.
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
                     stats = self._pkas_step_stats
                     assert stats is not None
                     if (
@@ -1399,18 +1447,6 @@ class Scheduler(SchedulerInterface):
                     0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
                 )
 
-                # Determine if we need to allocate cross-attention blocks.
-                num_encoder_tokens = 0
-                if (
-                    self.is_encoder_decoder
-                    and request.has_encoder_inputs
-                    and encoder_inputs_to_schedule
-                ):
-                    num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
-                        for i in encoder_inputs_to_schedule
-                    )
-
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1420,7 +1456,7 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # The full-ISL check already ran above, before PKAS.
                     failure_observer=(
                         diagnostics.admission_failed if diagnostics else None
                     ),

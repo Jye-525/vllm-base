@@ -81,6 +81,7 @@ def create_scheduler(
     ),
     peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau,
     peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap,
+    scheduler_reserve_full_isl: bool | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -104,6 +105,12 @@ def create_scheduler(
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
+    if scheduler_reserve_full_isl is None:
+        # Mirror EngineArgs: full-ISL reservation is opt-in under PKAS.
+        scheduler_reserve_full_isl = (
+            admission_policy != "pkas"
+            and SchedulerConfig.scheduler_reserve_full_isl
+        )
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -135,6 +142,7 @@ def create_scheduler(
         peek_eviction_recency_weight=peek_eviction_recency_weight,
         peek_eviction_decay_tau=peek_eviction_decay_tau,
         peek_eviction_scan_cap=peek_eviction_scan_cap,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

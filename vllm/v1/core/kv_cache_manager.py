@@ -274,6 +274,50 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
+    def full_sequence_fits(
+        self,
+        request: Request,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_external_computed_tokens: int = 0,
+        num_encoder_tokens: int = 0,
+    ) -> tuple[bool, int, int]:
+        """Check whether the request's full sequence fits in free KV blocks.
+
+        This is the full-ISL admission check used by `allocate_slots` when
+        `full_sequence_must_fit` is set. It has no side effects, so the
+        scheduler can run it before other admission gates.
+
+        Returns:
+            (fits, num_blocks_required, num_free_blocks).
+        """
+        if new_computed_blocks is not None:
+            new_computed_block_list = new_computed_blocks.blocks
+        else:
+            new_computed_block_list = self.empty_kv_cache_blocks.blocks
+        total_computed_tokens = min(
+            request.num_computed_tokens
+            + num_new_computed_tokens
+            + num_external_computed_tokens,
+            self.max_model_len,
+        )
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+        )
+        num_free_blocks = self.block_pool.get_num_free_blocks()
+        return (
+            num_blocks_to_allocate <= num_free_blocks,
+            num_blocks_to_allocate,
+            num_free_blocks,
+        )
+
     def allocate_slots(
         self,
         request: Request,
@@ -389,18 +433,16 @@ class KVCacheManager:
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
-
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
+            fits, required, available = self.full_sequence_fits(
+                request,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_external_computed_tokens=num_external_computed_tokens,
                 num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            if not fits:
+                if failure_observer is not None:
+                    failure_observer(request.request_id, required, available)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens

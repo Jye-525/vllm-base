@@ -622,7 +622,8 @@ class EngineArgs:
     peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau
     peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap
 
-    scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
+    # None = resolved in _resolve_policy_profile (off under PKAS admission).
+    scheduler_reserve_full_isl: bool | None = None
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -831,6 +832,16 @@ class EngineArgs:
             if getattr(self, name) is None:
                 setattr(self, name, default)
 
+        if self.scheduler_reserve_full_isl is None:
+            # PKAS already gates admission on predicted KV usage, including
+            # the rest of the prompt and decode growth. Upstream's full-ISL
+            # check would veto PKAS admissions that fit only once running
+            # requests finish, so it is opt-in under PKAS.
+            self.scheduler_reserve_full_isl = (
+                self.admission_policy != "pkas"
+                and SchedulerConfig.scheduler_reserve_full_isl
+            )
+
         if self.policy_profile in ("lpm", "peek", "kvreuse"):
             if self.enable_prefix_caching is False:
                 raise ValueError(
@@ -845,7 +856,7 @@ class EngineArgs:
                 "Resolved policy profile %s: scheduling=%s, admission=%s, "
                 "lpm_window=%d, "
                 "lpm_fallback=%d, group_major=%s, dynamic_lane=%s, "
-                "eviction=%s, peek_mode=%s",
+                "eviction=%s, peek_mode=%s, reserve_full_isl=%s",
                 self.policy_profile,
                 self.scheduling_policy,
                 self.admission_policy,
@@ -855,6 +866,7 @@ class EngineArgs:
                 self.clpm_dynamic_lane,
                 self.kv_cache_eviction_policy,
                 self.peek_eviction_mode,
+                self.scheduler_reserve_full_isl,
             )
 
     @staticmethod
@@ -1568,7 +1580,7 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--scheduler-reserve-full-isl",
-            **scheduler_kwargs["scheduler_reserve_full_isl"],
+            **{**scheduler_kwargs["scheduler_reserve_full_isl"], "default": None},
         )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
