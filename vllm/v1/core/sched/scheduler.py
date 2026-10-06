@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -245,15 +244,16 @@ class Scheduler(SchedulerInterface):
 
         # Demand-aware eviction: track which block hashes are needed by
         # waiting requests so that the block pool can prefer evicting
-        # blocks that no future request will use. Gated by
-        # VLLM_DEMAND_AWARE_EVICTION=1 (default) and requires prefix caching.
+        # blocks that no future request will use.
+        import os
         demand_aware_enabled = (
             self.cache_config.enable_prefix_caching
             and os.environ.get("VLLM_DEMAND_AWARE_EVICTION", "1") != "0"
         )
         if demand_aware_enabled:
             self.demand_tracker: DemandTracker | None = DemandTracker()
-            self.kv_cache_manager.block_pool.demand_tracker = self.demand_tracker
+            self.kv_cache_manager.block_pool.demand_tracker = (
+                self.demand_tracker)
         else:
             self.demand_tracker = None
 
@@ -776,9 +776,13 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                # Request was already popped from self.waiting
+                # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
-                if self.demand_tracker is not None and request.block_hashes:
-                    self.demand_tracker.remove_request(request.block_hashes)
+                if (self.demand_tracker is not None
+                        and request.block_hashes):
+                    self.demand_tracker.remove_request(
+                        request.block_hashes)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -966,7 +970,8 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
-        if self.demand_tracker is not None and request.block_hashes:
+        if (self.demand_tracker is not None
+                and request.block_hashes):
             self.demand_tracker.add_request(request.block_hashes)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
@@ -1636,8 +1641,6 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
-        if self.demand_tracker is not None and request.block_hashes:
-            self.demand_tracker.add_request(request.block_hashes)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
@@ -1796,6 +1799,8 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
+            if self.demand_tracker is not None and request.block_hashes:
+                self.demand_tracker.add_request(request.block_hashes)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1846,10 +1851,12 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            # Update demand tracker for requests leaving the waiting queue
             if self.demand_tracker is not None:
                 for req in waiting_requests_to_remove:
                     if req.block_hashes:
-                        self.demand_tracker.remove_request(req.block_hashes)
+                        self.demand_tracker.remove_request(
+                            req.block_hashes)
 
         # Second pass: set status and free requests
         for request in valid_requests:

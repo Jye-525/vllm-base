@@ -19,7 +19,6 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.block_logger import BlockEventLogger
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -34,8 +33,14 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.core.block_logger import BlockEventLogger
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
+
+
+def _get_block_logger():
+    """Lazy accessor; returns None when VLLM_BLOCK_LOG is unset."""
+    return BlockEventLogger.get()
 
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
@@ -682,22 +687,22 @@ def get_request_block_hasher(
 
             new_block_hashes.append(block_hash)
 
-            # Experiment 1 instrumentation: log block creation when
-            # VLLM_BLOCK_LOG is set.
-            blog = BlockEventLogger.get()
-            if blog is not None:
-                phase = (
+            # -- Experiment 1 instrumentation --
+            if _blog := _get_block_logger():
+                # Phase: prefill if the block starts before the prompt boundary,
+                # decode if it starts at or beyond it.
+                _phase = (
                     "prefill"
                     if start_token_idx < request.num_prompt_tokens
                     else "decode"
                 )
-                blog.log_block(
+                _blog.log_block(
                     block_hash=block_hash,
                     parent_hash=prev_block_hash_value,
                     request_id=request.request_id,
                     block_index=start_token_idx // block_size,
                     num_tokens=block_size,
-                    phase=phase,
+                    phase=_phase,
                 )
 
             start_token_idx += block_size
