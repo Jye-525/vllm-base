@@ -6,8 +6,9 @@ The tier logger is gated on env var VLLM_TIER_LOG; when unset, every hook
 becomes a no-op (single isinstance check), so this manager is safe to use as
 the default.
 
-It also maintains the EXP 4 orphan counter state (_children / _orphaned),
-which orphan_probe.OrphanCounter samples when VLLM_ORPHAN_LOG is set.
+When VLLM_ORPHAN_LOG is set, it also maintains the EXP 4 orphan counter
+state (_children / _orphaned) that orphan_probe.OrphanCounter samples; when
+unset, that bookkeeping is skipped entirely.
 """
 
 from collections import defaultdict
@@ -29,13 +30,14 @@ class InstrumentedCPUOffloadingManager(CPUOffloadingManager):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # --- EXP 4: orphan counter state ---
+        # --- EXP 4: orphan counter state (only used when tracking) ---
         # parent key -> set of child keys currently resident in CPU
         self._children: dict[OffloadKey, set[OffloadKey]] = defaultdict(set)
         # CPU blocks whose parent has been evicted from CPU (orphaned)
         self._orphaned: set[OffloadKey] = set()
         # Background CSV writer, started only if VLLM_ORPHAN_LOG is set.
         self._orphan_counter = maybe_start_orphan_counter(self)
+        self._track_orphans = self._orphan_counter is not None
         # --- END EXP 4 ---
 
     def num_cpu_blocks_in_use(self) -> int:
@@ -60,28 +62,29 @@ class InstrumentedCPUOffloadingManager(CPUOffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        keys_list = list(keys)
+        if self._track_orphans:
+            keys = list(keys)
+            # --- EXP 4: register consecutive parent→child links.
+            # Blocks arrive in prefix-chain order, so keys[i-1] is the parent
+            # of keys[i].  This covers within-batch links; the parent of
+            # keys[0] (a cross-batch link) is tracked only when that parent
+            # is itself new in this batch.
+            for i in range(1, len(keys)):
+                self._children[keys[i - 1]].add(keys[i])
+            # --- END EXP 4 ---
 
-        # --- EXP 4: register consecutive parent→child links.
-        # Blocks arrive in prefix-chain order, so keys_list[i-1] is the
-        # parent of keys_list[i].  This covers within-batch links; the parent
-        # of keys_list[0] (a cross-batch link) is tracked only when that
-        # parent is itself new in this batch.
-        for i in range(1, len(keys_list)):
-            self._children[keys_list[i - 1]].add(keys_list[i])
-        # --- END EXP 4 ---
-
-        result = super().prepare_store(keys_list, req_context)
+        result = super().prepare_store(keys, req_context)
         if result is not None:
             tlog = _get_tier_logger()
             for key in result.evicted_keys:
-                # --- EXP 4: update orphan counter ---
-                self._orphaned.discard(key)
-                for child in self._children.get(key, ()):
-                    if self._policy.get(child) is not None:
-                        self._orphaned.add(child)
-                self._children.pop(key, None)
-                # --- END EXP 4 ---
+                if self._track_orphans:
+                    # --- EXP 4: update orphan counter ---
+                    self._orphaned.discard(key)
+                    for child in self._children.get(key, ()):
+                        if self._policy.get(child) is not None:
+                            self._orphaned.add(child)
+                    self._children.pop(key, None)
+                    # --- END EXP 4 ---
                 if tlog is not None:
                     tlog.log_event(
                         "cpu_evict", key, "cpu",
@@ -96,14 +99,15 @@ class InstrumentedCPUOffloadingManager(CPUOffloadingManager):
         success: bool = True,
     ) -> None:
         if not success:
-            # --- EXP 4: clean up orphan state for blocks the failed store
-            # is about to drop (mirrors the base class predicate).
-            for key in keys:
-                block = self._policy.get(key)
-                if block is not None and not block.is_ready:
-                    self._orphaned.discard(key)
-                    self._children.pop(key, None)
-            # --- END EXP 4 ---
+            if self._track_orphans:
+                # --- EXP 4: clean up orphan state for blocks the failed
+                # store is about to drop (mirrors the base class predicate).
+                for key in keys:
+                    block = self._policy.get(key)
+                    if block is not None and not block.is_ready:
+                        self._orphaned.discard(key)
+                        self._children.pop(key, None)
+                # --- END EXP 4 ---
             super().complete_store(keys, req_context, success)
             return
 
