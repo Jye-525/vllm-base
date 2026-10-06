@@ -80,6 +80,17 @@ def test_incremental_demand_count_and_depth_updates() -> None:
     assert pool._demand_max_depths == {_bh(B): 4}
 
 
+def test_ranking_probe_does_not_count_peek_hits() -> None:
+    pool, _ = _pool_with_cached([A, B])
+    pool.set_peek_demand_counts({_bh(A): 1.0})
+    hits = pool.peek_hits
+    with pool.probing():
+        assert pool.get_cached_block(_bh(A), [0]) is not None
+    assert pool.peek_hits == hits
+    assert pool.get_cached_block(_bh(A), [0]) is not None
+    assert pool.peek_hits == hits + 1
+
+
 def test_zero_demand_evicted_before_demanded() -> None:
     pool, _ = _pool_with_cached([A, B, C])
     pool.set_peek_demand_counts({_bh(A): 2.0, _bh(B): 1.0})

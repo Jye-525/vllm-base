@@ -277,8 +277,9 @@ class KVCacheCoordinator(ABC):
         This is used by cache-aware scheduling policies to rank waiting
         requests without allocating KV blocks or recording prefix-cache stats.
         """
-        _, hit_length = self.find_longest_cache_hit(
-            block_hashes, max_cache_hit_length)
+        with self.block_pool.probing():
+            _, hit_length = self.find_longest_cache_hit(
+                block_hashes, max_cache_hit_length)
         return hit_length
 
     def new_step_starts(self) -> None:

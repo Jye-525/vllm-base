@@ -4,7 +4,8 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -214,6 +215,9 @@ class BlockPool:
         # Peek-eviction effectiveness counters. Pure observability —
         # they do not influence eviction.
         self.peek_hits: int = 0
+        # >0 while scheduler ranking probes the cache; such lookups are not
+        # real hits and must not inflate peek_hits.
+        self._probe_depth: int = 0
         self.peek_protected: int = 0
         self.peek_publishes: int = 0
 
@@ -405,9 +409,18 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
-        if block_hash in self._demand_counts:
+        if not self._probe_depth and block_hash in self._demand_counts:
             self.peek_hits += 1
         return cached_blocks
+
+    @contextmanager
+    def probing(self) -> Iterator[None]:
+        """Treat get_cached_block() calls in this scope as ranking probes."""
+        self._probe_depth += 1
+        try:
+            yield
+        finally:
+            self._probe_depth -= 1
 
     def is_cached_block(self, block_hash: BlockHash,
                         kv_cache_group_ids: list[int]) -> bool:
