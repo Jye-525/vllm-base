@@ -4,7 +4,7 @@ import itertools
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -65,6 +65,8 @@ from vllm.v1.core.sched.waiting_ranker import (
     RankPlan,
     rank_clpm,
     rank_lpm,
+    rank_sjf,
+    rank_spf,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
@@ -224,6 +226,7 @@ class Scheduler(SchedulerInterface):
         self._clpm_lane_a_pass = 0.0
         self._clpm_lane_b_pass = 0.0
         self._clpm_dynamic_b_share = 0.3
+        self._init_waiting_rankers()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -614,7 +617,9 @@ class Scheduler(SchedulerInterface):
         normal waiting-admission path still performs the authoritative checks
         before scheduling the selected request.
         """
-        if request.status != RequestStatus.WAITING:
+        if request.status != RequestStatus.WAITING and not (
+            self._rank_preempted and request.status == RequestStatus.PREEMPTED
+        ):
             return False
         if request.num_computed_tokens != 0:
             return False
@@ -627,15 +632,58 @@ class Scheduler(SchedulerInterface):
             and request.lora_request.lora_int_id not in scheduled_loras
         )
 
+    def _init_waiting_rankers(self) -> None:
+        """Select the candidate ranker for the configured policy.
+
+        Policies without a ranker (FCFS, PRIORITY) keep their queue order.
+        """
+        config = self.scheduler_config
+        # Default aging: a request that waited 60 s outranks any fresh one,
+        # since vLLM bounds prompt and output lengths by max_model_len.
+        default_alpha = self.max_model_len / 60.0
+        self._spf_age_alpha = (
+            default_alpha if config.spf_age_alpha is None else config.spf_age_alpha
+        )
+        self._sjf_age_alpha = (
+            default_alpha if config.sjf_age_alpha is None else config.sjf_age_alpha
+        )
+        self._rank_preempted = config.rank_preempted_requests
+        self._step_rank_ns = 0
+        rankers: dict[SchedulingPolicy, Callable[[list[Request]], RankPlan]] = {
+            SchedulingPolicy.LPM: self._rank_lpm_candidates,
+            SchedulingPolicy.CLPM: self._rank_clpm_candidates,
+            SchedulingPolicy.SPF: self._rank_spf_candidates,
+            SchedulingPolicy.SJF: self._rank_sjf_candidates,
+        }
+        self._waiting_ranker = rankers.get(self.policy)
+        if self.policy == SchedulingPolicy.SPF:
+            if not self.cache_config.enable_prefix_caching:
+                logger.warning_once(
+                    "SPF without prefix caching ranks by prompt length only."
+                )
+            logger.info(
+                "SPF scheduling: age_alpha=%.3f tokens/s, window=%d, "
+                "rank_preempted=%s",
+                self._spf_age_alpha,
+                config.lpm_window_size,
+                self._rank_preempted,
+            )
+        elif self.policy == SchedulingPolicy.SJF:
+            logger.info(
+                "SJF scheduling: age_alpha=%.3f tokens/s, window=%d, "
+                "rank_preempted=%s",
+                self._sjf_age_alpha,
+                config.lpm_window_size,
+                self._rank_preempted,
+            )
+
     def _reorder_waiting_requests(
         self,
         scheduled_loras: set[int],
     ) -> RankPlan | None:
         """Reorder rankable slots in one bounded waiting-queue prefix."""
-        if self.policy not in (
-            SchedulingPolicy.LPM,
-            SchedulingPolicy.CLPM,
-        ):
+        ranker = self._waiting_ranker
+        if ranker is None:
             return None
         assert isinstance(self.waiting, FCFSRequestQueue)
         fallback_threshold = self.scheduler_config.lpm_fallback_threshold
@@ -652,55 +700,66 @@ class Scheduler(SchedulerInterface):
         if len(candidates) <= 1:
             return None
 
-        prefix_hits = {
-            request.request_id: self.kv_cache_manager.get_computed_prefix_len(request)
-            for request in candidates
-        }
-        candidate_ids = [request.request_id for request in candidates]
-        if self.policy == SchedulingPolicy.LPM:
-            plan = rank_lpm(candidates, prefix_hits)
-        else:
-            deprioritize_threshold = self.scheduler_config.lpm_deprioritize_threshold
-            claim_depth_blocks = (
-                (deprioritize_threshold + self.block_size - 1) // self.block_size
-                if deprioritize_threshold > 0
-                else 0
-            )
-            rank_info = self.pending_prefix_index.rank_info_many(
-                candidate_ids,
-                claim_depth_blocks,
-                include_request_score=not self.scheduler_config.clpm_group_major,
-            )
-            if len(rank_info) != len(candidates):
-                raise RuntimeError("Prefix index is inconsistent with waiting queue")
-
-            if not any(info.cluster_size >= 2 for info in rank_info.values()):
-                plan = rank_lpm(candidates, prefix_hits)
-            else:
-                plan = rank_clpm(
-                    candidates,
-                    prefix_hits,
-                    rank_info,
-                    check_threshold=self.scheduler_config.lpm_check_threshold,
-                    big_lane_share=self.scheduler_config.clpm_big_lane_share,
-                    age_alpha=self.scheduler_config.clpm_age_alpha,
-                    group_major=self.scheduler_config.clpm_group_major,
-                    dynamic_lane=self.scheduler_config.clpm_dynamic_lane,
-                    slo_budget_s=self.scheduler_config.clpm_slo_budget_s,
-                    previous_b_share=self._clpm_dynamic_b_share,
-                    lane_a_pass=self._clpm_lane_a_pass,
-                    lane_b_pass=self._clpm_lane_b_pass,
-                    now=time.time(),
-                )
-                if plan.dynamic_b_share is not None:
-                    self._clpm_dynamic_b_share = plan.dynamic_b_share
-
+        plan = ranker(candidates)
         self.waiting.reorder_rankable_prefix(
             window_size,
             plan.ordered_requests,
-            set(candidate_ids),
+            {request.request_id for request in candidates},
         )
         return plan
+
+    def _prefix_hits(self, candidates: list[Request]) -> dict[str, int]:
+        return {
+            request.request_id: self.kv_cache_manager.get_computed_prefix_len(request)
+            for request in candidates
+        }
+
+    def _rank_lpm_candidates(self, candidates: list[Request]) -> RankPlan:
+        return rank_lpm(candidates, self._prefix_hits(candidates))
+
+    def _rank_clpm_candidates(self, candidates: list[Request]) -> RankPlan:
+        prefix_hits = self._prefix_hits(candidates)
+        deprioritize_threshold = self.scheduler_config.lpm_deprioritize_threshold
+        claim_depth_blocks = (
+            (deprioritize_threshold + self.block_size - 1) // self.block_size
+            if deprioritize_threshold > 0
+            else 0
+        )
+        rank_info = self.pending_prefix_index.rank_info_many(
+            [request.request_id for request in candidates],
+            claim_depth_blocks,
+            include_request_score=not self.scheduler_config.clpm_group_major,
+        )
+        if len(rank_info) != len(candidates):
+            raise RuntimeError("Prefix index is inconsistent with waiting queue")
+
+        if not any(info.cluster_size >= 2 for info in rank_info.values()):
+            return rank_lpm(candidates, prefix_hits)
+        plan = rank_clpm(
+            candidates,
+            prefix_hits,
+            rank_info,
+            check_threshold=self.scheduler_config.lpm_check_threshold,
+            big_lane_share=self.scheduler_config.clpm_big_lane_share,
+            age_alpha=self.scheduler_config.clpm_age_alpha,
+            group_major=self.scheduler_config.clpm_group_major,
+            dynamic_lane=self.scheduler_config.clpm_dynamic_lane,
+            slo_budget_s=self.scheduler_config.clpm_slo_budget_s,
+            previous_b_share=self._clpm_dynamic_b_share,
+            lane_a_pass=self._clpm_lane_a_pass,
+            lane_b_pass=self._clpm_lane_b_pass,
+            now=time.time(),
+        )
+        if plan.dynamic_b_share is not None:
+            self._clpm_dynamic_b_share = plan.dynamic_b_share
+        return plan
+
+    def _rank_spf_candidates(self, candidates: list[Request]) -> RankPlan:
+        return rank_spf(candidates, self._prefix_hits(candidates), self._spf_age_alpha)
+
+    def _rank_sjf_candidates(self, candidates: list[Request]) -> RankPlan:
+        # Ranks on max_tokens alone: no prefix-cache lookups.
+        return rank_sjf(candidates, self._sjf_age_alpha)
 
     def _commit_clpm_admission(
         self, request_id: str, rank_plan: RankPlan | None
@@ -929,6 +988,7 @@ class Scheduler(SchedulerInterface):
                 self._log_schedule_batch(args[:-1] + (-1,), -1)
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
+        self._step_rank_ns = 0
         self._pkas_step += 1
         self._pkas_step_stats = (
             dict.fromkeys(
@@ -1198,9 +1258,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
-            # LPM/cLPM: reorder the bounded rankable prefix of self.waiting
-            # once per step; admission below still pops from the queue head.
+            # Ranked policies (LPM, cLPM, SPF, SJF): reorder the bounded
+            # rankable prefix of self.waiting once per step; admission below
+            # still pops from the queue head.
+            rank_start_ns = time.perf_counter_ns()
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
+            self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
             if self.predictive_admission is not None:
                 threshold = self.scheduler_config.lpm_fallback_threshold
                 if not threshold or len(self.waiting) <= threshold:
@@ -1690,6 +1753,7 @@ class Scheduler(SchedulerInterface):
             self.max_num_scheduled_tokens,
             prefill_tokens,
             decode_tokens,
+            self._step_rank_ns,
             self._pkas_step_stats,
             self._step_preempted_tokens,
         )
@@ -1819,7 +1883,7 @@ class Scheduler(SchedulerInterface):
             "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
             "running=%d preempted=%d waiting_after=%d running_after=%d "
             "token_budget_used=%d token_budget_max=%d "
-            "prefill_tokens=%d decode_tokens=%d "
+            "prefill_tokens=%d decode_tokens=%d rank_ns=%d "
             "preempted_tokens=%d recomputed_tokens=%d%s",
             *args[:-2],
             args[-1],
@@ -2663,6 +2727,8 @@ class Scheduler(SchedulerInterface):
             SchedulingPolicy.FCFS,
             SchedulingPolicy.LPM,
             SchedulingPolicy.CLPM,
+            SchedulingPolicy.SPF,
+            SchedulingPolicy.SJF,
         ):
             return self.skipped_waiting or self.waiting or None
 
@@ -2824,6 +2890,15 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if (
+                self.policy == SchedulingPolicy.SJF
+                and request.sampling_params is not None
+                and not request.sampling_params.ignore_eos
+            ):
+                logger.warning_once(
+                    "SJF ranks by max_tokens, which is only an upper bound on "
+                    "output length for requests without ignore_eos."
+                )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)

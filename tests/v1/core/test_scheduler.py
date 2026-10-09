@@ -279,6 +279,140 @@ def test_lpm_falls_back_to_fcfs_without_prefix_caching():
     scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
 
 
+def _ranked_scheduler(policy: str, **kwargs) -> Scheduler:
+    return create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy=policy,
+        lpm_window_size=0,
+        **kwargs,
+    )
+
+
+def _add_at(scheduler: Scheduler, request: Request, arrival_time: float) -> None:
+    request.arrival_time = arrival_time
+    scheduler.add_request(request)
+
+
+def test_spf_schedules_fewest_uncached_tokens_first():
+    scheduler = _ranked_scheduler("spf", spf_age_alpha=0.0)
+    cold_long = create_requests(1, num_tokens=100, req_ids=["cold_long"])[0]
+    warm_long = create_requests(1, num_tokens=100, req_ids=["warm_long"])[0]
+    cold_short = create_requests(1, num_tokens=40, req_ids=["cold_short"])[0]
+    for request in (cold_long, warm_long, cold_short):
+        _add_at(scheduler, request, 0.0)
+    hits = {"cold_long": 0, "warm_long": 80, "cold_short": 0}
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
+        side_effect=lambda req: hits[req.request_id]
+    )
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["warm_long"]
+    assert [req.request_id for req in scheduler.waiting] == [
+        "cold_short",
+        "cold_long",
+    ]
+
+
+def test_spf_aging_lets_old_long_request_go_first():
+    scheduler = _ranked_scheduler("spf", spf_age_alpha=10.0)
+    old_long = create_requests(1, num_tokens=120, req_ids=["old_long"])[0]
+    new_short = create_requests(1, num_tokens=20, req_ids=["new_short"])[0]
+    _add_at(scheduler, new_short, 100.0)
+    # 11 s older at 10 tokens/s outweighs the 100-token gap.
+    _add_at(scheduler, old_long, 89.0)
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["old_long"]
+
+
+def test_sjf_schedules_smallest_max_tokens_without_cache_lookups():
+    scheduler = _ranked_scheduler("sjf", sjf_age_alpha=0.0)
+    for req_id, max_tokens in (("big", 500), ("small", 50), ("mid", 200)):
+        request = create_requests(
+            1, max_tokens=max_tokens, ignore_eos=True, req_ids=[req_id]
+        )[0]
+        _add_at(scheduler, request, 0.0)
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["small"]
+    assert [req.request_id for req in scheduler.waiting] == ["mid", "big"]
+    scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
+
+
+def test_sjf_respects_bounded_window():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        scheduling_policy="sjf",
+        sjf_age_alpha=0.0,
+        lpm_window_size=2,
+    )
+    for req_id, max_tokens in (("a", 300), ("b", 200), ("c", 10)):
+        request = create_requests(
+            1, max_tokens=max_tokens, ignore_eos=True, req_ids=[req_id]
+        )[0]
+        _add_at(scheduler, request, 0.0)
+
+    output = scheduler.schedule()
+
+    # "c" is shortest but outside the two-request window.
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["b"]
+
+
+def test_ranked_policies_default_age_alpha_is_max_model_len_per_minute():
+    for policy, attr in (("spf", "_spf_age_alpha"), ("sjf", "_sjf_age_alpha")):
+        scheduler = create_scheduler(
+            enable_prefix_caching=True, scheduling_policy=policy
+        )
+        assert getattr(scheduler, attr) == pytest.approx(scheduler.max_model_len / 60)
+
+
+def _preempted_then_short(rank_preempted: bool) -> SchedulerOutput:
+    scheduler = _ranked_scheduler(
+        "sjf", sjf_age_alpha=0.0, rank_preempted_requests=rank_preempted
+    )
+    victim = create_requests(1, max_tokens=100, ignore_eos=True, req_ids=["victim"])[0]
+    _add_at(scheduler, victim, 0.0)
+    scheduler.schedule()
+    assert scheduler.running == [victim]
+    scheduler.running.remove(victim)
+    scheduler._preempt_request(victim, 0.0)
+    # A real preemption happens in a step that does not schedule the victim.
+    scheduler.prev_step_scheduled_req_ids.discard("victim")
+    short = create_requests(1, max_tokens=10, ignore_eos=True, req_ids=["short"])[0]
+    _add_at(scheduler, short, 1.0)
+    return scheduler.schedule()
+
+
+def test_preempted_request_resumes_first_by_default():
+    output = _preempted_then_short(rank_preempted=False)
+
+    assert [req.request_id for req in output.scheduled_new_reqs] == []
+    assert output.scheduled_cached_reqs.req_ids == ["victim"]
+
+
+def test_preempted_request_is_ranked_when_enabled():
+    output = _preempted_then_short(rank_preempted=True)
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["short"]
+    assert output.scheduled_cached_reqs.req_ids == []
+
+
+def test_rank_preempted_requests_requires_spf_or_sjf():
+    with pytest.raises(ValueError, match="rank_preempted_requests"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy="lpm",
+            rank_preempted_requests=True,
+        )
+
+
 def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
     scheduler = create_scheduler(
         max_num_seqs=1,

@@ -616,6 +616,9 @@ class EngineArgs:
     clpm_group_major: bool | None = None
     clpm_dynamic_lane: bool | None = None
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
+    spf_age_alpha: float | None = SchedulerConfig.spf_age_alpha
+    sjf_age_alpha: float | None = SchedulerConfig.sjf_age_alpha
+    rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
     peek_eviction_mode: PeekEvictionMode | None = None
     peek_eviction_recency_weight: float = SchedulerConfig.peek_eviction_recency_weight
@@ -1543,6 +1546,16 @@ class EngineArgs:
             "--clpm-slo-budget-s", **scheduler_kwargs["clpm_slo_budget_s"]
         )
         scheduler_group.add_argument(
+            "--spf-age-alpha", **scheduler_kwargs["spf_age_alpha"]
+        )
+        scheduler_group.add_argument(
+            "--sjf-age-alpha", **scheduler_kwargs["sjf_age_alpha"]
+        )
+        scheduler_group.add_argument(
+            "--rank-preempted-requests",
+            **scheduler_kwargs["rank_preempted_requests"],
+        )
+        scheduler_group.add_argument(
             "--kv-cache-eviction-policy",
             **{
                 **scheduler_kwargs["kv_cache_eviction_policy"],
@@ -2228,6 +2241,9 @@ class EngineArgs:
             clpm_group_major=self.clpm_group_major,
             clpm_dynamic_lane=self.clpm_dynamic_lane,
             clpm_slo_budget_s=self.clpm_slo_budget_s,
+            spf_age_alpha=self.spf_age_alpha,
+            sjf_age_alpha=self.sjf_age_alpha,
+            rank_preempted_requests=self.rank_preempted_requests,
             kv_cache_eviction_policy=self.kv_cache_eviction_policy,
             peek_eviction_mode=self.peek_eviction_mode,
             peek_eviction_recency_weight=self.peek_eviction_recency_weight,

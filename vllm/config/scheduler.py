@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm"]
+SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sjf"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek"]
@@ -119,7 +119,11 @@ class SchedulerConfig:
       value means earlier handling) and time of arrival deciding any ties).
     - "lpm" orders a bounded waiting window by locally cached prefix length
       descending, preserving current queue order on ties.
-    - "clpm" adds clustered demand and an age-aware fairness lane."""
+    - "clpm" adds clustered demand and an age-aware fairness lane.
+    - "spf" orders the same window by uncached prompt tokens ascending, with
+      linear aging (shortest prefill first, as in PrefillOnly).
+    - "sjf" orders the same window by ``max_tokens`` ascending, with linear
+      aging. It is an oracle only when clients set ``ignore_eos``."""
 
     admission_policy: AdmissionPolicy = "none"
     """Waiting-request admission policy. ``none`` uses stock vLLM admission;
@@ -154,11 +158,11 @@ class SchedulerConfig:
     rejected candidate on every step."""
 
     lpm_window_size: int = Field(default=128, ge=0)
-    """For LPM/cLPM, the number of waiting requests to reorder per
-    scheduler step. Zero means the full waiting queue."""
+    """For LPM, cLPM, SPF and SJF, the number of waiting requests to reorder
+    per scheduler step. Zero means the full waiting queue."""
 
     lpm_fallback_threshold: int = Field(default=0, ge=0)
-    """For LPM/cLPM, fall back to FCFS when the total waiting
+    """For LPM, cLPM, SPF and SJF, fall back to FCFS when the total waiting
     queue is larger than this threshold. Zero disables the fallback."""
 
     lpm_check_threshold: int = 32
@@ -183,6 +187,20 @@ class SchedulerConfig:
 
     clpm_slo_budget_s: float = Field(default=2.0, gt=0.0)
     """Waiting-time budget used to normalize cLPM's dynamic age pressure."""
+
+    spf_age_alpha: float | None = Field(default=None, ge=0.0)
+    """SPF aging: uncached-token credit per second of waiting. None uses
+    ``max_model_len / 60`` so a request that waited 60 s outranks any fresh
+    one. Zero disables aging."""
+
+    sjf_age_alpha: float | None = Field(default=None, ge=0.0)
+    """SJF aging: output-token credit per second of waiting. None uses
+    ``max_model_len / 60``. Zero disables aging."""
+
+    rank_preempted_requests: bool = False
+    """For SPF and SJF, rank preempted requests by their remaining work.
+    False keeps them unranked at the head of the waiting queue, so they
+    resume first (stock vLLM, FCFS and LPM behavior)."""
 
     kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
     """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
@@ -339,6 +357,12 @@ class SchedulerConfig:
                 self.max_num_partial_prefills,
                 self.max_long_partial_prefills,
                 self.long_prefill_token_threshold,
+            )
+
+        if self.rank_preempted_requests and self.policy not in ("spf", "sjf"):
+            raise ValueError(
+                "rank_preempted_requests requires the 'spf' or 'sjf' "
+                f"scheduling policy, not {self.policy!r}"
             )
 
         self.verify_max_model_len(max_model_len)

@@ -58,6 +58,56 @@ def rank_lpm(
     return RankPlan(ordered, {})
 
 
+def _rank_by_aged_length(
+    requests: list[Request],
+    lengths: dict[str, int],
+    age_alpha: float,
+) -> RankPlan:
+    """Order by ``length - age_alpha * wait``, shortest first.
+
+    Aging is linear and shared, so ``length - age_alpha * (now - arrival)``
+    orders the same as ``length + age_alpha * arrival``; no clock is needed.
+    The sort is stable, so ties keep the current queue order.
+    """
+    ordered = sorted(
+        requests,
+        key=lambda request: (
+            lengths[request.request_id] + age_alpha * request.arrival_time
+        ),
+    )
+    return RankPlan(ordered, {})
+
+
+def rank_spf(
+    requests: list[Request],
+    prefix_hits: dict[str, int],
+    age_alpha: float,
+) -> RankPlan:
+    """Shortest prefill first: fewest uncached tokens, with linear aging.
+
+    A preempted request's ``num_tokens`` includes its generated tokens, which
+    must be replayed, so the same formula covers it.
+    """
+    uncached = {
+        request.request_id: request.num_tokens - prefix_hits[request.request_id]
+        for request in requests
+    }
+    return _rank_by_aged_length(requests, uncached, age_alpha)
+
+
+def rank_sjf(requests: list[Request], age_alpha: float) -> RankPlan:
+    """Shortest job first on remaining output tokens, with linear aging.
+
+    ``max_tokens`` is the true output length only when the client sets
+    ``ignore_eos``; otherwise it is an upper bound.
+    """
+    remaining = {
+        request.request_id: request.max_tokens - request.num_output_tokens
+        for request in requests
+    }
+    return _rank_by_aged_length(requests, remaining, age_alpha)
+
+
 def _group_major_order(
     requests: list[Request],
     sections: dict[str, int],
