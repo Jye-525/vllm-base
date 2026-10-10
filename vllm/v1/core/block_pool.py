@@ -191,6 +191,11 @@ class BlockPool:
         # change allocation or eviction decisions.
         self.observer: Any | None = None
 
+        # Raw hashes whose last cached copy was evicted since the last drain.
+        # None (the default) records nothing; the scheduler turns it on only
+        # while re-ranking waiting requests per admission.
+        self._eviction_log: list[BlockHash] | None = None
+
         # Peek eviction uses waiting-queue-aware victim selection; LRU uses
         # stock popleft_n. The scheduler configures this at startup.
         self._eviction_policy: str = "lru"
@@ -426,6 +431,19 @@ class BlockPool:
             yield
         finally:
             self._probe_depth -= 1
+
+    def start_eviction_log(self) -> None:
+        self._eviction_log = []
+
+    def drain_eviction_log(self) -> list[BlockHash]:
+        """Return and clear the hashes evicted since the last drain."""
+        evicted = self._eviction_log or []
+        if self._eviction_log is not None:
+            self._eviction_log = []
+        return evicted
+
+    def stop_eviction_log(self) -> None:
+        self._eviction_log = None
 
     def is_cached_block(self, block_hash: BlockHash,
                         kv_cache_group_ids: list[int]) -> bool:
@@ -744,10 +762,13 @@ class BlockPool:
         # Blocks are not de-duplicated: report a hash only when its last
         # cached copy goes, i.e. when the content stops being reusable.
         if (
-            self.observer is not None
-            and self.cached_block_hash_to_block.get_one_block(block_hash) is None
-        ):
-            self.observer.on_evict(get_block_hash(block_hash))
+            self.observer is not None or self._eviction_log is not None
+        ) and self.cached_block_hash_to_block.get_one_block(block_hash) is None:
+            raw_hash = get_block_hash(block_hash)
+            if self.observer is not None:
+                self.observer.on_evict(raw_hash)
+            if self._eviction_log is not None:
+                self._eviction_log.append(raw_hash)
 
         block.reset_hash()
 

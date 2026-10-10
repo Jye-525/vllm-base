@@ -1906,6 +1906,26 @@ def test_maybe_evict_cached_block():
     assert pool.cached_block_hash_to_block._cache == {}
 
 
+def test_eviction_log_records_last_cached_copy_only():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    hash_a = make_block_hash_with_group_id(BlockHash(b"10"), 0)
+    hash_b = make_block_hash_with_group_id(BlockHash(b"20"), 0)
+    for block, block_hash in zip(pool.blocks, [hash_a, hash_b, hash_a, hash_b]):
+        block.block_hash = block_hash
+        pool.cached_block_hash_to_block.insert(block_hash, block)
+    block0, block1, block2, block3 = pool.blocks
+
+    pool._maybe_evict_cached_block(block3)  # logging off: not recorded
+    pool.start_eviction_log()
+    pool._maybe_evict_cached_block(block0)  # block2 still caches hash_a
+    pool._maybe_evict_cached_block(block1)
+    assert pool.drain_eviction_log() == [BlockHash(b"20")]
+    assert pool.drain_eviction_log() == []
+    pool._maybe_evict_cached_block(block2)
+    pool.stop_eviction_log()
+    assert pool.drain_eviction_log() == []
+
+
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
 def test_kv_cache_events(blocks_to_cache: int):
     block_size = 16

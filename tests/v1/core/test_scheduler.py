@@ -413,6 +413,113 @@ def test_rank_preempted_requests_requires_spf_or_sjf():
         )
 
 
+def _token_request(request_id: str, prompt_token_ids: list[int]) -> Request:
+    global _none_hash_initialized
+    if not _none_hash_initialized:
+        init_none_hash(sha256)
+        _none_hash_initialized = True
+    sampling_params = SamplingParams(max_tokens=16)
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+
+def _schedule_pioneer_other_sibling(
+    policy: str, rank_per_admission: bool
+) -> tuple[Scheduler, list[str]]:
+    """All three start cold; admitting the pioneer caches the sibling's prefix."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy=policy,
+        lpm_window_size=0,
+        spf_age_alpha=0.0,
+        rank_per_admission=rank_per_admission,
+    )
+    shared = list(range(1, 65))
+    for request_id, prompt in (
+        ("pioneer", shared + [100] * 16),
+        ("other", [200] * 80),
+        ("sibling", shared + [300] * 16),
+    ):
+        scheduler.add_request(_token_request(request_id, prompt))
+    output = scheduler.schedule()
+    return scheduler, [req.req_id for req in output.scheduled_new_reqs]
+
+
+@pytest.mark.parametrize("policy", ["lpm", "spf"])
+def test_rank_per_admission_pulls_sibling_forward(policy):
+    scheduler, order = _schedule_pioneer_other_sibling(policy, True)
+
+    assert order == ["pioneer", "sibling", "other"]
+    assert scheduler._step_rerank_count == 1
+
+
+@pytest.mark.parametrize("policy", ["lpm", "spf"])
+def test_rank_once_per_step_keeps_step_start_order(policy):
+    scheduler, order = _schedule_pioneer_other_sibling(policy, False)
+
+    assert order == ["pioneer", "other", "sibling"]
+    assert scheduler._step_rerank_count == 0
+
+
+def test_rank_per_admission_skips_rerank_when_hits_unchanged():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=0,
+        rank_per_admission=True,
+    )
+    for request_id, token in (("a", 1), ("b", 2), ("c", 3)):
+        scheduler.add_request(_token_request(request_id, [token] * 40))
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["a", "b", "c"]
+    assert scheduler._step_rerank_count == 0
+
+
+def test_rank_per_admission_reranks_after_evicting_waiting_prefix():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=0,
+        rank_per_admission=True,
+    )
+    first = _token_request("first", [1] * 40)
+    second = _token_request("second", [2] * 40)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    # Admitting "first" evicts a block that "second" uses.
+    scheduler.kv_cache_manager.block_pool.drain_eviction_log = Mock(
+        side_effect=[[second.block_hashes[0]], []]
+    )
+
+    scheduler.schedule()
+
+    assert scheduler._step_rerank_count == 1
+
+
+@pytest.mark.parametrize(
+    ("policy", "admission_policy"),
+    [("sjf", "none"), ("clpm", "none"), ("fcfs", "none"), ("lpm", "pkas")],
+)
+def test_rank_per_admission_requires_lpm_or_spf_without_pkas(
+    policy, admission_policy
+):
+    with pytest.raises(ValueError, match="rank_per_admission"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy=policy,
+            admission_policy=admission_policy,
+            rank_per_admission=True,
+        )
+
+
 def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
     scheduler = create_scheduler(
         max_num_seqs=1,

@@ -619,6 +619,7 @@ class EngineArgs:
     spf_age_alpha: float | None = SchedulerConfig.spf_age_alpha
     sjf_age_alpha: float | None = SchedulerConfig.sjf_age_alpha
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
+    rank_per_admission: bool = SchedulerConfig.rank_per_admission
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
     peek_eviction_mode: PeekEvictionMode | None = None
     peek_eviction_recency_weight: float = SchedulerConfig.peek_eviction_recency_weight
@@ -1556,6 +1557,9 @@ class EngineArgs:
             **scheduler_kwargs["rank_preempted_requests"],
         )
         scheduler_group.add_argument(
+            "--rank-per-admission", **scheduler_kwargs["rank_per_admission"]
+        )
+        scheduler_group.add_argument(
             "--kv-cache-eviction-policy",
             **{
                 **scheduler_kwargs["kv_cache_eviction_policy"],
@@ -2244,6 +2248,7 @@ class EngineArgs:
             spf_age_alpha=self.spf_age_alpha,
             sjf_age_alpha=self.sjf_age_alpha,
             rank_preempted_requests=self.rank_preempted_requests,
+            rank_per_admission=self.rank_per_admission,
             kv_cache_eviction_policy=self.kv_cache_eviction_policy,
             peek_eviction_mode=self.peek_eviction_mode,
             peek_eviction_recency_weight=self.peek_eviction_recency_weight,

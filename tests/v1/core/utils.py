@@ -77,6 +77,7 @@ def create_scheduler(
     spf_age_alpha: float | None = SchedulerConfig.spf_age_alpha,
     sjf_age_alpha: float | None = SchedulerConfig.sjf_age_alpha,
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests,
+    rank_per_admission: bool = SchedulerConfig.rank_per_admission,
     kv_cache_eviction_policy: str = SchedulerConfig.kv_cache_eviction_policy,
     peek_eviction_mode: str = SchedulerConfig.peek_eviction_mode,
     peek_eviction_recency_weight: float = (
@@ -143,6 +144,7 @@ def create_scheduler(
         spf_age_alpha=spf_age_alpha,
         sjf_age_alpha=sjf_age_alpha,
         rank_preempted_requests=rank_preempted_requests,
+        rank_per_admission=rank_per_admission,
         kv_cache_eviction_policy=kv_cache_eviction_policy,
         peek_eviction_mode=peek_eviction_mode,
         peek_eviction_recency_weight=peek_eviction_recency_weight,

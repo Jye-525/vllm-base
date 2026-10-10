@@ -202,6 +202,12 @@ class SchedulerConfig:
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
 
+    rank_per_admission: bool = False
+    """For LPM and SPF, re-rank the waiting window after an admission when
+    that admission changed another waiting request's prefix hits (cached a
+    block it shares, or evicted a block it uses). False ranks once per step.
+    A step that admits at most one request never re-ranks."""
+
     kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
     """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
     ``peek`` protects blocks demanded by waiting requests."""
@@ -364,6 +370,17 @@ class SchedulerConfig:
                 "rank_preempted_requests requires the 'spf' or 'sjf' "
                 f"scheduling policy, not {self.policy!r}"
             )
+        if self.rank_per_admission:
+            if self.policy not in ("lpm", "spf"):
+                raise ValueError(
+                    "rank_per_admission requires the 'lpm' or 'spf' "
+                    f"scheduling policy, not {self.policy!r}"
+                )
+            if self.admission_policy != "none":
+                raise ValueError(
+                    "rank_per_admission is not supported with "
+                    f"admission_policy={self.admission_policy!r}"
+                )
 
         self.verify_max_model_len(max_model_len)
 

@@ -648,7 +648,9 @@ class Scheduler(SchedulerInterface):
             default_alpha if config.sjf_age_alpha is None else config.sjf_age_alpha
         )
         self._rank_preempted = config.rank_preempted_requests
+        self._rank_per_admission = config.rank_per_admission
         self._step_rank_ns = 0
+        self._step_rerank_count = 0
         rankers: dict[SchedulingPolicy, Callable[[list[Request]], RankPlan]] = {
             SchedulingPolicy.LPM: self._rank_lpm_candidates,
             SchedulingPolicy.CLPM: self._rank_clpm_candidates,
@@ -676,6 +678,46 @@ class Scheduler(SchedulerInterface):
                 config.lpm_window_size,
                 self._rank_preempted,
             )
+        if self._rank_per_admission:
+            logger.info(
+                "Waiting-queue ranking: re-rank after admissions that change "
+                "waiting prefix hits (policy=%s).",
+                self.policy.value,
+            )
+
+    def _rerank_waiting_requests(self, scheduled_loras: set[int]) -> None:
+        """Re-rank after an admission changed waiting requests' prefix hits."""
+        start_ns = time.perf_counter_ns()
+        self._reorder_waiting_requests(scheduled_loras)
+        self._step_rank_ns += time.perf_counter_ns() - start_ns
+        self._step_rerank_count += 1
+
+    def _admission_changed_waiting_hits(
+        self,
+        request: Request,
+        num_local_hit_tokens: int,
+        num_scheduled_end: int,
+    ) -> bool:
+        """Whether admitting ``request`` changed a waiting request's prefix hits.
+
+        Call after ``request`` left the pending index. Allocation caches the
+        admitted request's new full blocks (raising hits of waiting requests
+        that share them) and may evict cached blocks (lowering hits of
+        waiting requests that use them). Block hashes are cumulative, so a
+        waiting request that shares any newly cached block also shares the
+        first one. The check is conservative: it may report a change that
+        does not move any key, which only costs an extra re-rank.
+        """
+        index = self.pending_prefix_index
+        block_pool = self.kv_cache_manager.block_pool
+        if any(index.pending_count(h) for h in block_pool.drain_eviction_log()):
+            return True
+        block_size = block_pool.hash_block_size
+        first_new = num_local_hit_tokens // block_size
+        num_full = min(num_scheduled_end // block_size, len(request.block_hashes))
+        if first_new >= num_full:
+            return False
+        return index.pending_count(request.block_hashes[first_new]) > 0
 
     def _reorder_waiting_requests(
         self,
@@ -989,6 +1031,7 @@ class Scheduler(SchedulerInterface):
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
+        self._step_rerank_count = 0
         self._pkas_step += 1
         self._pkas_step_stats = (
             dict.fromkeys(
@@ -1259,8 +1302,9 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
             # Ranked policies (LPM, cLPM, SPF, SJF): reorder the bounded
-            # rankable prefix of self.waiting once per step; admission below
-            # still pops from the queue head.
+            # rankable prefix of self.waiting once per step (LPM and SPF may
+            # re-rank between admissions); admission below still pops from
+            # the queue head.
             rank_start_ns = time.perf_counter_ns()
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
@@ -1280,9 +1324,17 @@ class Scheduler(SchedulerInterface):
                 predictive_admission_state = self._build_predictive_admission_state(
                     num_scheduled_tokens
                 )
+            # Per-admission re-ranking: re-rank lazily, only before the next
+            # admission attempt, so a step that admits once never re-ranks.
+            rerank_pending = False
+            if self._rank_per_admission:
+                self.kv_cache_manager.block_pool.start_eviction_log()
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
+                if rerank_pending:
+                    rerank_pending = False
+                    self._rerank_waiting_requests(scheduled_loras)
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
@@ -1585,6 +1637,15 @@ class Scheduler(SchedulerInterface):
                     self._pkas_step_stats["admitted_after_skip"] += 1
                     pkas_bypassed_ids.update(req.request_id for req in pkas_skipped)
                 self._untrack_waiting_request(request)
+                if self._rank_per_admission:
+                    rerank_pending = (
+                        self._admission_changed_waiting_hits(
+                            request,
+                            num_new_local_computed_tokens,
+                            num_computed_tokens + num_new_tokens,
+                        )
+                        or rerank_pending
+                    )
                 recovery_start = self._pkas_recovery_started.pop(
                     request.request_id, None
                 )
@@ -1697,6 +1758,9 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+            if self._rank_per_admission:
+                self.kv_cache_manager.block_pool.stop_eviction_log()
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1754,6 +1818,7 @@ class Scheduler(SchedulerInterface):
             prefill_tokens,
             decode_tokens,
             self._step_rank_ns,
+            self._step_rerank_count,
             self._pkas_step_stats,
             self._step_preempted_tokens,
         )
@@ -1883,7 +1948,7 @@ class Scheduler(SchedulerInterface):
             "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
             "running=%d preempted=%d waiting_after=%d running_after=%d "
             "token_budget_used=%d token_budget_max=%d "
-            "prefill_tokens=%d decode_tokens=%d rank_ns=%d "
+            "prefill_tokens=%d decode_tokens=%d rank_ns=%d reranks=%d "
             "preempted_tokens=%d recomputed_tokens=%d%s",
             *args[:-2],
             args[-1],
