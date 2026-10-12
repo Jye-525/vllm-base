@@ -24,6 +24,7 @@ PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
+PKASOutputPredictor = Literal["legacy", "paper", "quantile"]
 
 
 @config
@@ -127,30 +128,35 @@ class SchedulerConfig:
 
     admission_policy: AdmissionPolicy = "none"
     """Waiting-request admission policy. ``none`` uses stock vLLM admission;
-    ``pkas`` applies prefix-aware predictive admission after LPM ranking."""
+    ``pkas`` applies prefix-aware predictive admission after LPM ranking:
+    admission stops at the first request PKAS rejects. PKAS requires
+    ``scheduler_reserve_full_isl=False``."""
 
-    pkas_max_candidate_skips: int = Field(default=8, ge=0)
-    """Maximum PKAS-rejected candidates to skip per scheduling step.
-    Zero stops waiting-request admission at the first rejection."""
-
-    pkas_max_replay_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    """Allow a predicted tail preemption when estimated replay plus a one-block
-    restart charge fits this fraction of scheduled tokens plus any recovered
-    prefix tokens on resumption.
-    Zero preserves strict predictive admission. Cost estimation requires LRU."""
-
-    pkas_batch_cost: bool = False
-    """Use measured batch latency and observed replay amplification to price
-    cost admission. Requires a positive replay ratio; missing measurements
-    fall back to strict admission. False retains the token-budget policy."""
+    pkas_output_predictor: PKASOutputPredictor = "legacy"
+    """Output-length forecast PKAS reserves future decode KV for.
+    - "paper": the PKAS paper's Eq. 1, ``ceil(|mean - std|)`` of every
+      completed output (Welford); one more token for a request already past
+      the forecast. Ignores the quantile, history and confidence settings.
+    - "quantile": ``pkas_output_quantile`` of completed outputs, used only
+      once enough completions exist to bound that quantile with
+      ``pkas_output_confidence`` (distribution-free); before that, and for
+      requests past every completed length, one more token.
+    - "legacy": the earlier quantile forecast with a fixed 512-token cold
+      forecast until 32 completions; kept only to reproduce older runs."""
 
     pkas_output_quantile: float = Field(default=0.9, gt=0.0, le=1.0)
-    """Quantile of recent completed output lengths that PKAS reserves KV for.
-    Lower values admit more aggressively and rely on preemption/replay when a
-    request outgrows its forecast."""
+    """Quantile of completed output lengths that the "quantile" and "legacy"
+    predictors reserve KV for. Lower values admit more aggressively and rely
+    on preemption/replay when a request outgrows its forecast."""
 
-    pkas_output_history: int = Field(default=256, ge=8)
-    """Number of recent completed outputs used by the PKAS length forecast."""
+    pkas_output_history: int | None = Field(default=None, ge=0)
+    """Recent completed outputs the "quantile" and "legacy" predictors keep.
+    None uses each predictor's default (all outputs for "quantile", 256 for
+    "legacy"); 0 keeps all outputs."""
+
+    pkas_output_confidence: float = Field(default=0.95, gt=0.0, lt=1.0)
+    """Confidence with which the "quantile" predictor's sample must bound the
+    quantile before it is used (fewest samples n with q**n <= 1 - confidence)."""
 
     pkas_reject_cache_steps: int = Field(default=16, ge=0)
     """Reuse a PKAS rejection for up to this many scheduling steps unless a

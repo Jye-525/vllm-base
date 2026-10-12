@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Work fields of the ``batch_execution`` log line (step cost model input)."""
+"""Work fields of the ``schedule_batch`` log line (step cost model input)."""
 
 from types import SimpleNamespace as NS
 

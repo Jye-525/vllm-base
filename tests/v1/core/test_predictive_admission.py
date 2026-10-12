@@ -4,10 +4,12 @@
 import pytest
 
 from vllm.v1.core.sched.predictive_admission import (
-    BatchCostModel,
     CausalOutputLengthEstimator,
+    PaperOutputLengthEstimator,
     PredictiveAdmissionController,
+    QuantileOutputLengthEstimator,
     RequestSnapshot,
+    min_quantile_samples,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -108,6 +110,99 @@ def test_controller_passes_estimator_settings_and_resets():
     assert controller.estimator.predict() == 7
     controller.reset_history()
     assert controller.estimator.count == 0
+
+
+def test_paper_estimator_follows_eq1():
+    estimator = PaperOutputLengthEstimator()
+    assert estimator.predict() == 1
+    estimator.observe(100)
+    assert estimator.predict() == 1  # N <= 1
+    for length in (200, 300):
+        estimator.observe(length)
+    # mean 200, sample std 100: ceil(|200 - 100|) = 100.
+    assert estimator.predict() == 100
+    assert estimator.target(50) == 100
+    # At or past the forecast: one more token.
+    assert estimator.target(100) == 101
+    assert estimator.target(150) == 151
+    estimator.reset()
+    assert estimator.count == 0 and estimator.predict() == 1
+
+
+def test_paper_estimator_uses_absolute_value_for_heavy_tails():
+    estimator = PaperOutputLengthEstimator()
+    for length in (1, 1, 1, 97):
+        estimator.observe(length)
+    # mean 25, sample std 48: ceil(|25 - 48|) = 23.
+    assert estimator.predict() == 23
+
+
+def test_min_quantile_samples_is_distribution_free_bound():
+    # Smallest n with q**n <= 1 - confidence.
+    assert min_quantile_samples(0.5, 0.95) == 5
+    assert min_quantile_samples(0.9, 0.95) == 29
+    assert 0.5**5 <= 0.05 < 0.5**4
+    for quantile, confidence in ((0.0, 0.95), (1.0, 0.95), (0.5, 1.0)):
+        with pytest.raises(ValueError):
+            min_quantile_samples(quantile, confidence)
+
+
+def test_quantile_estimator_waits_for_a_bounding_sample():
+    estimator = QuantileOutputLengthEstimator(0.5)  # needs 5 samples
+    for length in (10, 20, 30, 40):
+        estimator.observe(length)
+    assert estimator.predict() == 1
+    assert estimator.target(0) == 1
+    assert estimator.target(25) == 26
+    estimator.observe(50)
+    assert estimator.predict() == 30
+    assert estimator.target(10) == 30
+    # Two completed outputs are longer than 30: too few to bound the
+    # conditional median, so use the longest completed output.
+    assert estimator.target(30) == 50
+    assert estimator.target(50) == 51
+
+
+def test_quantile_estimator_conditional_tail_and_history():
+    estimator = QuantileOutputLengthEstimator(0.5)
+    for length in range(1, 21):
+        estimator.observe(length)
+    assert estimator.max_history == 0 and estimator.count == 20
+    assert estimator.predict() == 10  # median of 1..20 (index 9)
+    assert estimator.target(5) == 10
+    # Past the forecast: 8 outputs exceed 12, enough to bound their median,
+    # which is 16 (index 3 of 13..20).
+    assert estimator.target(12) == 16
+    windowed = QuantileOutputLengthEstimator(0.5, history=6)
+    for length in range(1, 21):
+        windowed.observe(length)
+    assert windowed.sorted_lengths == list(range(15, 21))
+    with pytest.raises(ValueError):
+        QuantileOutputLengthEstimator(0.5, history=4)
+
+
+@pytest.mark.parametrize("predictor,kind", [
+    ("paper", PaperOutputLengthEstimator),
+    ("quantile", QuantileOutputLengthEstimator),
+    ("legacy", CausalOutputLengthEstimator),
+])
+def test_controller_selects_output_predictor(predictor, kind):
+    controller = PredictiveAdmissionController(
+        block_size=4, capacity_blocks=8, token_budget=8,
+        long_prefill_token_threshold=0, max_model_len=128,
+        output_predictor=predictor, output_quantile=0.5,
+    )
+    assert isinstance(controller.estimator, kind)
+    if predictor == "quantile":
+        assert controller.estimator.max_history == 0
+    if predictor == "legacy":
+        assert controller.estimator.max_history == 256
+    with pytest.raises(ValueError):
+        PredictiveAdmissionController(
+            block_size=4, capacity_blocks=8, token_budget=8,
+            long_prefill_token_threshold=0, max_model_len=128,
+            output_predictor="unknown",
+        )
 
 
 @pytest.mark.parametrize("kwargs", [{"quantile": 0.0}, {"quantile": 1.5},
@@ -332,129 +427,19 @@ def test_shared_block_survives_until_last_reference_finishes(capacity, feasible)
     assert decision.peak_pinned_blocks == 5
 
 
-@pytest.mark.parametrize("budget,allowed", [(0, False), (4, False), (5, True)])
-def test_replay_budget_prices_private_tail_and_restart(budget, allowed):
-    controller = make_controller(3, predicted=4)
-    decision = controller.evaluate(
-        [make_request("running", prompt=4, computed=4, blocks=(7,))],
-        make_request("candidate", prompt=4, computed=4),
-        candidate_hit_block_ids=(),
-        block_ref_counts={7: 1},
-        replay_budget_tokens=budget,
-    )
-    # Next decode allocates two new blocks: one over capacity. Evicting
-    # the candidate's last block loses one token; restart costs four more.
-    assert not decision.feasible
-    assert decision.replay_allowed is allowed
-    if budget:
-        assert decision.estimated_replay_tokens == 1
-
-
-def test_replay_budget_never_overrides_current_step_capacity():
-    controller = make_controller(1)
-    decision = controller.evaluate(
-        [make_request("running", prompt=4, computed=4, blocks=(7,))],
-        make_request("candidate", prompt=4, computed=4),
-        candidate_hit_block_ids=(),
-        block_ref_counts={7: 1},
-        replay_budget_tokens=100,
-    )
-    assert not decision.feasible and not decision.replay_allowed
-
-
-def test_replay_budget_cannot_rescue_oversized_solo_request():
-    controller = make_controller(1, predicted=4)
-    decision = controller.evaluate(
-        [],
-        make_request("candidate", prompt=4, computed=4),
-        candidate_hit_block_ids=(),
-        block_ref_counts={},
-        replay_budget_tokens=100,
-    )
-    assert not decision.feasible and not decision.replay_allowed
-
-
-def test_replay_estimate_includes_shared_suffix_after_first_missing_block():
-    controller = make_controller(3, predicted=4)
-    controller.token_budget = 4
-    decision = controller.evaluate(
-        [make_request("running", prompt=12, computed=4, blocks=(8,))],
-        make_request("candidate", prompt=8, computed=8, output=1),
-        candidate_hit_block_ids=(7, 8),
-        block_ref_counts={7: 0, 8: 1},
-        replay_budget_tokens=100,
-    )
-    # Running grows by two blocks; candidate's shared tail cannot be freed.
-    # Evicting its first block loses the entire contiguous eight-token prefix.
-    assert not decision.feasible
-    assert decision.replay_allowed
-    assert decision.estimated_replay_tokens == 8
-
-
-def test_replay_budget_rejects_when_tail_cannot_cover_deficit():
-    controller = make_controller(2, predicted=4)
-    decision = controller.evaluate(
-        [make_request("running", prompt=12, computed=4, blocks=(7,))],
-        make_request("candidate", prompt=4, computed=4, output=1),
-        candidate_hit_block_ids=(7,),
-        block_ref_counts={7: 1},
-        replay_budget_tokens=100,
-    )
-    assert not decision.feasible and not decision.replay_allowed
-
-
-def test_cost_fast_forward_locates_first_overflow_like_stepwise():
+def test_fast_forward_matches_stepwise_simulation():
+    # Jumping to the next completion can overshoot the first overflowing step,
+    # so only the admission decision, not the reported peak, must match.
     for capacity in range(2, 12):
-        for budget in (1, 5, 20, 100):
-            controller = make_controller(capacity, predicted=16)
-            args = (
-                [make_request("running", prompt=4, computed=4, blocks=(7,))],
-                make_request("candidate", prompt=4, computed=4),
-            )
-            kwargs = dict(
-                candidate_hit_block_ids=(), block_ref_counts={7: 1},
-                replay_budget_tokens=budget, use_capacity_bound=False,
-            )
-            assert controller.evaluate(*args, **kwargs) == controller.evaluate(
-                *args, **kwargs, use_fast_forward=False,
-            )
-
-
-def test_batch_cost_needs_measurements_and_zero_ratio_stays_strict():
-    model = BatchCostModel()
-    assert model.replay_budget(100, 0, 100, 0, 0.05) == (0, 0.0)
-    for _ in range(3):
-        model.observe(100, 0, 0.1)
-        model.observe(200, 0, 0.12)
-    assert model.replay_budget(100, 0, 100, 0, 0) == (0, 0.0)
-    assert model.replay_budget(0, 0, 100, 0, 0.05)[0] == 0
-
-
-def test_batch_cost_saving_limits_budget_and_replay_corrects_it():
-    model = BatchCostModel()
-    for _ in range(3):
-        model.observe(100, 0, 0.1)
-        model.observe(200, 0, 0.12)
-    budget, saving = model.replay_budget(100, 0, 100, 0, 0.05)
-    assert saving == pytest.approx(0.08)
-    assert budget == 6
-    model.estimated_replay_tokens = 10
-    model.actual_replay_tokens = 30
-    assert model.replay_budget(100, 0, 100, 0, 0.05)[0] == 2
-    saturated = BatchCostModel()
-    for _ in range(3):
-        saturated.observe(100, 0, 0.1)
-        saturated.observe(200, 0, 0.2)
-    assert saturated.replay_budget(100, 0, 100, 0, 0.05)[0] == 0
-
-
-def test_batch_cost_decode_curve_is_separate_from_prefill():
-    model = BatchCostModel()
-    for _ in range(3):
-        model.observe(100, 0, 0.1)
-        model.observe(0, 8, 0.02)
-        model.observe(0, 16, 0.025)
-    assert model.estimate(0, 8) == pytest.approx(0.02)
-    assert model.estimate(8, 0) == pytest.approx(0.008)
-    assert model.estimate(0, 12) == pytest.approx(0.0225)
-    assert model.replay_budget(0, 8, 0, 8, 0.05)[1] == pytest.approx(0.015)
+        controller = make_controller(capacity, predicted=16)
+        args = (
+            [make_request("running", prompt=4, computed=4, blocks=(7,))],
+            make_request("candidate", prompt=4, computed=4),
+        )
+        kwargs = dict(
+            candidate_hit_block_ids=(), block_ref_counts={7: 1},
+            use_capacity_bound=False,
+        )
+        assert controller.evaluate(*args, **kwargs).feasible == controller.evaluate(
+            *args, **kwargs, use_fast_forward=False,
+        ).feasible

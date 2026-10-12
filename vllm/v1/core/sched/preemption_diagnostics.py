@@ -93,6 +93,7 @@ class PreemptionDiagnostics:
         self.pending = None
         self.pressure = None
         self.stream = None
+        self.unflushed = False
         try:
             Path(directory).mkdir(parents=True, exist_ok=True)
             filename = f"preemption-{os.getpid()}-{self.instance_id}.jsonl"
@@ -126,11 +127,13 @@ class PreemptionDiagnostics:
         self.cost["serialization_ns"] += time.perf_counter_ns() - start
         start = time.perf_counter_ns()
         self.stream.write(line)
+        self.unflushed = True
         self.cost["io_ns"] += time.perf_counter_ns() - start
 
     def flush(self):
         start = time.perf_counter_ns()
         self.stream.flush()
+        self.unflushed = False
         self.cost["io_ns"] += time.perf_counter_ns() - start
 
     @observed
@@ -162,8 +165,10 @@ class PreemptionDiagnostics:
     @observed
     def end_step(self):
         self.totals["scheduler_wall_ns"] += time.perf_counter_ns() - self.step_start
-        self.emit("step", totals=dict(self.totals), overhead=dict(self.cost))
-        self.flush()
+        # Running totals are written at cache resets and shutdown; flush only
+        # steps that wrote a record, so a hard kill loses nothing written.
+        if self.unflushed:
+            self.flush()
 
     @observed
     def add_request(self, request):
@@ -383,8 +388,8 @@ class PreemptionDiagnostics:
         if self.pending is not None and self.pending[0] == id(output):
             # Cancelled requests may have left the scheduler while the model ran.
             self.pending = None
-        self.emit("progress", totals=dict(self.totals))
-        self.flush()
+        if self.unflushed:
+            self.flush()
 
     def close_recovery(self, state, outcome):
         recovery = state["recovery"]

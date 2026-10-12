@@ -4,94 +4,37 @@
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_left, bisect_right, insort
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 
-class BatchCostModel:
-    """Small measured latency curves for prefill and decode batches."""
+class OutputLengthEstimator(Protocol):
+    """Causal output-length forecast fed by completed requests only."""
 
-    def __init__(self) -> None:
-        self.curves: dict[bool, dict[int, tuple[float, float, int]]] = {
-            False: {},
-            True: {},
-        }
-        self.prefill_seconds = 0.0
-        self.prefill_tokens = 0
-        self.estimated_replay_tokens = 0
-        self.actual_replay_tokens = 0
+    @property
+    def count(self) -> int: ...
 
-    def observe(self, prefill: int, decode: int, seconds: float) -> None:
-        tokens = prefill + decode
-        if tokens <= 0 or seconds <= 0:
-            return
-        curve = self.curves[prefill > 0]
-        bucket = tokens.bit_length()
-        old = curve.get(bucket)
-        if old is None:
-            curve[bucket] = (float(tokens), seconds, 1)
-        else:
-            x, y, count = old
-            curve[bucket] = (
-                0.8 * x + 0.2 * tokens,
-                0.8 * y + 0.2 * seconds,
-                count + 1,
-            )
-        if prefill:
-            self.prefill_seconds += seconds
-            self.prefill_tokens += prefill
+    def reset(self) -> None: ...
 
-    def estimate(self, prefill: int, decode: int) -> float | None:
-        tokens = prefill + decode
-        if tokens == 0:
-            return 0.0
-        points = sorted(
-            (x, y) for x, y, n in self.curves[prefill > 0].values() if n >= 3
-        )
-        if not points:
-            return None
-        index = bisect_left([x for x, _ in points], tokens)
-        if index == 0:
-            # Below observed sizes, do not invent an unmeasured launch cost.
-            x, y = points[0]
-            return y * tokens / x
-        if index == len(points):
-            x, y = points[-1]
-            return y * tokens / x
-        x0, y0 = points[index - 1]
-        x1, y1 = points[index]
-        return y0 + (y1 - y0) * (tokens - x0) / (x1 - x0)
+    def observe(self, output_tokens: int) -> None: ...
 
-    def replay_budget(
-        self,
-        base_prefill: int,
-        base_decode: int,
-        new_prefill: int,
-        new_decode: int,
-        ratio: float,
-    ) -> tuple[int, float]:
-        if ratio <= 0 or not self.prefill_tokens:
-            return 0, 0.0
-        base = self.estimate(base_prefill, base_decode)
-        solo = self.estimate(new_prefill, new_decode)
-        combined = self.estimate(
-            base_prefill + new_prefill, base_decode + new_decode
-        )
-        if base is None or solo is None or combined is None:
-            return 0, 0.0
-        saving = max(0.0, base + solo - combined)
-        seconds_per_token = self.prefill_seconds / self.prefill_tokens
-        correction = max(
-            1.0, self.actual_replay_tokens / max(1, self.estimated_replay_tokens)
-        )
-        budget = min(saving, ratio * solo) / (seconds_per_token * correction)
-        return int(budget), saving
+    def predict(self) -> int: ...
+
+    def target(self, observed_tokens: int) -> int: ...
 
 
 class CausalOutputLengthEstimator:
-    """Upper-quantile forecast from recent completed outputs only."""
+    """Upper-quantile forecast from recent completed outputs only.
+
+    Legacy predictor (``pkas_output_predictor="legacy"``), kept to reproduce
+    runs made before 2026-10-12. Its 512-token cold forecast, 32-sample
+    warm-up and 8-sample tail threshold are fixed choices without a
+    derivation; use ``QuantileOutputLengthEstimator`` for new experiments.
+    """
 
     def __init__(self, quantile: float = 0.9, history: int = 256) -> None:
         if not 0 < quantile <= 1:
@@ -135,6 +78,145 @@ class CausalOutputLengthEstimator:
         return observed_tokens + predicted
 
 
+class PaperOutputLengthEstimator:
+    """PKAS paper predictor (Eq. 1): ``ceil(|M1 - sqrt(M2 / (N - 1)))|``.
+
+    M1 and M2 are Welford's running mean and sum of squared deviations over
+    every completed output since the last reset. With at most one completion
+    the forecast is one token. A request that has already produced at least
+    the forecast is expected to produce one more token.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def reset(self) -> None:
+        self._count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def observe(self, output_tokens: int) -> None:
+        self._count += 1
+        delta = output_tokens - self.mean
+        self.mean += delta / self._count
+        self.m2 += delta * (output_tokens - self.mean)
+
+    def predict(self) -> int:
+        if self._count <= 1:
+            return 1
+        sample_stddev = math.sqrt(self.m2 / (self._count - 1))
+        # Every request produces at least one token.
+        return max(1, math.ceil(abs(self.mean - sample_stddev)))
+
+    def target(self, observed_tokens: int) -> int:
+        predicted = self.predict()
+        if observed_tokens < predicted:
+            return predicted
+        return observed_tokens + 1
+
+
+def min_quantile_samples(quantile: float, confidence: float) -> int:
+    """Fewest samples whose maximum bounds the ``quantile`` with ``confidence``.
+
+    All n i.i.d. samples fall below the true q-quantile with probability q**n,
+    so the sample maximum is a distribution-free upper confidence bound once
+    q**n <= 1 - confidence. Below this size no order statistic can bound the
+    quantile, and the empirical quantile is not used.
+    """
+    if not 0 < quantile < 1:
+        raise ValueError("quantile must be in (0, 1)")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be in (0, 1)")
+    return max(1, math.ceil(math.log(1 - confidence) / math.log(quantile)))
+
+
+class QuantileOutputLengthEstimator:
+    """Empirical quantile of completed outputs with derived sample-size rules.
+
+    ``history`` limits the samples to the most recent completions; 0 keeps
+    all of them. Until ``min_quantile_samples(quantile, confidence)`` requests
+    have completed there is no evidence for a forecast, and the paper's rule
+    applies: one more token. A request that outlives the forecast uses the
+    same quantile of the completed outputs longer than it when there are
+    enough of them, else the longest completed output, else one more token.
+    """
+
+    def __init__(
+        self, quantile: float = 0.5, history: int = 0, confidence: float = 0.95
+    ) -> None:
+        if history < 0:
+            raise ValueError("history must be nonnegative (0 keeps all outputs)")
+        self.quantile = quantile
+        self.confidence = confidence
+        self.max_history = history
+        self.min_samples = min_quantile_samples(quantile, confidence)
+        if history and history < self.min_samples:
+            raise ValueError(
+                f"history {history} cannot hold the {self.min_samples} samples "
+                "needed to bound this quantile"
+            )
+        self.history: deque[int] = deque()
+        self.sorted_lengths: list[int] = []
+
+    @property
+    def count(self) -> int:
+        return len(self.history)
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.sorted_lengths.clear()
+
+    def observe(self, output_tokens: int) -> None:
+        if self.max_history and len(self.history) == self.max_history:
+            oldest = self.history.popleft()
+            self.sorted_lengths.pop(bisect_left(self.sorted_lengths, oldest))
+        self.history.append(output_tokens)
+        insort(self.sorted_lengths, output_tokens)
+
+    def predict(self) -> int:
+        if self.count < self.min_samples:
+            return 1
+        return max(1, self.sorted_lengths[int(self.quantile * (self.count - 1))])
+
+    def target(self, observed_tokens: int) -> int:
+        predicted = self.predict()
+        if observed_tokens < predicted:
+            return predicted
+        if self.count < self.min_samples:
+            return observed_tokens + 1
+        first = bisect_right(self.sorted_lengths, observed_tokens)
+        longer = self.count - first
+        if longer >= self.min_samples:
+            return self.sorted_lengths[first + int(self.quantile * (longer - 1))]
+        if longer:
+            return self.sorted_lengths[-1]
+        return observed_tokens + 1
+
+
+def make_output_length_estimator(
+    predictor: str,
+    *,
+    quantile: float,
+    history: int | None,
+    confidence: float,
+) -> OutputLengthEstimator:
+    if predictor == "legacy":
+        return CausalOutputLengthEstimator(
+            quantile, 256 if history is None else history
+        )
+    if predictor == "paper":
+        return PaperOutputLengthEstimator()
+    if predictor == "quantile":
+        return QuantileOutputLengthEstimator(
+            quantile, 0 if history is None else history, confidence
+        )
+    raise ValueError(f"Unknown PKAS output predictor: {predictor}")
+
+
 @dataclass(frozen=True, slots=True)
 class RequestSnapshot:
     request_id: str
@@ -152,8 +234,6 @@ class AdmissionDecision:
     peak_pinned_blocks: int
     capacity_blocks: int
     peak_is_upper_bound: bool = False
-    replay_allowed: bool = False
-    estimated_replay_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -178,15 +258,22 @@ class PredictiveAdmissionController:
         token_budget: int,
         long_prefill_token_threshold: int,
         max_model_len: int,
+        output_predictor: str = "legacy",
         output_quantile: float = 0.9,
-        output_history: int = 256,
+        output_history: int | None = None,
+        output_confidence: float = 0.95,
     ) -> None:
         self.block_size = block_size
         self.capacity_blocks = capacity_blocks
         self.token_budget = token_budget
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.max_model_len = max_model_len
-        self.estimator = CausalOutputLengthEstimator(output_quantile, output_history)
+        self.estimator: OutputLengthEstimator = make_output_length_estimator(
+            output_predictor,
+            quantile=output_quantile,
+            history=output_history,
+            confidence=output_confidence,
+        )
 
     def reset_history(self) -> None:
         self.estimator.reset()
@@ -204,7 +291,6 @@ class PredictiveAdmissionController:
         initial_pinned_blocks: int | None = None,
         use_capacity_bound: bool = True,
         use_fast_forward: bool = True,
-        replay_budget_tokens: int = 0,
     ) -> AdmissionDecision:
         predicted = self.estimator.predict()
         # Keep the scheduler snapshot immutable and record only reference
@@ -306,43 +392,8 @@ class PredictiveAdmissionController:
             live_blocks -= request.synthetic_blocks
 
         def overflow_decision() -> AdmissionDecision:
-            replay_tokens = 0
-            allowed = False
-            # LPM preempts the newest (tail) request and frees its blocks in
-            # reverse order. Price the prefix lost if the deficit consumes
-            # those newly evictable blocks before the candidate resumes.
-            if replay_budget_tokens > 0 and len(virtual) > 1:
-                deficit = live_blocks - self.capacity_blocks
-                victim = candidate_virtual
-                for index in range(victim.allocated_blocks - 1, -1, -1):
-                    if index < len(victim.real_block_ids):
-                        block_id = victim.real_block_ids[index]
-                        refs = block_ref_counts.get(block_id, 0) + ref_deltas.get(
-                            block_id, 0
-                        )
-                        if refs > 1:
-                            continue
-                    deficit -= 1
-                    if deficit == 0:
-                        # An incomplete tail block is not a reusable cache hit.
-                        prefix = min(
-                            index * self.block_size,
-                            victim.progress // self.block_size * self.block_size,
-                        )
-                        replay_tokens = max(0, victim.progress - prefix)
-                        # One block-equivalent charges for restarting a victim.
-                        allowed = (
-                            replay_tokens + self.block_size <= replay_budget_tokens
-                        )
-                        break
             return AdmissionDecision(
-                False,
-                predicted,
-                prefix_hit_count,
-                peak,
-                self.capacity_blocks,
-                replay_allowed=allowed,
-                estimated_replay_tokens=replay_tokens,
+                False, predicted, prefix_hit_count, peak, self.capacity_blocks
             )
 
         while True:
@@ -367,26 +418,6 @@ class PredictiveAdmissionController:
                 and all(request.progress >= request.prefill_end for request in virtual)
             ):
                 jump = min(request.target - request.progress for request in virtual)
-                if replay_budget_tokens > 0:
-                    def growth(steps: int) -> int:
-                        return sum(
-                            max(
-                                0,
-                                (request.progress + steps + self.block_size - 1)
-                                // self.block_size - request.allocated_blocks,
-                            )
-                            for request in virtual
-                        )
-
-                    if live_blocks + growth(jump) > self.capacity_blocks:
-                        low, high = 1, jump
-                        while low < high:
-                            middle = (low + high) // 2
-                            if live_blocks + growth(middle) > self.capacity_blocks:
-                                high = middle
-                            else:
-                                low = middle + 1
-                        jump = low
                 for request in virtual:
                     request.progress += jump
                     allocate_to_progress(request, request.progress)

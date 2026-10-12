@@ -98,8 +98,9 @@ plus episode ID identifies an episode; instance ID, request ID, and ordinal
 identify an interruption. The schema is version 1 and includes monotonic record
 timestamps and scheduler step IDs. Monotonic timestamps should only be subtracted
 within an instance. Episode records are emitted on closure, recovery records on
-request departure, another preemption, invalidation, or shutdown. Step/progress
-records carry cumulative totals, allowing partial-run accounting.
+request departure, another preemption, invalidation, or shutdown. Cache-reset and
+shutdown records carry cumulative totals; there are no per-step records, and a
+step's records are flushed only when it wrote one.
 
 A malformed unterminated final record is reported and skipped. Malformed records
 elsewhere, unsupported schemas, and missing record envelopes raise visible

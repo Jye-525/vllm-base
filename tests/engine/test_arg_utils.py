@@ -648,49 +648,12 @@ def test_expand_json_human_readable_numbers(input_json, expected_json):
     assert _expand_json_human_readable_numbers(input_json) == expected_json
 
 
-def test_pkas_candidate_skip_cli():
+def test_removed_pkas_feature_flags_are_rejected():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    default = EngineArgs.from_cli_args(
-        parser.parse_args(["--policy-profile", "kvreuse"])
-    )
-    assert default.pkas_max_candidate_skips == 0
-    plain = EngineArgs.from_cli_args(parser.parse_args([]))
-    assert plain.pkas_max_candidate_skips == 8
-    disabled = EngineArgs.from_cli_args(
-        parser.parse_args(
-            [
-                "--policy-profile",
-                "kvreuse",
-                "--pkas-max-candidate-skips",
-                "0",
-            ]
-        )
-    )
-    assert disabled.pkas_max_candidate_skips == 0
-
-
-def test_pkas_replay_ratio_cli():
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    default = EngineArgs.from_cli_args(
-        parser.parse_args(["--policy-profile", "kvreuse"])
-    )
-    assert default.pkas_max_replay_ratio == 0
-    cost = EngineArgs.from_cli_args(parser.parse_args([
-        "--policy-profile", "kvreuse", "--pkas-max-replay-ratio", "0.05",
-    ]))
-    assert cost.pkas_max_replay_ratio == 0.05
-
-
-def test_pkas_batch_cost_cli():
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    default = EngineArgs.from_cli_args(parser.parse_args([]))
-    assert not default.pkas_batch_cost
-    batch = EngineArgs.from_cli_args(parser.parse_args([
-        "--policy-profile", "kvreuse", "--pkas-max-replay-ratio", "0.05",
-        "--pkas-batch-cost",
-    ]))
-    assert batch.pkas_batch_cost
-    assert batch.pkas_max_replay_ratio == 0.05
+    for flags in (["--pkas-max-candidate-skips", "8"],
+                  ["--pkas-max-replay-ratio", "0.05"], ["--pkas-batch-cost"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--policy-profile", "kvreuse", *flags])
 
 
 def test_pkas_output_estimator_and_reject_cache_cli():
@@ -698,20 +661,24 @@ def test_pkas_output_estimator_and_reject_cache_cli():
     default = EngineArgs.from_cli_args(
         parser.parse_args(["--policy-profile", "kvreuse"])
     )
+    assert default.pkas_output_predictor == "legacy"
     assert default.pkas_output_quantile == 0.9
-    assert default.pkas_output_history == 256
+    assert default.pkas_output_history is None
+    assert default.pkas_output_confidence == 0.95
     assert default.pkas_reject_cache_steps == 16
     tuned = EngineArgs.from_cli_args(parser.parse_args([
         "--policy-profile", "kvreuse",
         "--pkas-output-quantile", "0.5",
         "--pkas-output-history", "64",
         "--pkas-reject-cache-steps", "0",
-        "--pkas-max-candidate-skips", "8",
+        "--pkas-output-predictor", "quantile",
+        "--pkas-output-confidence", "0.9",
     ]))
+    assert tuned.pkas_output_predictor == "quantile"
+    assert tuned.pkas_output_confidence == 0.9
     assert tuned.pkas_output_quantile == 0.5
     assert tuned.pkas_output_history == 64
     assert tuned.pkas_reject_cache_steps == 0
-    assert tuned.pkas_max_candidate_skips == 8
 
 
 def test_full_isl_reservation_default_follows_admission_policy():

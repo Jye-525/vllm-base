@@ -195,6 +195,9 @@ class BlockPool:
         # None (the default) records nothing; the scheduler turns it on only
         # while re-ranking waiting requests per admission.
         self._eviction_log: list[BlockHash] | None = None
+        # Cached blocks whose hash was dropped to reuse them (cumulative); the
+        # scheduler logs the per-step difference.
+        self.num_evicted_cached_blocks = 0
 
         # Peek eviction uses waiting-queue-aware victim selection; LRU uses
         # stock popleft_n. The scheduler configures this at startup.
@@ -717,7 +720,7 @@ class BlockPool:
         self._trace_eviction_selection(num_blocks, victims, walked=walked)
 
         elapsed_us = (time.perf_counter() - t0) * 1e6
-        logger.info(
+        logger.debug(
             "peek_eviction: %.1f us | requested=%d walked=%d cap=%d "
             "demanded_seen=%d free_remaining=%d protected=%d hits=%d "
             "publishes=%d",
@@ -770,6 +773,7 @@ class BlockPool:
             if self._eviction_log is not None:
                 self._eviction_log.append(raw_hash)
 
+        self.num_evicted_cached_blocks += 1
         block.reset_hash()
 
         # Orphan tracking disabled for demand-aware eviction. Historical

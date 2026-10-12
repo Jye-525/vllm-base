@@ -47,7 +47,6 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.predictive_admission import (
-    BatchCostModel,
     PredictiveAdmissionController,
     RequestSnapshot,
 )
@@ -343,17 +342,14 @@ class Scheduler(SchedulerInterface):
             str, tuple[Sequence[KVCacheBlock], tuple[int, ...]]
         ] = {}
         self._pkas_ref_counts = _BlockRefCounts(block_pool.blocks)
-        self._pkas_bypass_counts: dict[str, int] = {}
         self._pkas_step_stats: dict[str, int] | None = None
-        self._pkas_batch_cost = (
-            BatchCostModel() if self.scheduler_config.pkas_batch_cost else None
-        )
-        self._pkas_recovery_started: dict[str, float] = {}
         self._pkas_last_gate_target: dict[str, int] = {}
+        # Scheduler step number; every scheduler log line carries it.
+        self._step_id = 0
+        self._step_evicted_blocks_start = 0
         # Rejections are reused until an admission, completion, or preemption
         # changes the epoch, or until the step-based expiry lets waiting time
         # (running requests nearing completion) change the outcome.
-        self._pkas_step = 0
         self._pkas_epoch = 0
         self._pkas_reject_cache: dict[str, tuple[int, int]] = {}
         if self.scheduler_config.admission_policy == "pkas":
@@ -385,11 +381,10 @@ class Scheduler(SchedulerInterface):
                 or groups[0].kv_cache_spec.attention_chunk_size is not None
             ):
                 unsupported.append("hybrid_or_non_full_attention")
-            if (
-                self.scheduler_config.pkas_max_replay_ratio > 0
-                and self.scheduler_config.kv_cache_eviction_policy != "lru"
-            ):
-                unsupported.append("replay_cost_requires_lru")
+            if self.scheduler_reserve_full_isl:
+                # PKAS's own simulation reserves the prompt and predicted
+                # decode, counting KV that running requests free first.
+                unsupported.append("full_isl_admission")
             if unsupported:
                 raise ValueError(
                     "PKAS predictive admission does not support: "
@@ -403,8 +398,10 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold=(
                     self.scheduler_config.long_prefill_token_threshold
                 ),
+                output_predictor=self.scheduler_config.pkas_output_predictor,
                 output_quantile=self.scheduler_config.pkas_output_quantile,
                 output_history=self.scheduler_config.pkas_output_history,
+                output_confidence=self.scheduler_config.pkas_output_confidence,
             )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -883,12 +880,7 @@ class Scheduler(SchedulerInterface):
 
         blocks = request_blocks.blocks[0]
         block_ids = self._predictive_block_ids(request.request_id, blocks)
-        pinned_blocks = self._predictive_pinned_blocks()
-        if self._pkas_step_stats is not None:
-            self._pkas_step_stats["admitted_pinned_blocks"] += (
-                pinned_blocks - state.pinned_block_count
-            )
-        state.pinned_block_count = pinned_blocks
+        state.pinned_block_count = self._predictive_pinned_blocks()
         state.running.append(
             RequestSnapshot(
                 request_id=request.request_id,
@@ -906,7 +898,6 @@ class Scheduler(SchedulerInterface):
         computed_blocks: KVCacheBlocks,
         num_computed_tokens: int,
         num_new_tokens: int,
-        scheduled_tokens: Mapping[str, int] | None = None,
     ) -> bool:
         controller = self.predictive_admission
         if controller is None:
@@ -917,7 +908,7 @@ class Scheduler(SchedulerInterface):
         cached = self._pkas_reject_cache.get(request.request_id)
         if cached is not None:
             epoch, expires = cached
-            if epoch == self._pkas_epoch and self._pkas_step <= expires:
+            if epoch == self._pkas_epoch and self._step_id <= expires:
                 self._pkas_step_stats["cached_rejections"] += 1
                 self._pkas_step_stats["rejections"] += 1
                 return False
@@ -926,36 +917,6 @@ class Scheduler(SchedulerInterface):
         hit_blocks = computed_blocks.blocks[0]
         hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
         start_ns = time.perf_counter_ns()
-        ratio = self.scheduler_config.pkas_max_replay_ratio
-        replay_budget = int(ratio * (num_new_tokens + min(
-            num_computed_tokens,
-            self._preemption_recovery_high.get(request.request_id, 0),
-        )))
-        if self._pkas_batch_cost is not None:
-            base_prefill = base_decode = 0
-            for rid, tokens in (scheduled_tokens or {}).items():
-                active = self.requests[rid]
-                prefill = min(tokens, max(
-                    0, max(active.num_prompt_tokens, active.num_tokens - 1)
-                    - active.num_computed_tokens
-                ))
-                base_prefill += prefill
-                base_decode += tokens - prefill
-            new_prefill = min(num_new_tokens, max(
-                0, max(request.num_prompt_tokens, request.num_tokens - 1)
-                - num_computed_tokens
-            ))
-            replay_budget, saving = self._pkas_batch_cost.replay_budget(
-                base_prefill, base_decode, new_prefill,
-                num_new_tokens - new_prefill, ratio,
-            )
-            # Do not add another speculative victim while recovery is pending.
-            if (self._preemption_recovery_high
-                    and request.request_id not in self._preemption_recovery_high):
-                replay_budget = 0
-            assert self._pkas_step_stats is not None
-            self._pkas_step_stats["batch_budget_tokens"] += replay_budget
-            self._pkas_step_stats["batch_saving_ns"] += int(saving * 1e9)
         decision = controller.evaluate(
             state.running,
             RequestSnapshot(
@@ -968,34 +929,23 @@ class Scheduler(SchedulerInterface):
             candidate_hit_block_ids=hit_ids,
             block_ref_counts=state.block_ref_counts,
             initial_pinned_blocks=state.pinned_block_count,
-            replay_budget_tokens=replay_budget,
         )
-        assert self._pkas_step_stats is not None
         stats = self._pkas_step_stats
         stats["evaluate_ns"] += time.perf_counter_ns() - start_ns
         stats["evaluations"] += 1
         stats["bound_accepts"] += int(decision.peak_is_upper_bound)
         stats["simulations"] += int(not decision.peak_is_upper_bound)
-        allowed = decision.feasible or decision.replay_allowed
-        stats["rejections"] += int(not allowed)
+        stats["rejections"] += int(not decision.feasible)
         cache_steps = self.scheduler_config.pkas_reject_cache_steps
-        if not allowed and cache_steps > 0:
+        if not decision.feasible and cache_steps > 0:
             self._pkas_reject_cache[request.request_id] = (
                 self._pkas_epoch,
-                self._pkas_step + cache_steps,
+                self._step_id + cache_steps,
             )
-        stats["cost_accepts"] += int(decision.replay_allowed)
-        if decision.replay_allowed:
-            stats["estimated_replay_tokens"] += decision.estimated_replay_tokens
-            if self._pkas_batch_cost is not None:
-                self._pkas_batch_cost.estimated_replay_tokens += (
-                    decision.estimated_replay_tokens
-                )
         logger.debug(
             "predictive_admission: request_id=%s feasible=%s "
             "predicted_output_tokens=%d prefix_hit_blocks=%d "
-            "peak_pinned_blocks=%d capacity_blocks=%d peak_is_upper_bound=%s "
-            "replay_allowed=%s estimated_replay_tokens=%d",
+            "peak_pinned_blocks=%d capacity_blocks=%d peak_is_upper_bound=%s",
             request.request_id,
             decision.feasible,
             decision.predicted_output_tokens,
@@ -1003,59 +953,42 @@ class Scheduler(SchedulerInterface):
             decision.peak_pinned_blocks,
             decision.capacity_blocks,
             decision.peak_is_upper_bound,
-            decision.replay_allowed,
-            decision.estimated_replay_tokens,
         )
-        if allowed:
-            target = controller.estimator.target(request.num_output_tokens)
-            self._pkas_last_gate_target[request.request_id] = target
-            logger.info(
-                "pkas_gate_allow: request_id=%s observed_output_tokens=%d "
-                "target_output_tokens=%d completed_samples=%d "
-                "peak_pinned_blocks=%d capacity_blocks=%d",
-                request.request_id,
-                request.num_output_tokens,
-                target,
-                controller.estimator.count,
-                decision.peak_pinned_blocks,
-                decision.capacity_blocks,
+        if decision.feasible:
+            # Reported on the request's admitted_prefix_cache line, and on
+            # its preempted line if PKAS's forecast turns out short.
+            self._pkas_last_gate_target[request.request_id] = (
+                controller.estimator.target(request.num_output_tokens)
             )
-        return allowed
+        return decision.feasible
 
     def schedule(self) -> SchedulerOutput:
         if self._pending_batch_logs:
             # Overlapping execution cannot use the synchronous accounting path.
             self._preemption_cost_supported = False
-            for args, _ in self._pending_batch_logs.values():
-                self._log_schedule_batch(args[:-1] + (-1,), -1)
+            for record, _ in self._pending_batch_logs.values():
+                record["preempted_tokens"] = -1
+                self._log_schedule_batch(record, -1)
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
-        self._pkas_step += 1
+        self._step_id += 1
+        self._step_evicted_blocks_start = (
+            self.kv_cache_manager.block_pool.num_evicted_cached_blocks
+        )
         self._pkas_step_stats = (
             dict.fromkeys(
                 (
                     "evaluations",
+                    "rejections",
                     "cached_rejections",
                     "bound_accepts",
-                    "cost_accepts",
-                    "estimated_replay_tokens",
-                    "recovery_stops",
-                    "admitted_pinned_blocks",
-                    "batch_budget_tokens",
-                    "batch_saving_ns",
-                    "execution_ns",
-                    "recovery_wait_ns",
                     "simulations",
-                    "rejections",
-                    "skipped",
-                    "admitted_after_skip",
-                    "fairness_stops",
+                    "recovery_stops",
+                    "blocked_budget",
                     "snapshot_ns",
                     "evaluate_ns",
-                    "blocked_budget",
-                    "isl_rejections",
                 ),
                 0,
             )
@@ -1294,9 +1227,6 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         prefix_rank_plan: RankPlan | None = None
-        pkas_skipped: list[Request] = []
-        pkas_bypassed_ids: set[str] = set()
-        pkas_scan_ids: set[str] = set()
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -1308,13 +1238,6 @@ class Scheduler(SchedulerInterface):
             rank_start_ns = time.perf_counter_ns()
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
-            if self.predictive_admission is not None:
-                threshold = self.scheduler_config.lpm_fallback_threshold
-                if not threshold or len(self.waiting) <= threshold:
-                    window = self.scheduler_config.lpm_window_size or len(self.waiting)
-                    pkas_scan_ids = {
-                        req.request_id for req in self.waiting.iter_first_n(window)
-                    }
             predictive_admission_state = None
             if (
                 (self.waiting or self.skipped_waiting)
@@ -1340,9 +1263,6 @@ class Scheduler(SchedulerInterface):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
-                if pkas_skipped and request.request_id not in pkas_scan_ids:
-                    self._pkas_step_stats["blocked_budget"] = token_budget
-                    break
 
                 request_id = request.request_id
 
@@ -1506,11 +1426,9 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                # Full-ISL admission check (upstream scheduler_reserve_full_isl;
-                # off by default under PKAS). It is cheap and a necessary
-                # condition, so run it before the PKAS gate: infeasible requests
-                # never reach the PKAS simulation or count as PKAS accepts.
-                isl_rejected = False
+                # Full-ISL admission check (upstream scheduler_reserve_full_isl).
+                # PKAS rejects this setting: its simulation already reserves
+                # the rest of the prompt and the predicted decode.
                 if self.scheduler_reserve_full_isl:
                     fits, required_blocks, free_blocks = (
                         self.kv_cache_manager.full_sequence_fits(
@@ -1526,24 +1444,17 @@ class Scheduler(SchedulerInterface):
                             diagnostics.admission_failed(
                                 request_id, required_blocks, free_blocks
                             )
-                        if self.predictive_admission is None:
-                            # Upstream behaviour: stop admitting this step.
-                            if request.has_encoder_inputs:
-                                self.encoder_cache_manager.free(request)
-                            break
-                        assert self._pkas_step_stats is not None
-                        self._pkas_step_stats["isl_rejections"] += 1
-                        isl_rejected = True
+                        # Upstream behaviour: stop admitting this step.
+                        if request.has_encoder_inputs:
+                            self.encoder_cache_manager.free(request)
+                        break
 
-                # Under PKAS, a full-ISL rejection takes the same path as a
-                # PKAS rejection (recovery stop, fairness cap, candidate skip).
-                if isl_rejected or not self._predictive_admission_allows(
+                if not self._predictive_admission_allows(
                     predictive_admission_state,
                     request,
                     new_computed_blocks,
                     num_computed_tokens,
                     num_new_tokens,
-                    num_scheduled_tokens,
                 ):
                     # Release encoder-cache references taken while checking
                     # this request, as the allocation-failure path does.
@@ -1551,26 +1462,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     stats = self._pkas_step_stats
                     assert stats is not None
-                    if (
-                        request.num_preemptions > 0
-                        and num_computed_tokens > 0
-                    ):
-                        # Bypassing recovery can evict the prefix that made
-                        # the predicted preemption cheap in the first place.
+                    if request.num_preemptions > 0 and num_computed_tokens > 0:
+                        # A preempted request is waiting to resume and PKAS
+                        # refused it: admission stops behind it.
                         stats["recovery_stops"] += 1
-                        stats["blocked_budget"] = token_budget
-                        break
-                    bypass_count = self._pkas_bypass_counts.get(request.request_id, 0)
-                    if bypass_count >= 8:
-                        stats["fairness_stops"] += 1
-                    elif (
-                        request.request_id in pkas_scan_ids
-                        and len(pkas_skipped)
-                        < self.scheduler_config.pkas_max_candidate_skips
-                    ):
-                        pkas_skipped.append(request_queue.pop_request())
-                        stats["skipped"] += 1
-                        continue
                     stats["blocked_budget"] = token_budget
                     break
 
@@ -1630,12 +1525,8 @@ class Scheduler(SchedulerInterface):
                 # Remove the request only after allocation succeeds. Prefix
                 # policies have already reordered the bounded queue prefix.
                 request = request_queue.pop_request()
-                self._pkas_bypass_counts.pop(request.request_id, None)
                 self._pkas_reject_cache.pop(request.request_id, None)
                 self._pkas_epoch += 1
-                if pkas_skipped:
-                    self._pkas_step_stats["admitted_after_skip"] += 1
-                    pkas_bypassed_ids.update(req.request_id for req in pkas_skipped)
                 self._untrack_waiting_request(request)
                 if self._rank_per_admission:
                     rerank_pending = (
@@ -1645,13 +1536,6 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens + num_new_tokens,
                         )
                         or rerank_pending
-                    )
-                recovery_start = self._pkas_recovery_started.pop(
-                    request.request_id, None
-                )
-                if recovery_start is not None and self._pkas_step_stats is not None:
-                    self._pkas_step_stats["recovery_wait_ns"] += int(
-                        (time.perf_counter() - recovery_start) * 1e9
                     )
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -1682,33 +1566,22 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_local_computed_tokens,
                 )
-                block_size = self.kv_cache_manager.block_pool.hash_block_size
-                local_hit_blocks = num_new_local_computed_tokens // block_size
-                prompt_blocks = len(request.block_hashes)
-                first_missing_block = (
-                    local_hit_blocks if local_hit_blocks < prompt_blocks else -1
-                )
+                # A resumed request (prompt_tokens includes its output so far)
+                # appears again; its first line is the original admission.
+                pkas_target = self._pkas_last_gate_target.get(request.request_id)
                 logger.info(
-                    "admitted_prefix_cache: policy=%s request_id=%s "
-                    "prompt_tokens=%d prompt_blocks=%d "
-                    "local_hit_tokens=%d local_hit_blocks=%d "
-                    "hit_rate=%.6f first_missing_block=%d "
-                    "num_new_tokens=%d waiting_after_pop=%d running=%d",
-                    self._eviction_policy,
+                    "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
+                    "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
+                    "running=%d%s",
+                    self._step_id,
                     request.request_id,
                     request.num_tokens,
-                    prompt_blocks,
                     num_new_local_computed_tokens,
-                    local_hit_blocks,
-                    (
-                        num_new_local_computed_tokens / request.num_tokens
-                        if request.num_tokens > 0
-                        else 0.0
-                    ),
-                    first_missing_block,
                     num_new_tokens,
                     len(self.waiting),
                     len(self.running),
+                    "" if pkas_target is None
+                    else f" pkas_target_output_tokens={pkas_target}",
                 )
 
                 self.running.append(request)
@@ -1765,21 +1638,6 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
-        if (
-            pkas_skipped
-            and not self.waiting
-            and len(self.running) < self.max_num_running_reqs
-        ):
-            self._pkas_step_stats["blocked_budget"] = token_budget
-        # PKAS-skipped candidates came from the self.waiting scan window;
-        # restore them at its head in their original order.
-        for request in reversed(pkas_skipped):
-            self.waiting.prepend_request(request)
-        for request_id in pkas_bypassed_ids:
-            self._pkas_bypass_counts[request_id] = (
-                self._pkas_bypass_counts.get(request_id, 0) + 1
-            )
-
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -1793,34 +1651,39 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs
         ) <= len(self.running)
 
-        prefill_tokens = 0
-        decode_tokens = 0
-        for req_id, num_tokens in num_scheduled_tokens.items():
-            request = self.requests[req_id]
-            remaining_prompt_tokens = max(
-                request.num_prompt_tokens - request.num_computed_tokens, 0
-            )
-            req_prefill_tokens = min(num_tokens, remaining_prompt_tokens)
-            prefill_tokens += req_prefill_tokens
-            decode_tokens += num_tokens - req_prefill_tokens
-
-        batch_log_args = (
-            self._eviction_policy,
-            len(num_scheduled_tokens),
-            len(scheduled_new_reqs),
-            len(scheduled_resumed_reqs),
-            len(scheduled_running_reqs),
-            len(preempted_reqs),
-            len(self.waiting),
-            len(self.running),
-            total_num_scheduled_tokens,
-            self.max_num_scheduled_tokens,
-            prefill_tokens,
-            decode_tokens,
-            self._step_rank_ns,
-            self._step_rerank_count,
-            self._pkas_step_stats,
-            self._step_preempted_tokens,
+        prefill_tokens, decode_tokens, prefill_attention, decode_context = (
+            self._execution_work({
+                rid: (
+                    self.requests[rid].num_computed_tokens,
+                    self.requests[rid].num_computed_tokens + n,
+                    0,
+                )
+                for rid, n in num_scheduled_tokens.items()
+            })
+        )
+        # One schedule_batch line per step, written once the batch has run
+        # (see _complete_batch_log); fields are in the order written.
+        batch_record: dict[str, Any] = dict(
+            step=self._step_id,
+            new=len(scheduled_new_reqs),
+            resumed=len(scheduled_resumed_reqs),
+            running=len(scheduled_running_reqs),
+            preempted=len(preempted_reqs),
+            waiting_after=len(self.waiting),
+            running_after=len(self.running),
+            token_budget_used=total_num_scheduled_tokens,
+            prefill_tokens=prefill_tokens,
+            decode_tokens=decode_tokens,
+            prefill_attention=prefill_attention,
+            decode_context=decode_context,
+            rank_ns=self._step_rank_ns,
+            reranks=self._step_rerank_count,
+            preempted_tokens=self._step_preempted_tokens,
+            evicted_blocks=(
+                self.kv_cache_manager.block_pool.num_evicted_cached_blocks
+                - self._step_evicted_blocks_start
+            ),
+            pkas=self._pkas_step_stats,
         )
 
         # Get the longest common prefix among all requests in the running queue.
@@ -1921,11 +1784,11 @@ class Scheduler(SchedulerInterface):
                 )
                 for rid, n in num_scheduled_tokens.items()
             }
-            self._pending_batch_logs[id(scheduler_output)] = (batch_log_args, intervals)
+            self._pending_batch_logs[id(scheduler_output)] = (batch_record, intervals)
         else:
             if not cost_supported:
-                batch_log_args = batch_log_args[:-1] + (-1,)
-            self._log_schedule_batch(batch_log_args, 0 if cost_supported else -1)
+                batch_record["preempted_tokens"] = -1
+            self._log_schedule_batch(batch_record, 0 if cost_supported else -1)
 
         if diagnostics is not None:
             diagnostics.scheduled(scheduler_output, self.requests)
@@ -1943,49 +1806,26 @@ class Scheduler(SchedulerInterface):
         return connector.build_connector_meta(scheduler_output)
 
     @staticmethod
-    def _log_schedule_batch(args: tuple[Any, ...], recomputed_tokens: int) -> None:
+    def _log_schedule_batch(record: dict[str, Any], recomputed_tokens: int) -> None:
+        """Write one step: counters, -1 when unavailable; PKAS counters only
+        when non-zero, and execution_ns only when the batch was timed."""
+        pkas = record["pkas"] or {}
+        fields = " ".join(
+            f"{key}={value}" for key, value in record.items() if key != "pkas"
+        )
         logger.info(
-            "schedule_batch: policy=%s scheduled=%d new=%d resumed=%d "
-            "running=%d preempted=%d waiting_after=%d running_after=%d "
-            "token_budget_used=%d token_budget_max=%d "
-            "prefill_tokens=%d decode_tokens=%d rank_ns=%d reranks=%d "
-            "preempted_tokens=%d recomputed_tokens=%d%s",
-            *args[:-2],
-            args[-1],
+            "schedule_batch: %s recomputed_tokens=%d%s",
+            fields,
             recomputed_tokens,
-            "".join(f" pkas_{key}={value}" for key, value in (args[-2] or {}).items()),
+            "".join(f" pkas_{key}={value}" for key, value in pkas.items() if value),
         )
 
     def observe_batch_execution(
         self, scheduler_output: SchedulerOutput, seconds: float
     ) -> None:
         pending = self._pending_batch_logs.get(id(scheduler_output))
-        if pending is None:
-            return
-        args, intervals = pending
-        work = self._execution_work(intervals)
-        logger.info(
-            "batch_execution: scheduled=%d prefill_tokens=%d decode_tokens=%d "
-            "execution_ns=%d exec_prefill_tokens=%d exec_decode_tokens=%d "
-            "prefill_attention=%d decode_context=%d",
-            args[1], args[10], args[11], int(seconds * 1e9), *work,
-        )
-        stats = args[-2]
-        if stats is not None:
-            stats["execution_ns"] = int(seconds * 1e9)
-        if self._pkas_batch_cost is not None:
-            prefill = decode = 0
-            for rid, (start, end, _) in intervals.items():
-                # Original prompt and replayed output both execute as prefill.
-                request = self.requests.get(rid)
-                if request is None:
-                    return
-                n = min(end - start, max(
-                    0, max(request.num_prompt_tokens, request.num_tokens - 1) - start
-                ))
-                prefill += n
-                decode += end - start - n
-            self._pkas_batch_cost.observe(prefill, decode, seconds)
+        if pending is not None:
+            pending[0]["execution_ns"] = int(seconds * 1e9)
 
     def _execution_work(
         self, intervals: dict[str, tuple[int, int, int]]
@@ -2029,8 +1869,6 @@ class Scheduler(SchedulerInterface):
                 )
                 if end >= recovery_high:
                     self._preemption_recovery_high.pop(rid, None)
-        if self._pkas_batch_cost is not None:
-            self._pkas_batch_cost.actual_replay_tokens += recomputed_tokens
         self._log_schedule_batch(args, recomputed_tokens)
 
     def _preempt_request(
@@ -2045,22 +1883,8 @@ class Scheduler(SchedulerInterface):
             "Only running requests can be preempted"
         )
         diagnostics = self.preemption_diagnostics
-        if diagnostics is not None:
-            free_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        free_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if reason == "memory_pressure":
-            if self.predictive_admission is not None:
-                self._pkas_recovery_started[request.request_id] = time.perf_counter()
-                estimator = self.predictive_admission.estimator
-                logger.info(
-                    "pkas_preemption: request_id=%s output_tokens=%d "
-                    "last_gate_target_output_tokens=%d "
-                    "current_target_output_tokens=%d preemptions=%d",
-                    request.request_id,
-                    request.num_output_tokens,
-                    self._pkas_last_gate_target.get(request.request_id, -1),
-                    estimator.target(request.num_output_tokens),
-                    request.num_preemptions + 1,
-                )
             if (
                 self._preemption_cost_supported
                 and not request.resumable
@@ -2087,6 +1911,29 @@ class Scheduler(SchedulerInterface):
             else None
         )
         self.kv_cache_manager.free(request)
+        free_after = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        # Its next admitted_prefix_cache line (same request_id) is the resume.
+        pkas = ""
+        if self.predictive_admission is not None:
+            pkas = (
+                " pkas_gate_target_output_tokens="
+                f"{self._pkas_last_gate_target.get(request.request_id, -1)}"
+                " pkas_current_target_output_tokens="
+                f"{self.predictive_admission.estimator.target(request.num_output_tokens)}"
+            )
+        logger.info(
+            "preempted: step=%d request_id=%s reason=%s computed_tokens=%d "
+            "prompt_tokens=%d output_tokens=%d released_blocks=%d preemptions=%d%s",
+            self._step_id,
+            request.request_id,
+            reason,
+            request.num_computed_tokens,
+            request.num_prompt_tokens,
+            request.num_output_tokens,
+            free_after - free_before,
+            request.num_preemptions + 1,
+            pkas,
+        )
         if survival is not None:
             survival.preempted(request, victim)
         self.encoder_cache_manager.free(request)
@@ -2102,12 +1949,7 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
         self._track_waiting_request(request)
         if diagnostics is not None:
-            diagnostics.preempt(
-                request,
-                free_before,
-                self.kv_cache_manager.block_pool.get_num_free_blocks(),
-                reason,
-            )
+            diagnostics.preempt(request, free_before, free_after, reason)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -3048,8 +2890,6 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
         self._pkas_block_ids.pop(request.request_id, None)
-        self._pkas_bypass_counts.pop(request.request_id, None)
-        self._pkas_recovery_started.pop(request.request_id, None)
         self._pkas_last_gate_target.pop(request.request_id, None)
         self._pkas_reject_cache.pop(request.request_id, None)
         self._pkas_epoch += 1
@@ -3253,8 +3093,8 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        for args, _ in self._pending_batch_logs.values():
-            self._log_schedule_batch(args, -1)
+        for record, _ in self._pending_batch_logs.values():
+            self._log_schedule_batch(record, -1)
         self._pending_batch_logs.clear()
         if self.preemption_diagnostics is not None:
             self.preemption_diagnostics.shutdown()
