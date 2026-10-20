@@ -469,9 +469,14 @@ def test_prefix_cache_default():
     assert not engine_args.enable_prefix_caching
 
 
+# With HF_HUB_OFFLINE, EngineArgs resolves the model to a cached snapshot;
+# opt-125m (also used by the scheduler tests) is small and cached.
+CACHED_MODEL = ["--model", "facebook/opt-125m"]
+
+
 def test_kvreuse_policy_profile_and_explicit_overrides():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args(["--policy-profile", "kvreuse"])
+    args = parser.parse_args([*CACHED_MODEL, "--policy-profile", "kvreuse"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.scheduling_policy == "lpm"
     assert engine_args.admission_policy == "pkas"
@@ -480,6 +485,7 @@ def test_kvreuse_policy_profile_and_explicit_overrides():
 
     args = parser.parse_args(
         [
+            *CACHED_MODEL,
             "--policy-profile",
             "kvreuse",
             "--admission-policy",
@@ -507,7 +513,7 @@ def test_kvreuse_policy_profile_allows_prefix_caching_off():
     # PKAS's original setting; the scheduler then runs LPM as FCFS.
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(
-        ["--policy-profile", "kvreuse", "--no-enable-prefix-caching"]
+        [*CACHED_MODEL, "--policy-profile", "kvreuse", "--no-enable-prefix-caching"]
     )
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_prefix_caching is False
