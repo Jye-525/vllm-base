@@ -354,10 +354,14 @@ class Scheduler(SchedulerInterface):
         self._pkas_reject_cache: dict[str, tuple[int, int]] = {}
         if self.scheduler_config.admission_policy == "pkas":
             unsupported = []
-            if self.policy != SchedulingPolicy.LPM:
+            # Without prefix caching LPM has fallen back to FCFS above, which
+            # is PKAS's original setting; FCFS is accepted only then.
+            configured = SchedulingPolicy(self.scheduler_config.policy)
+            if configured != SchedulingPolicy.LPM and not (
+                configured == SchedulingPolicy.FCFS
+                and not self.cache_config.enable_prefix_caching
+            ):
                 unsupported.append("scheduling_policy_must_be_lpm")
-            if not self.cache_config.enable_prefix_caching:
-                unsupported.append("prefix_caching_disabled")
             if (
                 self.scheduler_config.async_scheduling
                 or type(self).__name__ == "AsyncScheduler"

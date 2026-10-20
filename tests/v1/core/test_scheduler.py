@@ -581,19 +581,33 @@ def test_pkas_admission_acceptance_uses_normal_allocation_path():
     assert scheduler.predictive_admission.evaluate.call_count == 1
 
 
-def test_pkas_admission_requires_lpm_and_prefix_caching():
+def test_pkas_admission_requires_lpm_with_prefix_caching():
     with pytest.raises(ValueError, match="scheduling_policy_must_be_lpm"):
         create_scheduler(
             enable_prefix_caching=True,
             scheduling_policy="fcfs",
             admission_policy="pkas",
         )
-    with pytest.raises(ValueError, match="prefix_caching_disabled"):
-        create_scheduler(
+    # Only LPM's fallback is PKAS's original setting, not cLPM's or SPF's.
+    for policy in ("clpm", "spf"):
+        with pytest.raises(ValueError, match="scheduling_policy_must_be_lpm"):
+            create_scheduler(
+                enable_prefix_caching=False,
+                scheduling_policy=policy,
+                admission_policy="pkas",
+            )
+
+
+def test_pkas_admission_without_prefix_caching_runs_fcfs():
+    # PKAS's original setting: LPM falls back to FCFS without prefix caching.
+    for policy in ("lpm", "fcfs"):
+        scheduler = create_scheduler(
             enable_prefix_caching=False,
-            scheduling_policy="lpm",
+            scheduling_policy=policy,
             admission_policy="pkas",
         )
+        assert scheduler.policy == SchedulingPolicy.FCFS
+        assert scheduler.predictive_admission is not None
 
 
 def test_schedule_multimodal_requests():
@@ -4864,10 +4878,11 @@ def test_pkas_state_updates_between_successful_admissions():
     )
 
 
-def test_pkas_real_gate_accepts_one_block_one_output():
+@pytest.mark.parametrize("enable_prefix_caching", [True, False])
+def test_pkas_real_gate_accepts_one_block_one_output(enable_prefix_caching):
     scheduler = create_scheduler(
         num_blocks=2,
-        enable_prefix_caching=True,
+        enable_prefix_caching=enable_prefix_caching,
         scheduling_policy="lpm",
         admission_policy="pkas",
     )
@@ -4881,11 +4896,14 @@ def test_pkas_real_gate_accepts_one_block_one_output():
     assert scheduler._pkas_step_stats["bound_accepts"] == 1
 
 
-def test_pkas_real_gate_rejects_candidate_that_exceeds_capacity():
+@pytest.mark.parametrize("enable_prefix_caching", [True, False])
+def test_pkas_real_gate_rejects_candidate_that_exceeds_capacity(
+    enable_prefix_caching,
+):
     scheduler = create_scheduler(
         num_blocks=4,
         max_num_seqs=1,
-        enable_prefix_caching=True,
+        enable_prefix_caching=enable_prefix_caching,
         scheduling_policy="lpm",
         admission_policy="pkas",
     )

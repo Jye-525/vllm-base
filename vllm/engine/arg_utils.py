@@ -843,7 +843,12 @@ class EngineArgs:
             )
 
         if self.policy_profile in ("lpm", "peek", "kvreuse"):
-            if self.enable_prefix_caching is False:
+            # kvreuse without prefix caching is PKAS's original setting: LPM
+            # has no cached prefixes to rank and falls back to FCFS.
+            if (
+                self.enable_prefix_caching is False
+                and self.policy_profile != "kvreuse"
+            ):
                 raise ValueError(
                     f"The '{self.policy_profile}' policy profile requires "
                     "prefix caching. Remove --no-enable-prefix-caching."

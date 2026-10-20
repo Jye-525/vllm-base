@@ -493,13 +493,26 @@ def test_kvreuse_policy_profile_and_explicit_overrides():
     assert engine_args.kv_cache_eviction_policy == "peek"
 
 
-def test_kvreuse_policy_profile_requires_prefix_caching():
+@pytest.mark.parametrize("profile", ["lpm", "peek"])
+def test_cache_aware_policy_profiles_require_prefix_caching(profile):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--policy-profile", profile, "--no-enable-prefix-caching"]
+    )
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        EngineArgs.from_cli_args(args=args)
+
+
+def test_kvreuse_policy_profile_allows_prefix_caching_off():
+    # PKAS's original setting; the scheduler then runs LPM as FCFS.
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(
         ["--policy-profile", "kvreuse", "--no-enable-prefix-caching"]
     )
-    with pytest.raises(ValueError, match="requires prefix caching"):
-        EngineArgs.from_cli_args(args=args)
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_prefix_caching is False
+    assert engine_args.admission_policy == "pkas"
+    assert engine_args.scheduler_reserve_full_isl is False
 
 
 @pytest.mark.parametrize(
