@@ -678,7 +678,7 @@ def test_removed_pkas_feature_flags_are_rejected():
 def test_pkas_output_estimator_and_reject_cache_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     default = EngineArgs.from_cli_args(
-        parser.parse_args(["--policy-profile", "kvreuse"])
+        parser.parse_args([*CACHED_MODEL, "--policy-profile", "kvreuse"])
     )
     assert default.pkas_output_predictor == "legacy"
     assert default.pkas_output_quantile == 0.9
@@ -687,6 +687,7 @@ def test_pkas_output_estimator_and_reject_cache_cli():
     assert default.pkas_reject_cache_steps == 16
     assert default.pkas_simulation == "paper"
     tuned = EngineArgs.from_cli_args(parser.parse_args([
+        *CACHED_MODEL,
         "--policy-profile", "kvreuse",
         "--pkas-output-quantile", "0.5",
         "--pkas-output-history", "64",
