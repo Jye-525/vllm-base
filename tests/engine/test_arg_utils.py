@@ -685,6 +685,7 @@ def test_pkas_output_estimator_and_reject_cache_cli():
     assert default.pkas_output_history is None
     assert default.pkas_output_confidence == 0.95
     assert default.pkas_reject_cache_steps == 16
+    assert default.pkas_simulation == "paper"
     tuned = EngineArgs.from_cli_args(parser.parse_args([
         "--policy-profile", "kvreuse",
         "--pkas-output-quantile", "0.5",
@@ -692,12 +693,14 @@ def test_pkas_output_estimator_and_reject_cache_cli():
         "--pkas-reject-cache-steps", "0",
         "--pkas-output-predictor", "quantile",
         "--pkas-output-confidence", "0.9",
+        "--pkas-simulation", "repo",
     ]))
     assert tuned.pkas_output_predictor == "quantile"
     assert tuned.pkas_output_confidence == 0.9
     assert tuned.pkas_output_quantile == 0.5
     assert tuned.pkas_output_history == 64
     assert tuned.pkas_reject_cache_steps == 0
+    assert tuned.pkas_simulation == "repo"
 
 
 def test_full_isl_reservation_default_follows_admission_policy():

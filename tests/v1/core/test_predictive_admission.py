@@ -443,3 +443,98 @@ def test_fast_forward_matches_stepwise_simulation():
         assert controller.evaluate(*args, **kwargs).feasible == controller.evaluate(
             *args, **kwargs, use_fast_forward=False,
         ).feasible
+
+
+def make_paper_controller(
+    capacity: int, predicted: int
+) -> PredictiveAdmissionController:
+    controller = PredictiveAdmissionController(
+        block_size=4,
+        capacity_blocks=capacity,
+        token_budget=8,
+        long_prefill_token_threshold=0,
+        max_model_len=128,
+        output_predictor="paper",
+    )
+    for _ in range(2):
+        controller.observe_completion(predicted)
+    return controller
+
+
+@pytest.mark.parametrize("capacity,repo_feasible", [(5, False), (6, True)])
+def test_repo_running_request_reserves_full_forecast_past_its_output(
+    capacity, repo_feasible
+):
+    # The running request has produced 8 tokens against a 4-token forecast.
+    # The paper text expects one more token; the repository reserves 4 more.
+    controller = make_paper_controller(capacity, predicted=4)
+    kwargs = dict(
+        running=[make_request("running", prompt=4, computed=12, blocks=(1, 2, 3),
+                              output=8)],
+        candidate=make_request("candidate", prompt=4, computed=4),
+        candidate_hit_block_ids=(),
+        block_ref_counts={1: 1, 2: 1, 3: 1},
+    )
+    assert controller.evaluate(**kwargs).feasible
+    decision = controller.evaluate_repo(**kwargs)
+    assert decision.feasible is repo_feasible
+    assert decision.peak_pinned_blocks == 6
+
+
+@pytest.mark.parametrize("capacity,feasible", [(2, False), (3, True)])
+def test_repo_shared_prefix_is_counted_once(capacity, feasible):
+    controller = make_paper_controller(capacity, predicted=1)
+    decision = controller.evaluate_repo(
+        [make_request("running", prompt=4, computed=4, blocks=(7,))],
+        make_request("candidate", prompt=4, computed=4),
+        candidate_hit_block_ids=(7,),
+        block_ref_counts={7: 1},
+    )
+    assert decision.feasible is feasible
+    assert decision.prefix_hit_blocks == 1
+    # Shared block 7 plus one decode block each; unshared it would be 4.
+    assert decision.peak_pinned_blocks == 3
+
+
+@pytest.mark.parametrize("capacity,feasible", [(0, False), (1, True)])
+def test_repo_unpinned_prefix_hit_becomes_pinned(capacity, feasible):
+    controller = make_paper_controller(capacity, predicted=2)
+    decision = controller.evaluate_repo(
+        [],
+        make_request("candidate", prompt=4, computed=4),
+        candidate_hit_block_ids=(7,),
+        block_ref_counts={7: 0},
+    )
+    assert decision.feasible is feasible
+    assert decision.peak_pinned_blocks == 1
+
+
+def test_repo_without_running_requests_checks_only_the_next_chunk():
+    controller = make_paper_controller(1, predicted=1)
+    kwargs = dict(
+        running=[],
+        candidate=make_request("candidate", prompt=8, computed=4),
+        candidate_hit_block_ids=(),
+        block_ref_counts={},
+    )
+    assert not controller.evaluate(**kwargs).feasible
+    decision = controller.evaluate_repo(**kwargs)
+    assert decision.feasible
+    assert decision.peak_pinned_blocks == 1
+
+
+@pytest.mark.parametrize("capacity,feasible", [(7, False), (8, True)])
+def test_repo_fast_forward_prefill_and_running_completion(capacity, feasible):
+    # Forecast 2, budget 8: in 2 iterations the running request grows 2
+    # tokens and the candidate prefills 2 * (8 - 1) = 14 tokens (22 of 32,
+    # 6 blocks); the running request then finishes and the candidate is
+    # admitted with prefill left, as in the repository.
+    controller = make_paper_controller(capacity, predicted=2)
+    decision = controller.evaluate_repo(
+        [make_request("running", prompt=4, computed=4, blocks=(1,))],
+        make_request("candidate", prompt=32, computed=8),
+        candidate_hit_block_ids=(),
+        block_ref_counts={1: 1},
+    )
+    assert decision.feasible is feasible
+    assert decision.peak_pinned_blocks == 8

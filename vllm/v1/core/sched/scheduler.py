@@ -407,6 +407,11 @@ class Scheduler(SchedulerInterface):
                 output_history=self.scheduler_config.pkas_output_history,
                 output_confidence=self.scheduler_config.pkas_output_confidence,
             )
+        # PKAS repository variant: its simulation and its chunk clamp.
+        self._pkas_repo = (
+            self.predictive_admission is not None
+            and self.scheduler_config.pkas_simulation == "repo"
+        )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -966,6 +971,89 @@ class Scheduler(SchedulerInterface):
             )
         return decision.feasible
 
+    def _predictive_admission_allows_repo(
+        self,
+        state: _PredictiveAdmissionState | None,
+        request: Request,
+        computed_blocks: KVCacheBlocks,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> bool:
+        """Copy of ``_predictive_admission_allows`` that runs the PKAS
+        repository simulation (``pkas_simulation="repo"``)."""
+        controller = self.predictive_admission
+        if controller is None:
+            return True
+        assert state is not None
+        assert self._pkas_step_stats is not None
+
+        cached = self._pkas_reject_cache.get(request.request_id)
+        if cached is not None:
+            epoch, expires = cached
+            if epoch == self._pkas_epoch and self._step_id <= expires:
+                self._pkas_step_stats["cached_rejections"] += 1
+                self._pkas_step_stats["rejections"] += 1
+                return False
+            del self._pkas_reject_cache[request.request_id]
+
+        hit_blocks = computed_blocks.blocks[0]
+        hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
+        start_ns = time.perf_counter_ns()
+        decision = controller.evaluate_repo(
+            state.running,
+            RequestSnapshot(
+                request_id=request.request_id,
+                prompt_tokens=request.num_prompt_tokens,
+                computed_tokens=num_computed_tokens + num_new_tokens,
+                output_tokens=request.num_output_tokens,
+                block_ids=(),
+            ),
+            candidate_hit_block_ids=hit_ids,
+            block_ref_counts=state.block_ref_counts,
+            initial_pinned_blocks=state.pinned_block_count,
+        )
+        stats = self._pkas_step_stats
+        stats["evaluate_ns"] += time.perf_counter_ns() - start_ns
+        stats["evaluations"] += 1
+        stats["bound_accepts"] += int(decision.peak_is_upper_bound)
+        stats["simulations"] += int(not decision.peak_is_upper_bound)
+        stats["rejections"] += int(not decision.feasible)
+        cache_steps = self.scheduler_config.pkas_reject_cache_steps
+        if not decision.feasible and cache_steps > 0:
+            self._pkas_reject_cache[request.request_id] = (
+                self._pkas_epoch,
+                self._step_id + cache_steps,
+            )
+        logger.debug(
+            "predictive_admission: request_id=%s feasible=%s "
+            "predicted_output_tokens=%d prefix_hit_blocks=%d "
+            "peak_pinned_blocks=%d capacity_blocks=%d peak_is_upper_bound=%s",
+            request.request_id,
+            decision.feasible,
+            decision.predicted_output_tokens,
+            decision.prefix_hit_blocks,
+            decision.peak_pinned_blocks,
+            decision.capacity_blocks,
+            decision.peak_is_upper_bound,
+        )
+        if decision.feasible:
+            # The repository reserves a full forecast past the tokens so far.
+            self._pkas_last_gate_target[request.request_id] = (
+                request.num_output_tokens + controller.estimator.predict()
+            )
+        return decision.feasible
+
+    def _pkas_repo_clamp_to_free_kv(self, num_new_tokens: int) -> int:
+        """PKAS repository behaviour: shrink a running request's chunk to the
+        free KV (evictable cached blocks count as free), so a long prefill
+        advances by a smaller chunk instead of preempting. With no free block
+        the chunk is left as is and allocation preempts as usual."""
+        pool = self.kv_cache_manager.block_pool
+        free_tokens = pool.get_num_free_blocks() * self.block_size
+        if free_tokens > 0:
+            return min(num_new_tokens, free_tokens)
+        return num_new_tokens
+
     def schedule(self) -> SchedulerOutput:
         if self._pending_batch_logs:
             # Overlapping execution cannot use the synchronous accounting path.
@@ -1115,6 +1203,9 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
+
+            if self._pkas_repo:
+                num_new_tokens = self._pkas_repo_clamp_to_free_kv(num_new_tokens)
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -1453,7 +1544,12 @@ class Scheduler(SchedulerInterface):
                             self.encoder_cache_manager.free(request)
                         break
 
-                if not self._predictive_admission_allows(
+                admission_allows = (
+                    self._predictive_admission_allows_repo
+                    if self._pkas_repo
+                    else self._predictive_admission_allows
+                )
+                if not admission_allows(
                     predictive_admission_state,
                     request,
                     new_computed_blocks,
@@ -1919,11 +2015,16 @@ class Scheduler(SchedulerInterface):
         # Its next admitted_prefix_cache line (same request_id) is the resume.
         pkas = ""
         if self.predictive_admission is not None:
+            estimator = self.predictive_admission.estimator
+            current_target = (
+                request.num_output_tokens + estimator.predict()
+                if self._pkas_repo
+                else estimator.target(request.num_output_tokens)
+            )
             pkas = (
                 " pkas_gate_target_output_tokens="
                 f"{self._pkas_last_gate_target.get(request.request_id, -1)}"
-                " pkas_current_target_output_tokens="
-                f"{self.predictive_admission.estimator.target(request.num_output_tokens)}"
+                f" pkas_current_target_output_tokens={current_target}"
             )
         logger.info(
             "preempted: step=%d request_id=%s reason=%s computed_tokens=%d "

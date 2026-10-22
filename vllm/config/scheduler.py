@@ -25,6 +25,7 @@ AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 PKASOutputPredictor = Literal["legacy", "paper", "quantile"]
+PKASSimulation = Literal["paper", "repo"]
 
 
 @config
@@ -143,6 +144,17 @@ class SchedulerConfig:
       requests past every completed length, one more token.
     - "legacy": the earlier quantile forecast with a fixed 512-token cold
       forecast until 32 completions; kept only to reproduce older runs."""
+
+    pkas_simulation: PKASSimulation = "paper"
+    """How PKAS simulates KV growth before admitting a request. Both count
+    prefix-cache hits and shared blocks, so they work with prefix caching on
+    and off.
+    - "paper": the paper's text. A running request reserves its forecast
+      minus the tokens it has produced, and one more token once past it.
+    - "repo": the PKAS repository code (evict-optimal-7). Every running
+      request reserves a full forecast whatever it has produced, the
+      fast-forward follows the repository's, and each running request's
+      chunk is shrunk to the free KV instead of preempting."""
 
     pkas_output_quantile: float = Field(default=0.9, gt=0.0, le=1.0)
     """Quantile of completed output lengths that the "quantile" and "legacy"

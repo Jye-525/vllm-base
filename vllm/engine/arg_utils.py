@@ -96,6 +96,7 @@ from vllm.config.scheduler import (
     KVCacheEvictionPolicy,
     PeekEvictionMode,
     PKASOutputPredictor,
+    PKASSimulation,
     PolicyProfile,
     SchedulerPolicy,
 )
@@ -603,6 +604,7 @@ class EngineArgs:
     policy_profile: PolicyProfile | None = None
     admission_policy: AdmissionPolicy | None = None
     pkas_output_predictor: PKASOutputPredictor = SchedulerConfig.pkas_output_predictor
+    pkas_simulation: PKASSimulation = SchedulerConfig.pkas_simulation
     pkas_output_quantile: float = SchedulerConfig.pkas_output_quantile
     pkas_output_history: int | None = SchedulerConfig.pkas_output_history
     pkas_output_confidence: float = SchedulerConfig.pkas_output_confidence
@@ -1497,6 +1499,10 @@ class EngineArgs:
             **scheduler_kwargs["pkas_output_predictor"],
         )
         scheduler_group.add_argument(
+            "--pkas-simulation",
+            **scheduler_kwargs["pkas_simulation"],
+        )
+        scheduler_group.add_argument(
             "--pkas-output-quantile",
             **scheduler_kwargs["pkas_output_quantile"],
         )
@@ -2229,6 +2235,7 @@ class EngineArgs:
             policy=self.scheduling_policy,
             admission_policy=self.admission_policy,
             pkas_output_predictor=self.pkas_output_predictor,
+            pkas_simulation=self.pkas_simulation,
             pkas_output_quantile=self.pkas_output_quantile,
             pkas_output_history=self.pkas_output_history,
             pkas_output_confidence=self.pkas_output_confidence,

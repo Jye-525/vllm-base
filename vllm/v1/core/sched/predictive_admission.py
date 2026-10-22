@@ -455,3 +455,137 @@ class PredictiveAdmissionController:
                 peak = max(peak, live_blocks)
                 if peak > self.capacity_blocks:
                     return overflow_decision()
+
+    def evaluate_repo(
+        self,
+        running: Sequence[RequestSnapshot],
+        candidate: RequestSnapshot,
+        *,
+        candidate_hit_block_ids: Sequence[int],
+        block_ref_counts: Mapping[int, int],
+        initial_pinned_blocks: int | None = None,
+    ) -> AdmissionDecision:
+        """Copy of ``evaluate`` that follows the PKAS repository code.
+
+        Mirrors ``_simulate_running_queue`` of the PKAS repository's
+        evict-optimal-7 scheduler rather than the paper text. Every running
+        request is expected to produce a full forecast more tokens, whatever
+        it has produced already (the repository computes ``pt + est -
+        progress[0]`` and ``progress[0]`` is the prompt length), and the
+        event-driven fast-forward with its prefill accounting is the
+        repository's. KV accounting stays prefix-aware: hit and shared blocks
+        are reference counted, so a block is freed only with its last
+        reference, and evictable cached blocks count as free.
+        """
+        predicted = self.estimator.predict()
+        ref_deltas: dict[int, int] = {}
+        live_blocks = (
+            sum(count > 0 for count in block_ref_counts.values())
+            if initial_pinned_blocks is None
+            else initial_pinned_blocks
+        )
+
+        def adjust_ref(block_id: int, delta: int) -> None:
+            nonlocal live_blocks
+            before = block_ref_counts.get(block_id, 0) + ref_deltas.get(block_id, 0)
+            after = before + delta
+            assert after >= 0
+            ref_deltas[block_id] = ref_deltas.get(block_id, 0) + delta
+            if before == 0 and after > 0:
+                live_blocks += 1
+            elif before > 0 and after == 0:
+                live_blocks -= 1
+
+        def allocate_to_progress(request: _VirtualRequest, progress: int) -> None:
+            nonlocal live_blocks
+            required = (progress + self.block_size - 1) // self.block_size
+            new_blocks = max(0, required - request.allocated_blocks)
+            request.allocated_blocks += new_blocks
+            request.synthetic_blocks += new_blocks
+            live_blocks += new_blocks
+
+        def release(request: _VirtualRequest) -> None:
+            nonlocal live_blocks
+            for block_id in request.real_block_ids:
+                adjust_ref(block_id, -1)
+            live_blocks -= request.synthetic_blocks
+
+        def decision(feasible: bool) -> AdmissionDecision:
+            return AdmissionDecision(
+                feasible, predicted, len(hit_ids), peak, self.capacity_blocks
+            )
+
+        # The candidate must fit its next forward pass, after its prefix hit.
+        hit_ids = list(dict.fromkeys(candidate_hit_block_ids))
+        for block_id in hit_ids:
+            adjust_ref(block_id, 1)
+        prefill_end = candidate.prompt_tokens + candidate.output_tokens
+        candidate_virtual = _VirtualRequest(
+            candidate.request_id,
+            prefill_end,
+            candidate.computed_tokens,
+            prefill_end + predicted,
+            tuple(hit_ids),
+            len(hit_ids),
+        )
+        allocate_to_progress(candidate_virtual, candidate_virtual.progress)
+        peak = live_blocks
+        if peak > self.capacity_blocks:
+            return decision(False)
+
+        # Remaining tokens: the candidate's rest of prefill plus a forecast;
+        # one forecast for each running request (its ``target`` field here).
+        remaining = prefill_end + predicted - candidate.computed_tokens
+        prefill_left = prefill_end - candidate.computed_tokens
+        order = sorted(
+            (
+                _VirtualRequest(
+                    request.request_id,
+                    request.prompt_tokens + request.output_tokens,
+                    request.computed_tokens,
+                    max(1, predicted),
+                    tuple(request.block_ids),
+                    len(request.block_ids),
+                )
+                for request in running
+            ),
+            key=lambda request: request.target,
+        )
+        prefill_rate = max(1, self.token_budget - len(order))
+        iteration = 0
+        counted_prefill = 0
+        prefill_iterations = 0
+        index = 0
+        while index < len(order):
+            if remaining - counted_prefill - (iteration - prefill_iterations) == 0:
+                return decision(True)
+            request = order[index]
+            step = min(request.target, remaining) - iteration
+            if step <= 0:
+                release(request)
+                index += 1
+                continue
+            for other in order[index:]:
+                other.progress += step
+                allocate_to_progress(other, other.progress)
+            peak = max(peak, live_blocks)
+            if peak > self.capacity_blocks:
+                return decision(False)
+            prefill_steps = -(-prefill_left // prefill_rate)
+            if prefill_steps < step:
+                grow = prefill_left + step - prefill_steps
+                counted_prefill = prefill_left
+                prefill_iterations = prefill_steps
+                prefill_left = 0
+            else:
+                grow = prefill_rate * step
+                counted_prefill += grow
+                prefill_iterations += step
+                prefill_left -= grow
+            candidate_virtual.progress += grow
+            allocate_to_progress(candidate_virtual, candidate_virtual.progress)
+            peak = max(peak, live_blocks)
+            if peak > self.capacity_blocks:
+                return decision(False)
+            iteration += step
+        return decision(True)

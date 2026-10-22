@@ -5162,3 +5162,76 @@ def test_preempted_line_then_resume_admission_share_request_id():
         f"admitted_prefix_cache: step=2 request_id={request.request_id} "
         "prompt_tokens=33 local_hit_tokens=32"
     )
+
+
+@pytest.mark.parametrize("enable_prefix_caching", [True, False])
+def test_pkas_repo_gate_rejects_candidate_whose_chunk_exceeds_capacity(
+    enable_prefix_caching,
+):
+    scheduler = create_scheduler(
+        num_blocks=4,
+        max_num_seqs=1,
+        enable_prefix_caching=enable_prefix_caching,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_simulation="repo",
+    )
+    assert scheduler._pkas_repo
+    for _ in range(32):
+        scheduler.predictive_admission.observe_completion(1)
+    (large,) = create_requests(num_requests=1, num_tokens=80, req_ids=["large"])
+    scheduler.add_request(large)
+    output = scheduler.schedule()
+    assert not output.scheduled_new_reqs
+    assert scheduler._pkas_step_stats["rejections"] == 1
+
+
+def _finish_prefill_step(scheduler, output):
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(output, ModelRunnerOutput(
+        req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
+        sampled_token_ids=[[] for _ in req_ids], logprobs=None,
+        prompt_logprobs_dict={}, pooler_output=[],
+    ))
+
+
+@pytest.mark.parametrize("enable_prefix_caching", [True, False])
+@pytest.mark.parametrize("simulation", ["paper", "repo"])
+def test_pkas_repo_shrinks_running_chunk_to_free_kv(
+    enable_prefix_caching, simulation,
+):
+    # 5 usable blocks of 16 tokens, 32-token chunks, a 96-token prompt.
+    scheduler = create_scheduler(
+        num_blocks=6,
+        max_num_batched_tokens=32,
+        max_model_len=256,
+        enable_prefix_caching=enable_prefix_caching,
+        scheduling_policy="lpm",
+        admission_policy="pkas",
+        pkas_simulation=simulation,
+    )
+    for _ in range(32):
+        scheduler.predictive_admission.observe_completion(1)
+    (request,) = create_requests(num_requests=1, num_tokens=96, max_tokens=1)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    if simulation == "paper":
+        # The paper simulation needs the whole prompt to fit; it cannot.
+        assert not output.scheduled_new_reqs
+        return
+    # The repository admits once the first chunk fits.
+    assert output.num_scheduled_tokens == {request.request_id: 32}
+    _finish_prefill_step(scheduler, output)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 32}
+    _finish_prefill_step(scheduler, output)
+    # One free block left: the chunk shrinks to 16 tokens instead of the
+    # request preempting itself.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 16}
+    assert request.status == RequestStatus.RUNNING
+    _finish_prefill_step(scheduler, output)
+    # No free block: allocation preempts as usual.
+    output = scheduler.schedule()
+    assert not output.num_scheduled_tokens
+    assert request.status == RequestStatus.PREEMPTED
