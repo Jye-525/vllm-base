@@ -709,7 +709,7 @@ def test_full_isl_reservation_default_follows_admission_policy():
 
     def resolve(*cli_args):
         return EngineArgs.from_cli_args(
-            parser.parse_args(list(cli_args))
+            parser.parse_args([*CACHED_MODEL, *cli_args])
         ).scheduler_reserve_full_isl
 
     assert resolve() is True
@@ -727,7 +727,7 @@ def test_lpm_admission_skips_cli():
 
     def resolve(*cli_args):
         return EngineArgs.from_cli_args(
-            parser.parse_args(["--policy-profile", "lpm", *cli_args])
+            parser.parse_args([*CACHED_MODEL, "--policy-profile", "lpm", *cli_args])
         ).lpm_admission_skips
 
     assert resolve() == 0
