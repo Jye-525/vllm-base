@@ -470,8 +470,8 @@ def test_prefix_cache_default():
 
 
 # With HF_HUB_OFFLINE, EngineArgs resolves the model to a cached snapshot;
-# opt-125m (also used by the scheduler tests) is small and cached.
-CACHED_MODEL = ["--model", "facebook/opt-125m"]
+# Qwen3-8B is the benchmark model, cached under huggingface-hub/hub/ on Polaris.
+CACHED_MODEL = ["--model", "Qwen/Qwen3-8B"]
 
 
 def test_kvreuse_policy_profile_and_explicit_overrides():
