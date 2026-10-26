@@ -611,6 +611,7 @@ class EngineArgs:
     pkas_reject_cache_steps: int = SchedulerConfig.pkas_reject_cache_steps
     lpm_window_size: int | None = None
     lpm_fallback_threshold: int | None = None
+    lpm_admission_skips: int = SchedulerConfig.lpm_admission_skips
     lpm_check_threshold: int = SchedulerConfig.lpm_check_threshold
     lpm_deprioritize_threshold: int = SchedulerConfig.lpm_deprioritize_threshold
     clpm_big_lane_share: float = SchedulerConfig.clpm_big_lane_share
@@ -861,14 +862,15 @@ class EngineArgs:
         if self.policy_profile is not None:
             logger.info(
                 "Resolved policy profile %s: scheduling=%s, admission=%s, "
-                "lpm_window=%d, "
-                "lpm_fallback=%d, group_major=%s, dynamic_lane=%s, "
+                "lpm_window=%d, lpm_fallback=%d, lpm_admission_skips=%d, "
+                "group_major=%s, dynamic_lane=%s, "
                 "eviction=%s, peek_mode=%s, reserve_full_isl=%s",
                 self.policy_profile,
                 self.scheduling_policy,
                 self.admission_policy,
                 self.lpm_window_size,
                 self.lpm_fallback_threshold,
+                self.lpm_admission_skips,
                 self.clpm_group_major,
                 self.clpm_dynamic_lane,
                 self.kv_cache_eviction_policy,
@@ -1525,6 +1527,9 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--lpm-fallback-threshold",
             **{**scheduler_kwargs["lpm_fallback_threshold"], "default": None},
+        )
+        scheduler_group.add_argument(
+            "--lpm-admission-skips", **scheduler_kwargs["lpm_admission_skips"]
         )
         scheduler_group.add_argument(
             "--lpm-check-threshold", **scheduler_kwargs["lpm_check_threshold"]
@@ -2242,6 +2247,7 @@ class EngineArgs:
             pkas_reject_cache_steps=self.pkas_reject_cache_steps,
             lpm_window_size=self.lpm_window_size,
             lpm_fallback_threshold=self.lpm_fallback_threshold,
+            lpm_admission_skips=self.lpm_admission_skips,
             lpm_check_threshold=self.lpm_check_threshold,
             lpm_deprioritize_threshold=self.lpm_deprioritize_threshold,
             clpm_big_lane_share=self.clpm_big_lane_share,

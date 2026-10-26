@@ -657,6 +657,14 @@ class Scheduler(SchedulerInterface):
         self._rank_per_admission = config.rank_per_admission
         self._step_rank_ns = 0
         self._step_rerank_count = 0
+        # LPM that fell back to FCFS (no prefix caching) never skips.
+        self._lpm_admission_skips = (
+            config.lpm_admission_skips if self.policy == SchedulingPolicy.LPM else 0
+        )
+        self._lpm_bypass_counts: dict[str, int] = {}
+        self._step_lpm_skips = 0
+        self._step_lpm_scan_ns = 0
+        self._lpm_scan_start_ns = 0
         rankers: dict[SchedulingPolicy, Callable[[list[Request]], RankPlan]] = {
             SchedulingPolicy.LPM: self._rank_lpm_candidates,
             SchedulingPolicy.CLPM: self._rank_clpm_candidates,
@@ -690,6 +698,43 @@ class Scheduler(SchedulerInterface):
                 "waiting prefix hits (policy=%s).",
                 self.policy.value,
             )
+        if self._lpm_admission_skips:
+            logger.info(
+                "LPM admission skips: skip up to %d waiting requests that do "
+                "not fit in free KV, admit the first that fits, then stop.",
+                self._lpm_admission_skips,
+            )
+
+    def _can_skip_unfit_request(
+        self,
+        request: Request,
+        request_queue: RequestQueue,
+        skipped: list[Request],
+    ) -> bool:
+        """Whether LPM admission may skip a request that does not fit in KV.
+
+        Only fresh requests at the head of ``self.waiting`` are skipped; a
+        preempted request waiting to resume still stops admission.
+        """
+        return (
+            len(skipped) < self._lpm_admission_skips
+            and request_queue is self.waiting
+            and request.status == RequestStatus.WAITING
+            and request.num_computed_tokens == 0
+        )
+
+    def _skip_unfit_request(
+        self, request_queue: RequestQueue, skipped: list[Request]
+    ) -> None:
+        """Move the unfit head request aside for the rest of this step."""
+        request = request_queue.pop_request()
+        if not skipped:
+            self._lpm_scan_start_ns = time.perf_counter_ns()
+        skipped.append(request)
+        self._lpm_bypass_counts[request.request_id] = (
+            self._lpm_bypass_counts.get(request.request_id, 0) + 1
+        )
+        self._step_lpm_skips += 1
 
     def _rerank_waiting_requests(self, scheduled_loras: set[int]) -> None:
         """Re-rank after an admission changed waiting requests' prefix hits."""
@@ -1065,6 +1110,8 @@ class Scheduler(SchedulerInterface):
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
+        self._step_lpm_skips = 0
+        self._step_lpm_scan_ns = 0
         self._step_id += 1
         self._step_evicted_blocks_start = (
             self.kv_cache_manager.block_pool.num_evicted_cached_blocks
@@ -1347,6 +1394,9 @@ class Scheduler(SchedulerInterface):
             rerank_pending = False
             if self._rank_per_admission:
                 self.kv_cache_manager.block_pool.start_eviction_log()
+            # LPM admission skips: unfit requests set aside this step, in
+            # ranked order. One admission after a skip ends the step.
+            lpm_skipped: list[Request] = []
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -1539,9 +1589,14 @@ class Scheduler(SchedulerInterface):
                             diagnostics.admission_failed(
                                 request_id, required_blocks, free_blocks
                             )
-                        # Upstream behaviour: stop admitting this step.
                         if request.has_encoder_inputs:
                             self.encoder_cache_manager.free(request)
+                        if self._can_skip_unfit_request(
+                            request, request_queue, lpm_skipped
+                        ):
+                            self._skip_unfit_request(request_queue, lpm_skipped)
+                            continue
+                        # Upstream behaviour: stop admitting this step.
                         break
 
                 admission_allows = (
@@ -1600,6 +1655,11 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self._can_skip_unfit_request(
+                        request, request_queue, lpm_skipped
+                    ):
+                        self._skip_unfit_request(request_queue, lpm_skipped)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1626,6 +1686,7 @@ class Scheduler(SchedulerInterface):
                 # policies have already reordered the bounded queue prefix.
                 request = request_queue.pop_request()
                 self._pkas_reject_cache.pop(request.request_id, None)
+                lpm_bypassed = self._lpm_bypass_counts.pop(request.request_id, 0)
                 self._pkas_epoch += 1
                 self._untrack_waiting_request(request)
                 if self._rank_per_admission:
@@ -1658,6 +1719,8 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     # Still pending (not ready) until the remote KVs arrive.
                     self._track_waiting_request(request)
+                    if lpm_skipped:
+                        break
                     continue
 
                 self._commit_clpm_admission(request.request_id, prefix_rank_plan)
@@ -1672,16 +1735,17 @@ class Scheduler(SchedulerInterface):
                 logger.info(
                     "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
                     "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s",
+                    "running=%d%s%s",
                     self._step_id,
                     request.request_id,
                     request.num_tokens,
                     num_new_local_computed_tokens,
                     num_new_tokens,
-                    len(self.waiting),
+                    len(self.waiting) + len(lpm_skipped),
                     len(self.running),
                     "" if pkas_target is None
                     else f" pkas_target_output_tokens={pkas_target}",
+                    f" lpm_bypassed={lpm_bypassed}" if lpm_bypassed else "",
                 )
 
                 self.running.append(request)
@@ -1730,9 +1794,20 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+                if lpm_skipped:
+                    # Admitted past unfit requests: stop admitting this step.
+                    break
 
             if self._rank_per_admission:
                 self.kv_cache_manager.block_pool.stop_eviction_log()
+
+            if lpm_skipped:
+                # Return the skipped requests to the head in ranked order.
+                self._step_lpm_scan_ns = (
+                    time.perf_counter_ns() - self._lpm_scan_start_ns
+                )
+                for skipped_request in reversed(lpm_skipped):
+                    self.waiting.prepend_request(skipped_request)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -1778,6 +1853,8 @@ class Scheduler(SchedulerInterface):
             decode_context=decode_context,
             rank_ns=self._step_rank_ns,
             reranks=self._step_rerank_count,
+            lpm_skips=self._step_lpm_skips,
+            lpm_scan_ns=self._step_lpm_scan_ns,
             preempted_tokens=self._step_preempted_tokens,
             evicted_blocks=(
                 self.kv_cache_manager.block_pool.num_evicted_cached_blocks
@@ -2997,6 +3074,7 @@ class Scheduler(SchedulerInterface):
         self._pkas_block_ids.pop(request.request_id, None)
         self._pkas_last_gate_target.pop(request.request_id, None)
         self._pkas_reject_cache.pop(request.request_id, None)
+        self._lpm_bypass_counts.pop(request.request_id, None)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,

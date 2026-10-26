@@ -720,3 +720,15 @@ def test_full_isl_reservation_default_follows_admission_policy():
         "--policy-profile", "kvreuse", "--scheduler-reserve-full-isl"
     ) is True
     assert resolve("--no-scheduler-reserve-full-isl") is False
+
+
+def test_lpm_admission_skips_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    def resolve(*cli_args):
+        return EngineArgs.from_cli_args(
+            parser.parse_args(["--policy-profile", "lpm", *cli_args])
+        ).lpm_admission_skips
+
+    assert resolve() == 0
+    assert resolve("--lpm-admission-skips", "1000000") == 1000000

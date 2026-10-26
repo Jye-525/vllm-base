@@ -183,6 +183,14 @@ class SchedulerConfig:
     """For LPM, cLPM, SPF and SJF, fall back to FCFS when the total waiting
     queue is larger than this threshold. Zero disables the fallback."""
 
+    lpm_admission_skips: int = Field(default=0, ge=0)
+    """For LPM, the number of waiting requests that do not fit in free KV
+    (their full sequence with ``scheduler_reserve_full_isl``, else their
+    first chunk) that admission may skip per step. The first later request
+    that fits is admitted and admission stops for the step. Preempted
+    requests are never skipped. Zero stops at the first request that does
+    not fit (stock behavior)."""
+
     lpm_check_threshold: int = 32
     """For cLPM, requests with at most this many cached tokens are considered cold.
     A negative value disables cold pioneer/sibling classification."""
@@ -397,6 +405,17 @@ class SchedulerConfig:
             if self.admission_policy != "none":
                 raise ValueError(
                     "rank_per_admission is not supported with "
+                    f"admission_policy={self.admission_policy!r}"
+                )
+        if self.lpm_admission_skips:
+            if self.policy != "lpm":
+                raise ValueError(
+                    "lpm_admission_skips requires the 'lpm' scheduling "
+                    f"policy, not {self.policy!r}"
+                )
+            if self.admission_policy != "none":
+                raise ValueError(
+                    "lpm_admission_skips is not supported with "
                     f"admission_policy={self.admission_policy!r}"
                 )
 

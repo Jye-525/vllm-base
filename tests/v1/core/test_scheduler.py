@@ -520,6 +520,155 @@ def test_rank_per_admission_requires_lpm_or_spf_without_pkas(
         )
 
 
+def _lpm_skip_scheduler(lpm_admission_skips: int, **kwargs) -> Scheduler:
+    return create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="lpm",
+        lpm_window_size=0,
+        lpm_admission_skips=lpm_admission_skips,
+        **kwargs,
+    )
+
+
+def test_lpm_admission_skips_admit_first_fit_then_stop():
+    scheduler = _lpm_skip_scheduler(2)
+    requests = create_requests(num_requests=4, req_ids=["A", "B", "C", "D"])
+    for request in requests:
+        scheduler.add_request(request)
+    # A and B do not fit; C and D would.
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(
+        side_effect=[(False, 10, 1), (False, 10, 1), (True, 1, 10)]
+    )
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["C"]
+    assert scheduler.kv_cache_manager.full_sequence_fits.call_count == 3
+    assert [req.request_id for req in scheduler.waiting] == ["A", "B", "D"]
+    assert scheduler._step_lpm_skips == 2
+    assert scheduler._lpm_bypass_counts == {"A": 1, "B": 1}
+    assert len(scheduler.pending_prefix_index) == 3
+
+    scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
+    assert scheduler._lpm_bypass_counts == {"B": 1}
+
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(return_value=(True, 1, 10))
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["B", "D"]
+    assert scheduler._step_lpm_skips == 0
+    assert scheduler._lpm_bypass_counts == {}
+
+
+@pytest.mark.parametrize(
+    ("lpm_admission_skips", "expected_checks", "expected_skips"),
+    [(0, 1, 0), (1, 2, 1), (1000000, 4, 4)],
+)
+def test_lpm_admission_skips_stop_when_nothing_fits(
+    lpm_admission_skips, expected_checks, expected_skips
+):
+    scheduler = _lpm_skip_scheduler(lpm_admission_skips)
+    requests = create_requests(num_requests=4)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(return_value=(False, 10, 1))
+
+    output = scheduler.schedule()
+
+    assert not output.scheduled_new_reqs
+    assert scheduler.kv_cache_manager.full_sequence_fits.call_count == expected_checks
+    assert list(scheduler.waiting) == requests
+    # A large bound scans the whole queue; the skipped requests return in order.
+    assert scheduler._step_lpm_skips == expected_skips
+
+
+@pytest.mark.parametrize(("lpm_admission_skips", "expected"), [(0, []), (2, ["C"])])
+def test_lpm_admission_skips_on_allocation_failure_without_isl(
+    lpm_admission_skips, expected
+):
+    # Five free blocks (one of six is the null block); chunks are whole prompts.
+    scheduler = _lpm_skip_scheduler(
+        lpm_admission_skips, num_blocks=6, scheduler_reserve_full_isl=False
+    )
+    requests = [
+        _token_request("A", [1] * 100),  # 7 blocks
+        _token_request("B", [2] * 100),  # 7 blocks
+        _token_request("C", [3] * 40),  # 3 blocks
+        _token_request("D", [4] * 16),  # 1 block, fits after C
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == expected
+    assert [req.request_id for req in scheduler.waiting] == [
+        req.request_id for req in requests if req.request_id not in expected
+    ]
+
+
+def test_lpm_admission_skips_stop_at_preempted_request():
+    scheduler = _lpm_skip_scheduler(2, max_num_seqs=1)
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            req_id_to_index={first.request_id: 0},
+            sampled_token_ids=[[1]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.running.remove(first)
+    scheduler._preempt_request(first, 0.0)
+    scheduler.add_request(second)
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(
+        side_effect=[(False, 10, 1), (True, 1, 10)]
+    )
+
+    output = scheduler.schedule()
+
+    assert not output.scheduled_new_reqs
+    assert not output.scheduled_cached_reqs.num_reqs
+    assert scheduler.kv_cache_manager.full_sequence_fits.call_count == 1
+    assert list(scheduler.waiting) == [first, second]
+    assert scheduler._step_lpm_skips == 0
+
+
+@pytest.mark.parametrize(
+    ("policy", "admission_policy"),
+    [
+        ("fcfs", "none"),
+        ("clpm", "none"),
+        ("spf", "none"),
+        ("sjf", "none"),
+        ("lpm", "pkas"),
+    ],
+)
+def test_lpm_admission_skips_require_lpm_without_pkas(policy, admission_policy):
+    with pytest.raises(ValueError, match="lpm_admission_skips"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy=policy,
+            admission_policy=admission_policy,
+            lpm_admission_skips=1,
+        )
+
+
+def test_lpm_admission_skips_off_when_lpm_falls_back_to_fcfs():
+    scheduler = create_scheduler(
+        enable_prefix_caching=False,
+        scheduling_policy="lpm",
+        lpm_admission_skips=8,
+    )
+    assert scheduler.policy == SchedulingPolicy.FCFS
+    assert scheduler._lpm_admission_skips == 0
+
+
 def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
     scheduler = create_scheduler(
         max_num_seqs=1,
