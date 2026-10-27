@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import heapq
 import json
 import math
 import os
@@ -76,6 +77,18 @@ class BlockHashToBlockMap:
                 return next(iter(blocks.values()))
             self._unexpected_blocks_type(blocks)
         return None
+
+    def get_all_blocks(self, key: BlockHashWithGroupId) -> list[KVCacheBlock]:
+        """Gets every cached block with the given block hash key."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return []
+        if isinstance(blocks, KVCacheBlock):
+            return [blocks]
+        if isinstance(blocks, dict):
+            return list(blocks.values())
+        self._unexpected_blocks_type(blocks)
+        return []
 
     def insert(self, key: BlockHashWithGroupId, block: KVCacheBlock) -> None:
         """
@@ -215,6 +228,30 @@ class BlockPool:
         self._peek_eviction_decay_tau: float = 30.0
         self._peek_eviction_scan_cap: int = 0
 
+        # Skip-aware eviction ("skip"): the scheduler publishes the waiting
+        # requests that LPM admission skipped, most important first, each with
+        # its cached prefix at the time it was skipped. Free blocks of those
+        # prefixes sit in _skip_side_pool instead of free_block_queue; they
+        # still count as free but are evicted only when free_block_queue is
+        # empty, worst rank and deepest block first.
+        self._skip_protected_ids: list[str] = []
+        # request_id -> its protected prefix hashes, in prompt order
+        self._skip_protected_hashes: dict[str, list[BlockHashWithGroupId]] = {}
+        # hash -> number of protected requests that use it
+        self._skip_protect_counts: dict[BlockHashWithGroupId, int] = {}
+        # hash -> (best rank, depth) eviction key, larger keys go first;
+        # built lazily, None when the protected list changed.
+        self._skip_eviction_keys: (
+            dict[BlockHashWithGroupId, tuple[int, int]] | None
+        ) = None
+        self._skip_side_pool: dict[int, KVCacheBlock] = {}
+        # Min-heap of (-rank, -depth, block_id), built lazily and None while
+        # the keys are stale. Entries of blocks that left the side pool are
+        # dropped when popped.
+        self._skip_victims: list[tuple[int, int, int]] | None = None
+        # Protected blocks reused as new blocks (cumulative).
+        self.num_skip_protected_evictions = 0
+
         # Orphan tracking is intentionally disabled for the demand-aware
         # experiment. vLLM already frees request blocks in reverse order, so
         # suffix blocks normally become eviction candidates before prefix
@@ -293,6 +330,8 @@ class BlockPool:
                 tier = "demanded"
             elif self._eviction_policy == "peek":
                 tier = "zero_demand"
+            elif block.block_hash in self._skip_protect_counts:
+                tier = "skip_protected"
             else:
                 tier = "lru_cached"
             rows.append({
@@ -312,7 +351,7 @@ class BlockPool:
             "requested_blocks": num_blocks,
             "selected_blocks": len(victims),
             "walked_blocks": walked,
-            "free_blocks_before_reuse": self.free_block_queue.num_free_blocks,
+            "free_blocks_before_reuse": self.get_num_free_blocks(),
             "peek_protected": self.peek_protected,
             "peek_publishes": self.peek_publishes,
             **self._eviction_trace_context,
@@ -368,6 +407,115 @@ class BlockPool:
                         self._demand_max_depths[block_hash] = int(depth)
         self.peek_protected = len(self._demand_counts)
         self.peek_publishes += 1
+
+    def set_skip_protected(self, protected: Sequence[tuple[Request, int]]) -> None:
+        """Publish the skip-protected waiting requests, most important first,
+        each with the number of prompt blocks to protect (its cached prefix
+        when it was last skipped; deeper blocks cannot be hit after a gap).
+
+        A request that joins, or whose prefix changed, moves the free blocks
+        of that prefix out of free_block_queue into the side pool. A request
+        that leaves returns the blocks no other protected request uses to the
+        recently used end of free_block_queue.
+        """
+        new_ids = [request.request_id for request, _ in protected]
+        changed = new_ids != self._skip_protected_ids
+        kept = set(new_ids)
+        for request_id in self._skip_protected_ids:
+            if request_id not in kept:
+                self._release_skip_protection(request_id)
+        for request, num_blocks in protected:
+            hashes = self._skip_protected_hashes.get(request.request_id)
+            num_blocks = min(num_blocks, len(request.block_hashes))
+            if hashes is not None and len(hashes) == num_blocks:
+                continue
+            if hashes is not None:
+                self._release_skip_protection(request.request_id)
+            self._add_skip_protection(request, num_blocks)
+            changed = True
+        if changed:
+            self._skip_protected_ids = new_ids
+            self._skip_eviction_keys = None
+            self._skip_victims = None
+
+    @property
+    def num_skip_protected_free_blocks(self) -> int:
+        """Free blocks held back by skip-aware eviction."""
+        return len(self._skip_side_pool)
+
+    def _add_skip_protection(self, request: Request, num_blocks: int) -> None:
+        # Skip-aware eviction runs with a single KV cache group (group 0).
+        hashes = [
+            make_block_hash_with_group_id(block_hash, 0)
+            for block_hash in request.block_hashes[:num_blocks]
+        ]
+        for key in hashes:
+            count = self._skip_protect_counts.get(key, 0)
+            self._skip_protect_counts[key] = count + 1
+            if count:
+                continue
+            for block in self.cached_block_hash_to_block.get_all_blocks(key):
+                if block.ref_cnt == 0:
+                    self.free_block_queue.remove(block)
+                    self._skip_side_pool[block.block_id] = block
+        self._skip_protected_hashes[request.request_id] = hashes
+
+    def _release_skip_protection(self, request_id: str) -> None:
+        released: list[KVCacheBlock] = []
+        for key in self._skip_protected_hashes.pop(request_id):
+            count = self._skip_protect_counts[key] - 1
+            if count:
+                self._skip_protect_counts[key] = count
+                continue
+            del self._skip_protect_counts[key]
+            for block in self.cached_block_hash_to_block.get_all_blocks(key):
+                if self._skip_side_pool.pop(block.block_id, None) is not None:
+                    released.append(block)
+        # Hashes are in prompt order: append the deepest first so that it is
+        # evicted first, as when a request frees its blocks.
+        self.free_block_queue.append_n(released[::-1])
+
+    def _skip_victim_entry(self, block: KVCacheBlock) -> tuple[int, int, int]:
+        keys = self._skip_eviction_keys
+        if keys is None:
+            keys = {}
+            for rank, request_id in enumerate(self._skip_protected_ids):
+                for depth, key in enumerate(self._skip_protected_hashes[request_id]):
+                    keys.setdefault(key, (rank, depth))
+            self._skip_eviction_keys = keys
+        assert block.block_hash is not None
+        rank, depth = keys[block.block_hash]
+        return -rank, -depth, block.block_id
+
+    def _add_to_skip_side_pool(self, block: KVCacheBlock) -> None:
+        self._skip_side_pool[block.block_id] = block
+        heap = self._skip_victims
+        if heap is None:
+            return
+        if len(heap) > 2 * len(self._skip_side_pool) + 1024:
+            self._skip_victims = None  # mostly stale: rebuild when needed
+        else:
+            heapq.heappush(heap, self._skip_victim_entry(block))
+
+    def _pop_skip_protected_victims(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Take protected free blocks once free_block_queue is empty: the
+        least important protected request first, its deepest block first.
+        A block shared by several protected requests takes the best rank."""
+        heap = self._skip_victims
+        if heap is None or len(heap) > 2 * len(self._skip_side_pool) + 1024:
+            heap = [self._skip_victim_entry(b) for b in self._skip_side_pool.values()]
+            heapq.heapify(heap)
+            self._skip_victims = heap
+        victims: list[KVCacheBlock] = []
+        while len(victims) < num_blocks:
+            entry = heapq.heappop(heap)
+            block = self._skip_side_pool.get(entry[2])
+            if block is None or self._skip_victim_entry(block) != entry:
+                continue  # left the side pool since this entry was added
+            del self._skip_side_pool[block.block_id]
+            victims.append(block)
+        self.num_skip_protected_evictions += len(victims)
+        return victims
 
     def _get_peek_eviction_priority(
         self,
@@ -638,6 +786,13 @@ class BlockPool:
 
         if self.enable_caching and self._eviction_policy == "peek":
             ret = self._select_victims_peek(num_blocks)
+        elif self._skip_side_pool:
+            # Skip-aware eviction: plain LRU first, protected blocks last.
+            num_lru = min(num_blocks, self.free_block_queue.num_free_blocks)
+            ret = self.free_block_queue.popleft_n(num_lru)
+            if num_lru < num_blocks:
+                ret += self._pop_skip_protected_victims(num_blocks - num_lru)
+            self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
             self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
@@ -817,7 +972,11 @@ class BlockPool:
                 self._block_hash_last_access[get_block_hash(block.block_hash)] = now
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if (
+                block.ref_cnt == 0
+                and not block.is_null
+                and self._skip_side_pool.pop(block.block_id, None) is None
+            ):
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -835,9 +994,18 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if self._skip_protect_counts:
+            unprotected = []
+            for block in freed:
+                if block.block_hash in self._skip_protect_counts:
+                    self._add_to_skip_side_pool(block)
+                else:
+                    unprotected.append(block)
+            freed = unprotected
+        self.free_block_queue.append_n(freed)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -856,7 +1024,12 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+            if (
+                self._maybe_evict_cached_block(block)
+                and self._skip_side_pool.pop(block_id, None) is not None
+            ):
+                # No longer cached, so no longer protected: reuse it first.
+                self.free_block_queue.appendleft(block)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -886,6 +1059,15 @@ class BlockPool:
         self._demand_max_depths = {}
         self._block_hash_last_access = {}
 
+        # Drop skip protection; the scheduler republishes it next step.
+        self.free_block_queue.append_n(list(self._skip_side_pool.values()))
+        self._skip_side_pool.clear()
+        self._skip_protected_ids = []
+        self._skip_protected_hashes.clear()
+        self._skip_protect_counts.clear()
+        self._skip_eviction_keys = None
+        self._skip_victims = None
+
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
@@ -906,7 +1088,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.free_block_queue.num_free_blocks + len(self._skip_side_pool)
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

@@ -22,7 +22,7 @@ RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sjf"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
-KVCacheEvictionPolicy = Literal["lru", "peek"]
+KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 PKASOutputPredictor = Literal["legacy", "paper", "quantile"]
 PKASSimulation = Literal["paper", "repo"]
@@ -236,7 +236,15 @@ class SchedulerConfig:
 
     kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
     """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
-    ``peek`` protects blocks demanded by waiting requests."""
+    ``peek`` protects blocks demanded by waiting requests; ``skip`` protects
+    the prefixes of waiting requests that LPM admission skipped (requires
+    ``lpm_admission_skips``)."""
+
+    skip_eviction_max_protected: int = Field(default=8, ge=1)
+    """For ``skip`` eviction, the number of skipped waiting requests whose
+    prefixes are protected, in LPM order. Free blocks they use are evicted
+    only after every other free block, the lowest-ranked request's deepest
+    block first."""
 
     peek_eviction_mode: PeekEvictionMode = "plain"
     """Protection formula used by Peek eviction."""
@@ -418,6 +426,10 @@ class SchedulerConfig:
                     "lpm_admission_skips is not supported with "
                     f"admission_policy={self.admission_policy!r}"
                 )
+        if self.kv_cache_eviction_policy == "skip" and not self.lpm_admission_skips:
+            raise ValueError(
+                "kv_cache_eviction_policy='skip' requires lpm_admission_skips > 0"
+            )
 
         self.verify_max_model_len(max_model_len)
 

@@ -332,6 +332,24 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += 1
 
+    def appendleft(self, block: KVCacheBlock) -> None:
+        """Put a block at the front of the free list (the next eviction
+        victim) and increase num_free_blocks by 1.
+
+        Args:
+            block: The block to put at the front.
+        """
+        first_block = self.fake_free_list_head.next_free_block
+        if first_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+        block.prev_free_block = self.fake_free_list_head
+        block.next_free_block = first_block
+        self.fake_free_list_head.next_free_block = block
+        first_block.prev_free_block = block
+        self.num_free_blocks += 1
+
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
 

@@ -624,6 +624,7 @@ class EngineArgs:
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
     rank_per_admission: bool = SchedulerConfig.rank_per_admission
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
+    skip_eviction_max_protected: int = SchedulerConfig.skip_eviction_max_protected
     peek_eviction_mode: PeekEvictionMode | None = None
     peek_eviction_recency_weight: float = SchedulerConfig.peek_eviction_recency_weight
     peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau
@@ -1576,6 +1577,10 @@ class EngineArgs:
             },
         )
         scheduler_group.add_argument(
+            "--skip-eviction-max-protected",
+            **scheduler_kwargs["skip_eviction_max_protected"],
+        )
+        scheduler_group.add_argument(
             "--peek-eviction-mode",
             **{**scheduler_kwargs["peek_eviction_mode"], "default": None},
         )
@@ -2260,6 +2265,7 @@ class EngineArgs:
             rank_preempted_requests=self.rank_preempted_requests,
             rank_per_admission=self.rank_per_admission,
             kv_cache_eviction_policy=self.kv_cache_eviction_policy,
+            skip_eviction_max_protected=self.skip_eviction_max_protected,
             peek_eviction_mode=self.peek_eviction_mode,
             peek_eviction_recency_weight=self.peek_eviction_recency_weight,
             peek_eviction_decay_tau=self.peek_eviction_decay_tau,

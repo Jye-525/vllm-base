@@ -80,6 +80,7 @@ def create_scheduler(
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests,
     rank_per_admission: bool = SchedulerConfig.rank_per_admission,
     kv_cache_eviction_policy: str = SchedulerConfig.kv_cache_eviction_policy,
+    skip_eviction_max_protected: int = SchedulerConfig.skip_eviction_max_protected,
     peek_eviction_mode: str = SchedulerConfig.peek_eviction_mode,
     peek_eviction_recency_weight: float = (
         SchedulerConfig.peek_eviction_recency_weight
@@ -148,6 +149,7 @@ def create_scheduler(
         rank_preempted_requests=rank_preempted_requests,
         rank_per_admission=rank_per_admission,
         kv_cache_eviction_policy=kv_cache_eviction_policy,
+        skip_eviction_max_protected=skip_eviction_max_protected,
         peek_eviction_mode=peek_eviction_mode,
         peek_eviction_recency_weight=peek_eviction_recency_weight,
         peek_eviction_decay_tau=peek_eviction_decay_tau,

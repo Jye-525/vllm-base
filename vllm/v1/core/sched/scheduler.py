@@ -307,8 +307,9 @@ class Scheduler(SchedulerInterface):
         policy = self.scheduler_config.kv_cache_eviction_policy
         if not self.cache_config.enable_prefix_caching and policy != "lru":
             logger.warning_once(
-                "Peek eviction requires prefix caching. Falling back to LRU "
-                "because prefix caching is disabled."
+                "%s eviction requires prefix caching. Falling back to LRU "
+                "because prefix caching is disabled.",
+                policy,
             )
             policy = "lru"
         self._eviction_policy = policy
@@ -325,6 +326,37 @@ class Scheduler(SchedulerInterface):
         block_pool._peek_eviction_scan_cap = (
             self.scheduler_config.peek_eviction_scan_cap
         )
+        # Skip-aware eviction protects the prefixes of waiting requests that
+        # LPM admission skipped. It matches request.block_hashes against
+        # group-0 block hashes, so it needs one group hashed at its block size.
+        self._skip_eviction = self._eviction_policy == "skip"
+        self._skip_protected: list[Request] = []
+        # Requests skipped this step that have a cached prefix to protect.
+        self._step_skip_protectable: list[Request] = []
+        self._skip_eviction_max_protected = (
+            self.scheduler_config.skip_eviction_max_protected
+        )
+        if self._skip_eviction:
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                len(groups) != 1
+                or groups[0].kv_cache_spec.block_size != block_pool.hash_block_size
+            ):
+                raise ValueError(
+                    "kv_cache_eviction_policy='skip' requires a single KV cache "
+                    "group whose block size equals the hash block size"
+                )
+            if self.connector is not None:
+                # Connectors such as simple KV offload walk free_block_queue,
+                # which no longer holds the protected free blocks.
+                raise ValueError(
+                    "kv_cache_eviction_policy='skip' does not support KV connectors"
+                )
+            logger.info(
+                "Skip-aware eviction: protect the prefixes of up to %d skipped "
+                "waiting requests, evicting them after all other free blocks.",
+                self._skip_eviction_max_protected,
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -662,6 +694,10 @@ class Scheduler(SchedulerInterface):
             config.lpm_admission_skips if self.policy == SchedulingPolicy.LPM else 0
         )
         self._lpm_bypass_counts: dict[str, int] = {}
+        # Local prefix hit of a bypassed request when it was first and last
+        # skipped (skip-aware eviction protects the last one).
+        self._lpm_first_skip_hits: dict[str, int] = {}
+        self._lpm_last_skip_hits: dict[str, int] = {}
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
         self._lpm_scan_start_ns = 0
@@ -724,17 +760,70 @@ class Scheduler(SchedulerInterface):
         )
 
     def _skip_unfit_request(
-        self, request_queue: RequestQueue, skipped: list[Request]
+        self,
+        request_queue: RequestQueue,
+        skipped: list[Request],
+        num_local_hit_tokens: int,
     ) -> None:
         """Move the unfit head request aside for the rest of this step."""
         request = request_queue.pop_request()
         if not skipped:
             self._lpm_scan_start_ns = time.perf_counter_ns()
         skipped.append(request)
+        self._lpm_first_skip_hits.setdefault(request.request_id, num_local_hit_tokens)
+        self._lpm_last_skip_hits[request.request_id] = num_local_hit_tokens
         self._lpm_bypass_counts[request.request_id] = (
             self._lpm_bypass_counts.get(request.request_id, 0) + 1
         )
         self._step_lpm_skips += 1
+        protectable = self._step_skip_protectable
+        if (
+            self._skip_eviction
+            and num_local_hit_tokens >= self.block_size
+            and len(protectable) < self._skip_eviction_max_protected
+        ):
+            # Protect now, so the backfill admitted later in this step cannot
+            # evict the prefix of a request it bypassed. This step's skips
+            # lead in ranked order, then the older protected requests.
+            protectable.append(request)
+            this_step = {r.request_id for r in protectable}
+            self._set_skip_protected(
+                protectable
+                + [r for r in self._skip_protected if r.request_id not in this_step]
+            )
+
+    def _set_skip_protected(self, requests: list[Request]) -> None:
+        """Publish the skip-protected waiting requests, most important first.
+        Each protects the cached prefix it had when it was last skipped; a
+        request without a full cached block takes no slot."""
+        protected = [
+            (r, self._lpm_last_skip_hits[r.request_id] // self.block_size)
+            for r in requests
+        ]
+        protected = [(r, n) for r, n in protected if n > 0]
+        protected = protected[: self._skip_eviction_max_protected]
+        self._skip_protected = [r for r, _ in protected]
+        self.kv_cache_manager.block_pool.set_skip_protected(protected)
+
+    def _unprotect_skipped_request(self, request: Request) -> None:
+        """A bypassed request was admitted or finished: release its prefix."""
+        if self._skip_eviction:
+            self._set_skip_protected(
+                [r for r in self._skip_protected if r is not request]
+            )
+
+    def _refresh_skip_protection(self) -> None:
+        """Protect the top bypassed waiting requests in the current LPM order."""
+        protected: list[Request] = []
+        hits = self._lpm_last_skip_hits
+        candidates = sum(hit >= self.block_size for hit in hits.values())
+        limit = min(self._skip_eviction_max_protected, candidates)
+        for request in self.waiting:
+            if len(protected) == limit:
+                break
+            if hits.get(request.request_id, 0) >= self.block_size:
+                protected.append(request)
+        self._set_skip_protected(protected)
 
     def _rerank_waiting_requests(self, scheduled_loras: set[int]) -> None:
         """Re-rank after an admission changed waiting requests' prefix hits."""
@@ -1112,9 +1201,13 @@ class Scheduler(SchedulerInterface):
         self._step_rerank_count = 0
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
+        self._step_skip_protectable = []
         self._step_id += 1
         self._step_evicted_blocks_start = (
             self.kv_cache_manager.block_pool.num_evicted_cached_blocks
+        )
+        self._step_skip_protected_evictions_start = (
+            self.kv_cache_manager.block_pool.num_skip_protected_evictions
         )
         self._pkas_step_stats = (
             dict.fromkeys(
@@ -1380,6 +1473,8 @@ class Scheduler(SchedulerInterface):
             rank_start_ns = time.perf_counter_ns()
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
+            if self._skip_eviction and self._lpm_bypass_counts:
+                self._refresh_skip_protection()
             predictive_admission_state = None
             if (
                 (self.waiting or self.skipped_waiting)
@@ -1594,7 +1689,11 @@ class Scheduler(SchedulerInterface):
                         if self._can_skip_unfit_request(
                             request, request_queue, lpm_skipped
                         ):
-                            self._skip_unfit_request(request_queue, lpm_skipped)
+                            self._skip_unfit_request(
+                                request_queue,
+                                lpm_skipped,
+                                num_new_local_computed_tokens,
+                            )
                             continue
                         # Upstream behaviour: stop admitting this step.
                         break
@@ -1658,7 +1757,9 @@ class Scheduler(SchedulerInterface):
                     if self._can_skip_unfit_request(
                         request, request_queue, lpm_skipped
                     ):
-                        self._skip_unfit_request(request_queue, lpm_skipped)
+                        self._skip_unfit_request(
+                            request_queue, lpm_skipped, num_new_local_computed_tokens
+                        )
                         continue
                     break
 
@@ -1687,6 +1788,13 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.pop_request()
                 self._pkas_reject_cache.pop(request.request_id, None)
                 lpm_bypassed = self._lpm_bypass_counts.pop(request.request_id, 0)
+                lpm_first_skip_hit = self._lpm_first_skip_hits.pop(
+                    request.request_id, 0
+                )
+                self._lpm_last_skip_hits.pop(request.request_id, None)
+                if lpm_bypassed:
+                    # Its hit blocks are allocated now; drop the protection.
+                    self._unprotect_skipped_request(request)
                 self._pkas_epoch += 1
                 self._untrack_waiting_request(request)
                 if self._rank_per_admission:
@@ -1745,7 +1853,10 @@ class Scheduler(SchedulerInterface):
                     len(self.running),
                     "" if pkas_target is None
                     else f" pkas_target_output_tokens={pkas_target}",
-                    f" lpm_bypassed={lpm_bypassed}" if lpm_bypassed else "",
+                    f" lpm_bypassed={lpm_bypassed}"
+                    f" lpm_first_skip_hit={lpm_first_skip_hit}"
+                    if lpm_bypassed
+                    else "",
                 )
 
                 self.running.append(request)
@@ -1862,6 +1973,16 @@ class Scheduler(SchedulerInterface):
             ),
             pkas=self._pkas_step_stats,
         )
+        if self._skip_eviction:
+            pool = self.kv_cache_manager.block_pool
+            batch_record["skip_protected_reqs"] = len(self._skip_protected)
+            batch_record["skip_protected_free_blocks"] = (
+                pool.num_skip_protected_free_blocks
+            )
+            batch_record["skip_protected_evictions"] = (
+                pool.num_skip_protected_evictions
+                - self._step_skip_protected_evictions_start
+            )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -3074,7 +3195,10 @@ class Scheduler(SchedulerInterface):
         self._pkas_block_ids.pop(request.request_id, None)
         self._pkas_last_gate_target.pop(request.request_id, None)
         self._pkas_reject_cache.pop(request.request_id, None)
-        self._lpm_bypass_counts.pop(request.request_id, None)
+        if self._lpm_bypass_counts.pop(request.request_id, None) is not None:
+            self._unprotect_skipped_request(request)
+        self._lpm_first_skip_hits.pop(request.request_id, None)
+        self._lpm_last_skip_hits.pop(request.request_id, None)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,

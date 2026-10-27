@@ -732,3 +732,24 @@ def test_lpm_admission_skips_cli():
 
     assert resolve() == 0
     assert resolve("--lpm-admission-skips", "1000000") == 1000000
+
+
+def test_skip_eviction_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    def resolve(*cli_args):
+        return EngineArgs.from_cli_args(
+            parser.parse_args([*CACHED_MODEL, "--policy-profile", "lpm", *cli_args])
+        )
+
+    assert resolve().skip_eviction_max_protected == 8
+    args = resolve(
+        "--lpm-admission-skips",
+        "1000000",
+        "--kv-cache-eviction-policy",
+        "skip",
+        "--skip-eviction-max-protected",
+        "4",
+    )
+    assert args.kv_cache_eviction_policy == "skip"
+    assert args.skip_eviction_max_protected == 4

@@ -669,6 +669,123 @@ def test_lpm_admission_skips_off_when_lpm_falls_back_to_fcfs():
     assert scheduler._lpm_admission_skips == 0
 
 
+@pytest.mark.parametrize(
+    ("eviction_policy", "expected_hit"), [("lru", 16), ("skip", 64)]
+)
+def test_skip_eviction_keeps_bypassed_prefix_through_backfill(
+    eviction_policy, expected_hit
+):
+    # Eleven usable blocks of 16 tokens.
+    scheduler = _lpm_skip_scheduler(
+        8, num_blocks=12, kv_cache_eviction_policy=eviction_policy
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+    shared = list(range(1000, 1064))  # 4 blocks
+    # R0 caches the shared prefix, then U caches 3 unrelated blocks; both end,
+    # so LRU order is [5 never used, shared tail..head, U tail..head].
+    for request_id, tokens in (("R0", shared), ("U", list(range(3000, 3048)))):
+        scheduler.add_request(_token_request(request_id, tokens))
+        scheduler.schedule()
+        scheduler.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+    assert pool.get_num_free_blocks() == 11
+
+    # R1 hits the shared prefix but needs 12 blocks: it never fits. R3 needs
+    # 7 blocks and is admitted past it.
+    r1 = _token_request("R1", shared + list(range(2000, 2128)))
+    r3 = _token_request("R3", list(range(5000, 5112)))
+    scheduler.add_request(r3)
+    scheduler.add_request(r1)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["R3"]
+    assert scheduler._lpm_bypass_counts == {"R1": 1}
+    assert scheduler._lpm_first_skip_hits == {"R1": 64}
+    # LRU fills R3 with 5 unused blocks and the shared tail; skip-aware
+    # eviction uses U's blocks instead and keeps all of R1's prefix.
+    assert scheduler.kv_cache_manager.get_computed_prefix_len(r1) == expected_hit
+    if eviction_policy == "skip":
+        assert scheduler._skip_protected == [r1]
+        assert pool.num_skip_protected_free_blocks == 4
+        assert pool.num_skip_protected_evictions == 0
+
+    scheduler.finish_requests("R1", RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler._skip_protected == []
+    assert pool.num_skip_protected_free_blocks == 0
+    assert pool.get_num_free_blocks() == 4
+
+
+def _skip_eviction_requests(
+    scheduler: Scheduler, request_ids: list[str]
+) -> list[Request]:
+    """Requests whose first block is cached (by an aborted warm-up request)."""
+    prefix = list(range(7000, 7016))
+    scheduler.add_request(_token_request("warmup", prefix))
+    scheduler.schedule()
+    scheduler.finish_requests("warmup", RequestStatus.FINISHED_ABORTED)
+    requests = [
+        _token_request(request_id, prefix + [8000 + i] * 16)
+        for i, request_id in enumerate(request_ids)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    return requests
+
+
+def test_skip_eviction_protects_at_skip_and_releases_on_admit_or_abort():
+    scheduler = _lpm_skip_scheduler(2, kv_cache_eviction_policy="skip")
+    a, b, _, _ = _skip_eviction_requests(scheduler, ["A", "B", "C", "D"])
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(
+        side_effect=[(False, 10, 1), (False, 10, 1), (True, 1, 10)]
+    )
+
+    scheduler.schedule()
+
+    pool = scheduler.kv_cache_manager.block_pool
+    assert scheduler._lpm_last_skip_hits == {"A": 16, "B": 16}
+    assert scheduler._skip_protected == [a, b]
+    assert pool._skip_protected_ids == ["A", "B"]
+    assert pool._skip_protect_counts  # the shared first block
+    # C reused the shared block, which took it out of the side pool.
+    assert pool.num_skip_protected_free_blocks == 0
+
+    scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
+    assert scheduler._skip_protected == [b]
+
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(return_value=(True, 1, 10))
+    scheduler.schedule()
+
+    assert scheduler._skip_protected == []
+    assert pool._skip_protected_ids == []
+    assert pool.num_skip_protected_free_blocks == 0
+
+
+def test_skip_eviction_caps_protected_requests():
+    scheduler = _lpm_skip_scheduler(
+        8, kv_cache_eviction_policy="skip", skip_eviction_max_protected=2
+    )
+    requests = _skip_eviction_requests(scheduler, ["A", "B", "C", "D"])
+    # E has no cached prefix: it is skipped but takes no protection slot.
+    scheduler.add_request(_token_request("E", list(range(9000, 9032))))
+    scheduler.kv_cache_manager.full_sequence_fits = Mock(return_value=(False, 10, 1))
+
+    scheduler.schedule()
+
+    assert scheduler._step_lpm_skips == 5
+    assert scheduler._skip_protected == requests[:2]
+    assert scheduler._lpm_last_skip_hits["E"] == 0
+
+
+def test_skip_eviction_requires_lpm_admission_skips():
+    with pytest.raises(ValueError, match="lpm_admission_skips"):
+        create_scheduler(
+            enable_prefix_caching=True,
+            scheduling_policy="lpm",
+            kv_cache_eviction_policy="skip",
+        )
+
+
 def test_pkas_admission_rejection_keeps_lpm_candidate_at_head():
     scheduler = create_scheduler(
         max_num_seqs=1,
