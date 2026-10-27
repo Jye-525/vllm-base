@@ -5685,6 +5685,9 @@ def test_dspf_charges_a_resumed_request_again(monkeypatch):
     )
     scheduler.running.remove(request)
     scheduler._preempt_request(request, 0.0)
+    # A real preemption happens inside schedule(), so the preempted request
+    # is not in the previous step's batch when it resumes.
+    scheduler.prev_step_scheduled_req_ids.discard(request.request_id)
 
     output = scheduler.schedule()
 
