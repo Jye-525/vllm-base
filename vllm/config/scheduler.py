@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sjf"]
+SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sjf", "dspf"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
@@ -125,7 +125,13 @@ class SchedulerConfig:
     - "spf" orders the same window by uncached prompt tokens ascending, with
       linear aging (shortest prefill first, as in PrefillOnly).
     - "sjf" orders the same window by ``max_tokens`` ascending, with linear
-      aging. It is an oracle only when clients set ``ignore_eos``."""
+      aging. It is an oracle only when clients set ``ignore_eos``.
+    - "dspf" orders the same window by estimated prefill FLOPs ascending,
+      guarded by per-request deadlines on a committed-prefill-work clock: a
+      request may be bypassed only while it can still be admitted before
+      arrival-order service would have finished it. No aging constant.
+      Supports Qwen3 and Qwen3-MoE text generation without LoRA, KV
+      connectors or pipeline parallelism."""
 
     admission_policy: AdmissionPolicy = "none"
     """Waiting-request admission policy. ``none`` uses stock vLLM admission;
@@ -426,6 +432,17 @@ class SchedulerConfig:
                     "lpm_admission_skips is not supported with "
                     f"admission_policy={self.admission_policy!r}"
                 )
+        if self.policy == "dspf" and self.admission_policy != "none":
+            raise ValueError(
+                "The 'dspf' scheduling policy is not supported with "
+                f"admission_policy={self.admission_policy!r}"
+            )
+        if self.policy == "dspf" and self.lpm_fallback_threshold:
+            # Falling back to FCFS would leave queued requests without
+            # deadlines until the queue shrinks.
+            raise ValueError(
+                "The 'dspf' scheduling policy requires lpm_fallback_threshold=0"
+            )
         if self.kv_cache_eviction_policy == "skip" and not self.lpm_admission_skips:
             raise ValueError(
                 "kv_cache_eviction_policy='skip' requires lpm_admission_skips > 0"

@@ -39,6 +39,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.request_logger import RequestEventLogger
+from vllm.v1.core.sched.dspf import DSPFScheduler, check_dspf_scope
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -51,6 +52,7 @@ from vllm.v1.core.sched.predictive_admission import (
     RequestSnapshot,
 )
 from vllm.v1.core.sched.preemption_diagnostics import PreemptionDiagnostics
+from vllm.v1.core.sched.prefill_cost import PrefillCostShape
 from vllm.v1.core.sched.survival_diagnostics import SurvivalRecorder
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
@@ -61,6 +63,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
 from vllm.v1.core.sched.waiting_ranker import (
+    DSPFRanking,
     RankPlan,
     rank_clpm,
     rank_lpm,
@@ -226,6 +229,9 @@ class Scheduler(SchedulerInterface):
         self._clpm_lane_b_pass = 0.0
         self._clpm_dynamic_b_share = 0.3
         self._init_waiting_rankers()
+        self._dspf: DSPFScheduler | None = None
+        if self.policy == SchedulingPolicy.DSPF:
+            self._dspf = self._init_dspf()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -943,6 +949,45 @@ class Scheduler(SchedulerInterface):
         # Ranks on max_tokens alone: no prefix-cache lookups.
         return rank_sjf(candidates, self._sjf_age_alpha)
 
+    def _init_dspf(self) -> DSPFScheduler:
+        """Check DSPF's scope and build its cost model and state."""
+        model_config = self.vllm_config.model_config
+        check_dspf_scope(
+            **{
+                "LoRA": self.lora_config is not None,
+                "KV connectors": self.connector is not None,
+                "encoder cache connectors": self.ec_connector is not None,
+                "encoder-decoder models": self.is_encoder_decoder,
+                "multimodal models": model_config.is_multimodal_model,
+                "pipeline parallelism": self.parallel_config.pipeline_parallel_size
+                > 1,
+            }
+        )
+        window_size = self.scheduler_config.lpm_window_size
+        if window_size > 0:
+            logger.warning_once(
+                "DSPF ranks only the first %d waiting requests; later ones get "
+                "no deadline until they enter the window. Use "
+                "--lpm-window-size 0 to rank the whole queue.",
+                window_size,
+            )
+        return DSPFScheduler(
+            PrefillCostShape.from_model_config(model_config),
+            window_size,
+            # Looked up on each call, so the manager can be created later.
+            lambda request: self.kv_cache_manager.get_computed_prefix_len(request),
+        )
+
+    def _dspf_rank(self, token_budget: int, record_step: bool) -> DSPFRanking:
+        assert self._dspf is not None and isinstance(self.waiting, FCFSRequestQueue)
+        return self._dspf.rank(
+            self.waiting,
+            self.skipped_waiting,
+            token_budget,
+            self.max_num_running_reqs - len(self.running),
+            record_step,
+        )
+
     def _commit_clpm_admission(
         self, request_id: str, rank_plan: RankPlan | None
     ) -> None:
@@ -1198,6 +1243,8 @@ class Scheduler(SchedulerInterface):
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
+        if self._dspf is not None:
+            self._dspf.start_step()
         self._step_rerank_count = 0
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
@@ -1471,7 +1518,10 @@ class Scheduler(SchedulerInterface):
             # re-rank between admissions); admission below still pops from
             # the queue head.
             rank_start_ns = time.perf_counter_ns()
-            prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
+            if self._dspf is not None:
+                self._dspf_rank(token_budget, record_step=True)
+            else:
+                prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
             if self._skip_eviction and self._lpm_bypass_counts:
                 self._refresh_skip_protection()
@@ -1544,6 +1594,16 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if self._dspf is not None and self._dspf.cost_grew(
+                        request, num_new_local_computed_tokens
+                    ):
+                        # An earlier admission this step evicted its blocks:
+                        # re-rank with its real cost and retry the head.
+                        rerank_start_ns = time.perf_counter_ns()
+                        self._dspf_rank(token_budget, record_step=False)
+                        self._step_rank_ns += time.perf_counter_ns() - rerank_start_ns
+                        self._step_rerank_count += 1
+                        continue
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1832,6 +1892,11 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self._commit_clpm_admission(request.request_id, prefix_rank_plan)
+                dspf_fields = (
+                    self._dspf.admit(request, num_computed_tokens)
+                    if self._dspf is not None
+                    else ""
+                )
 
                 self.kv_cache_manager.record_local_prefix_cache_hit(
                     request,
@@ -1843,7 +1908,7 @@ class Scheduler(SchedulerInterface):
                 logger.info(
                     "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
                     "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s%s",
+                    "running=%d%s%s%s",
                     self._step_id,
                     request.request_id,
                     request.num_tokens,
@@ -1857,6 +1922,7 @@ class Scheduler(SchedulerInterface):
                     f" lpm_first_skip_hit={lpm_first_skip_hit}"
                     if lpm_bypassed
                     else "",
+                    dspf_fields,
                 )
 
                 self.running.append(request)
@@ -1983,6 +2049,10 @@ class Scheduler(SchedulerInterface):
                 pool.num_skip_protected_evictions
                 - self._step_skip_protected_evictions_start
             )
+        if self._dspf is not None:
+            batch_record["dspf_feasible"] = self._dspf.step_feasible
+            batch_record["dspf_edd"] = self._dspf.step_edd
+            batch_record["dspf_late"] = self._dspf.step_late
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -2939,6 +3009,7 @@ class Scheduler(SchedulerInterface):
             SchedulingPolicy.CLPM,
             SchedulingPolicy.SPF,
             SchedulingPolicy.SJF,
+            SchedulingPolicy.DSPF,
         ):
             return self.skipped_waiting or self.waiting or None
 
@@ -3199,6 +3270,8 @@ class Scheduler(SchedulerInterface):
             self._unprotect_skipped_request(request)
         self._lpm_first_skip_hits.pop(request.request_id, None)
         self._lpm_last_skip_hits.pop(request.request_id, None)
+        if self._dspf is not None:
+            self._dspf.forget(request.request_id)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,
