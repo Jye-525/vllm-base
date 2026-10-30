@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -62,7 +63,7 @@ def rank_lpm(
 
 def _rank_by_aged_length(
     requests: list[Request],
-    lengths: dict[str, int],
+    lengths: Mapping[str, float],
     age_alpha: float,
 ) -> RankPlan:
     """Order by ``length - age_alpha * wait``, shortest first.
@@ -95,6 +96,21 @@ def rank_spf(
         for request in requests
     }
     return _rank_by_aged_length(requests, uncached, age_alpha)
+
+
+def rank_sspf(
+    requests: list[Request],
+    amortized_uncached: dict[str, float],
+    age_alpha: float,
+) -> RankPlan:
+    """Sharing-amortized SPF: fewest amortized uncached tokens, with aging.
+
+    ``amortized_uncached`` prices each uncached block at its size divided by
+    the number of waiting requests that contain it, so serving one member
+    of a group that shares an uncached prefix is cheap when the rest of the
+    group follows. With no sharing it equals the uncached tokens of SPF.
+    """
+    return _rank_by_aged_length(requests, amortized_uncached, age_alpha)
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,7 @@ from vllm.v1.core.sched.waiting_ranker import (
     rank_lpm,
     rank_sjf,
     rank_spf,
+    rank_sspf,
 )
 
 
@@ -166,6 +167,44 @@ def test_spf_aging_overtakes_exactly_past_length_gap() -> None:
 
     assert order(old_arrival=91.0) == ["short", "long"]
     assert order(old_arrival=89.0) == ["long", "short"]
+
+
+def test_sspf_orders_by_amortized_uncached_tokens() -> None:
+    requests = [
+        _job("solo"),
+        _job("member_a"),
+        _job("member_b"),
+    ]
+    # Each member's 64-token uncached prefix is shared by four waiting
+    # requests (16 tokens each), plus 16 own tokens: 32. SPF would charge
+    # them 80 and pick solo (48).
+    costs = {"solo": 48.0, "member_a": 48.0 - 16.0, "member_b": 48.0 - 16.0}
+
+    plan = rank_sspf(requests, costs, age_alpha=0.0)
+
+    assert _ids(plan) == ["member_a", "member_b", "solo"]
+    assert plan.lane_credit == {}
+
+
+def test_sspf_ties_and_aging_match_spf() -> None:
+    requests = [
+        _job("short", arrival_time=100.0),
+        _job("long", arrival_time=89.0),
+        _job("short_twin", arrival_time=100.0),
+    ]
+    costs = {"short": 20.0, "long": 120.0, "short_twin": 20.0}
+
+    # 11 s older at 10 tokens/s outweighs the 100-token gap; ties keep order.
+    assert _ids(rank_sspf(requests, costs, age_alpha=10.0)) == [
+        "long",
+        "short",
+        "short_twin",
+    ]
+    assert _ids(rank_sspf(requests, costs, age_alpha=0.0)) == [
+        "short",
+        "short_twin",
+        "long",
+    ]
 
 
 def test_sjf_orders_by_remaining_output_tokens() -> None:

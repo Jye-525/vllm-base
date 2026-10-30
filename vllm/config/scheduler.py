@@ -19,7 +19,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sjf", "dspf"]
+SchedulerPolicy = Literal[
+    "fcfs", "priority", "lpm", "clpm", "spf", "sspf", "sjf", "dspf"
+]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
@@ -124,6 +126,9 @@ class SchedulerConfig:
     - "clpm" adds clustered demand and an age-aware fairness lane.
     - "spf" orders the same window by uncached prompt tokens ascending, with
       linear aging (shortest prefill first, as in PrefillOnly).
+    - "sspf" is SPF with each uncached prompt block's tokens divided by the
+      number of waiting requests that contain it (sharing-amortized SPF).
+      It uses ``spf_age_alpha``. With no sharing it orders as SPF.
     - "sjf" orders the same window by ``max_tokens`` ascending, with linear
       aging. It is an oracle only when clients set ``ignore_eos``.
     - "dspf" orders the same window by estimated prefill FLOPs ascending,
@@ -233,6 +238,13 @@ class SchedulerConfig:
     """For SPF and SJF, rank preempted requests by their remaining work.
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
+
+    defer_inflight_prefixes: bool = False
+    """For SPF and SSPF, hold back a fresh waiting request whose next
+    uncached prompt block a running request (or one admitted earlier in the
+    step) has yet to compute, so it later reads that block from the prefix
+    cache instead of computing it again. Admission continues with the next
+    request. Needs prefix caching."""
 
     rank_per_admission: bool = False
     """For LPM and SPF, re-rank the waiting window after an admission when
@@ -408,6 +420,11 @@ class SchedulerConfig:
         if self.rank_preempted_requests and self.policy not in ("spf", "sjf"):
             raise ValueError(
                 "rank_preempted_requests requires the 'spf' or 'sjf' "
+                f"scheduling policy, not {self.policy!r}"
+            )
+        if self.defer_inflight_prefixes and self.policy not in ("spf", "sspf"):
+            raise ValueError(
+                "defer_inflight_prefixes requires the 'spf' or 'sspf' "
                 f"scheduling policy, not {self.policy!r}"
             )
         if self.rank_per_admission:

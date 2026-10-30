@@ -257,6 +257,36 @@ class PendingPrefixIndex:
             if request_id in cache
         }
 
+    def amortized_blocks(self, request_id: str, start_block: int) -> float:
+        """Return ``sum(1 / ready_count(h))`` over the path from ``start_block``.
+
+        Each block counts once per rank-ready request that contains it, so a
+        block shared by n waiting requests costs 1/n. Hashes are cumulative,
+        so counts never increase along a path: the sum is taken one run of
+        equal counts at a time, each run's end found by binary search.
+        Counts are floored at 1 (a request that is not ready yet).
+        """
+        path = self._request_paths.get(request_id)
+        if path is None:
+            return 0.0
+        counts = self._ready_counts
+        total = 0.0
+        i = max(start_block, 0)
+        n = len(path)
+        while i < n:
+            count = max(counts.get(path[i], 0), 1)
+            # First position after i whose count is below this run's.
+            lo, hi = i + 1, n
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if counts.get(path[mid], 0) >= count:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            total += (lo - i) / count
+            i = lo
+        return total
+
     def longest_shared_prefix_blocks(self, request_id: str) -> int:
         """Return the deepest prefix shared with another pending request."""
         path = self._request_paths.get(request_id)

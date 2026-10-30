@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.waiting_prefix_index import (
     PendingPrefixIndex,
@@ -122,3 +124,48 @@ def test_rank_info_cache_is_invalidated_by_index_changes() -> None:
     assert index.rank_info_many(["r1"], 1)["r1"].cluster_size == 1
     index.upsert("r2", [a, b])
     assert index.rank_info_many(["r1", "r2"], 1)["r1"].cluster_size == 2
+
+
+def _naive_amortized(index: PendingPrefixIndex, request_id: str, start: int) -> float:
+    path = index.request_path(request_id) or ()
+    return sum(1 / max(index.ready_count(h), 1) for h in path[start:])
+
+
+def test_amortized_blocks_divides_each_block_by_its_ready_sharers() -> None:
+    index = PendingPrefixIndex()
+    a, b, c, d, e, f, g = map(_hash, "abcdefg")
+    index.upsert("r1", [a, b, c, d])
+    index.upsert("r2", [a, b, e])
+    index.upsert("r3", [a, f])
+    # Not rank-ready: demand only, it does not share the cost.
+    index.upsert("parked", [a, b, g], ready=False)
+
+    # Counts along r1: a=3, b=2, c=1, d=1.
+    assert index.amortized_blocks("r1", 0) == pytest.approx(1 / 3 + 1 / 2 + 2)
+    assert index.amortized_blocks("r1", 1) == pytest.approx(1 / 2 + 2)
+    assert index.amortized_blocks("r1", 3) == pytest.approx(1)
+    assert index.amortized_blocks("r1", 4) == 0.0
+    assert index.amortized_blocks("r3", 0) == pytest.approx(1 / 3 + 1)
+    assert index.amortized_blocks("missing", 0) == 0.0
+    for request_id in ("r1", "r2", "r3", "parked"):
+        path = index.request_path(request_id)
+        assert path is not None
+        for start in range(len(path) + 1):
+            assert index.amortized_blocks(request_id, start) == pytest.approx(
+                _naive_amortized(index, request_id, start)
+            )
+
+
+def test_amortized_blocks_follows_index_changes() -> None:
+    index = PendingPrefixIndex()
+    path = [_hash(f"b{i}") for i in range(8)]
+    index.upsert("long", path)
+    index.upsert("mid", path[:5])
+    index.upsert("short", path[:2])
+
+    # Runs of counts 3, 2, 1 along the long path.
+    assert index.amortized_blocks("long", 0) == pytest.approx(2 / 3 + 3 / 2 + 3)
+    index.discard("mid")
+    assert index.amortized_blocks("long", 0) == pytest.approx(2 / 2 + 6)
+    index.set_ready("short", False)
+    assert index.amortized_blocks("long", 1) == pytest.approx(7)
