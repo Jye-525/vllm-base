@@ -2021,8 +2021,8 @@ class Scheduler(SchedulerInterface):
                     f" lpm_first_skip_hit={lpm_first_skip_hit}"
                     if lpm_bypassed
                     else "",
-                    dspf_fields,
                     f" deferred_steps={deferred_steps}" if deferred_steps else "",
+                    dspf_fields,
                 )
 
                 self.running.append(request)
