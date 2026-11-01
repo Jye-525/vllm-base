@@ -441,6 +441,32 @@ class Scheduler(SchedulerInterface):
             self.predictive_admission is not None
             and self.scheduler_config.pkas_simulation == "repo"
         )
+        self._preempt_least_done = (
+            self.scheduler_config.preemption_victim == "least_done"
+        )
+        if self._preempt_least_done:
+            unsupported = []
+            if (
+                self.scheduler_config.async_scheduling
+                or type(self).__name__ == "AsyncScheduler"
+            ):
+                unsupported.append("async_scheduling")
+            if self.use_pp:
+                unsupported.append("pipeline_parallelism")
+            if speculative_config is not None:
+                unsupported.append("speculative_decoding")
+            if unsupported:
+                raise ValueError(
+                    "preemption_victim='least_done' does not support: "
+                    + ", ".join(unsupported)
+                )
+            logger.info(
+                "Preemption victim: least_done (fewest computed tokens, "
+                "earliest admitted on ties)."
+            )
+        # Preemption victim: max() over self.running with this key, or None
+        # for stock LIFO (running.pop()).
+        self._victim_key = self._make_victim_key()
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -496,6 +522,21 @@ class Scheduler(SchedulerInterface):
         ] = {}
         # add_request work since the previous schedule() (arrival_ns).
         self._step_arrival_ns = 0
+
+    def _make_victim_key(self) -> Callable[[Request], Any] | None:
+        """Key whose max() over self.running is the preemption victim.
+
+        PRIORITY: lowest priority, then latest arrival. least_done: fewest
+        computed tokens (prefix hits included; computed tokens only advance
+        after scheduling, so this is the pre-step progress); max() returns
+        the first minimum, i.e. the earliest admitted on ties, as the
+        simulator does. None: stock LIFO.
+        """
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return lambda r: (r.priority, r.arrival_time)
+        if self._preempt_least_done:
+            return lambda r: -r.num_computed_tokens
+        return None
 
     def _mamba_block_aligned_split(
         self,
@@ -1298,12 +1339,10 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
+                    if self._victim_key is not None:
+                        preempted_req = max(self.running, key=self._victim_key)
+                        victim_pos = self.running.index(preempted_req)
+                        del self.running[victim_pos]
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
@@ -1321,6 +1360,10 @@ class Scheduler(SchedulerInterface):
                                     for i in preempted_encoder_inputs
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                        elif self._preempt_least_done and victim_pos < req_index:
+                            # An unscheduled request before this one (skipped
+                            # this step) left the list: keep the position.
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()

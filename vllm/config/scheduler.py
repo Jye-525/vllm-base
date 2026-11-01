@@ -26,6 +26,7 @@ KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 PKASOutputPredictor = Literal["paper", "quantile"]
 PKASSimulation = Literal["paper", "repo"]
+PreemptionVictim = Literal["lifo", "least_done"]
 
 
 @config
@@ -224,6 +225,14 @@ class SchedulerConfig:
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
 
+    preemption_victim: PreemptionVictim = "lifo"
+    """Which running request to preempt when a running request cannot get KV
+    blocks. ``lifo`` (stock vLLM) preempts the last admitted one;
+    ``least_done`` (SSPF series) preempts the one with the fewest computed
+    tokens (prefix hits included), the earliest admitted on ties. Not with
+    the ``priority`` policy, which has its own victim rule, PKAS admission,
+    async scheduling, pipeline parallelism or speculative decoding."""
+
     rank_per_admission: bool = False
     """For LPM and SPF, re-rank the waiting window after an admission when
     that admission changed another waiting request's prefix hits (cached a
@@ -396,6 +405,17 @@ class SchedulerConfig:
                 self.long_prefill_token_threshold,
             )
 
+        if self.preemption_victim != "lifo":
+            if self.policy == "priority":
+                raise ValueError(
+                    "preemption_victim is not supported with the 'priority' "
+                    "scheduling policy, which has its own victim rule"
+                )
+            if self.admission_policy != "none":
+                raise ValueError(
+                    "preemption_victim is not supported with "
+                    f"admission_policy={self.admission_policy!r}"
+                )
         if self.rank_preempted_requests and self.policy != "spf":
             raise ValueError(
                 "rank_preempted_requests requires the 'spf' scheduling "

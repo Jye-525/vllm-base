@@ -533,6 +533,18 @@ def test_scheduling_defaults_rank_whole_queue_without_aging_or_pkas():
         assert engine_args.rank_per_admission is False
 
 
+def test_preemption_victim_flag():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default = EngineArgs.from_cli_args(parser.parse_args([*CACHED_MODEL]))
+    assert default.preemption_victim == "lifo"
+    engine_args = EngineArgs.from_cli_args(
+        parser.parse_args([*CACHED_MODEL, "--preemption-victim", "least_done"])
+    )
+    assert engine_args.preemption_victim == "least_done"
+    with pytest.raises(SystemExit):
+        parser.parse_args([*CACHED_MODEL, "--preemption-victim", "most_kv"])
+
+
 @pytest.mark.parametrize(
     "flags",
     [

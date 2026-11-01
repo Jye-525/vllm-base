@@ -98,6 +98,7 @@ from vllm.config.scheduler import (
     PKASOutputPredictor,
     PKASSimulation,
     PolicyProfile,
+    PreemptionVictim,
     SchedulerPolicy,
 )
 from vllm.config.utils import get_field
@@ -621,6 +622,7 @@ class EngineArgs:
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
     spf_age_alpha: float = SchedulerConfig.spf_age_alpha
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
+    preemption_victim: PreemptionVictim = SchedulerConfig.preemption_victim
     rank_per_admission: bool = SchedulerConfig.rank_per_admission
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
     skip_eviction_max_protected: int = SchedulerConfig.skip_eviction_max_protected
@@ -1563,6 +1565,9 @@ class EngineArgs:
             **scheduler_kwargs["rank_preempted_requests"],
         )
         scheduler_group.add_argument(
+            "--preemption-victim", **scheduler_kwargs["preemption_victim"]
+        )
+        scheduler_group.add_argument(
             "--rank-per-admission", **scheduler_kwargs["rank_per_admission"]
         )
         scheduler_group.add_argument(
@@ -2258,6 +2263,7 @@ class EngineArgs:
             clpm_slo_budget_s=self.clpm_slo_budget_s,
             spf_age_alpha=self.spf_age_alpha,
             rank_preempted_requests=self.rank_preempted_requests,
+            preemption_victim=self.preemption_victim,
             rank_per_admission=self.rank_per_admission,
             kv_cache_eviction_policy=self.kv_cache_eviction_policy,
             skip_eviction_max_protected=self.skip_eviction_max_protected,
