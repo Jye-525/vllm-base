@@ -36,7 +36,6 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
-from vllm.v1.core.request_logger import RequestEventLogger
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -1641,12 +1640,6 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
-                        if (request_logger := RequestEventLogger.get()) is not None:
-                            request_logger.record_prefill(
-                                request.request_id,
-                                num_computed_tokens,
-                                num_external_computed_tokens,
-                            )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -3302,10 +3295,6 @@ class Scheduler(SchedulerInterface):
             self.predictive_admission.observe_completion(request.num_output_tokens)
         self._completed_token_high.pop(request.request_id, None)
         self._preemption_recovery_high.pop(request.request_id, None)
-
-        request_logger = RequestEventLogger.get()
-        if request_logger is not None:
-            request_logger.log_request(request)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

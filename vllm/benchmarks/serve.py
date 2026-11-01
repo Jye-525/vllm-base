@@ -57,14 +57,6 @@ from vllm.utils.network_utils import join_host_port
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
-
-def _merge_overrides(base: dict | None, override: dict | None) -> dict | None:
-    """Shallow merge request bodies, with per-request fields taking priority."""
-    if not base and not override:
-        return None
-    return {**(base or {}), **(override or {})}
-
-
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
 )
@@ -675,8 +667,6 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
-    test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
-    test_chat_messages = input_requests[0].chat_messages
 
     assert (
         test_mm_content is None
@@ -697,8 +687,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=test_extra_body,
-        chat_messages=test_chat_messages,
+        extra_body=extra_body,
     )
 
     if ready_check_timeout_sec > 0:
@@ -775,8 +764,7 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=test_extra_body,
-            chat_messages=test_chat_messages,
+            extra_body=extra_body,
         )
         profile_output = await request_func(
             request_func_input=profile_input, session=session
@@ -850,7 +838,6 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
-        per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -867,9 +854,8 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=per_request_extra_body,
+            extra_body=extra_body,
             request_id=request_id,
-            chat_messages=request.chat_messages,
         )
         tasks.append(
             asyncio.create_task(

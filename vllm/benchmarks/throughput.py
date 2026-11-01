@@ -18,7 +18,6 @@ from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
 from vllm.benchmarks.datasets import (
     AIMODataset,
     ASRDataset,
-    BFCLDataset,
     BurstGPTDataset,
     ConversationDataset,
     InstructCoderDataset,
@@ -392,11 +391,6 @@ def get_requests(args, tokenizer):
     elif args.dataset_name == "burstgpt":
         dataset_cls = BurstGPTDataset
     elif args.dataset_name == "hf":
-        if args.dataset_path in BFCLDataset.SUPPORTED_DATASET_PATHS:
-            raise ValueError(
-                "BFCL is only supported by the online serving benchmark. Use "
-                "'vllm bench serve --backend openai-chat'."
-            )
         if args.output_len is not None:
             sample_kwargs["output_len"] = args.output_len
         common_kwargs["hf_name"] = args.hf_name
@@ -578,11 +572,6 @@ def validate_args(args):
             stacklevel=2,
         )
     elif args.dataset_name == "hf":
-        if args.dataset_path in BFCLDataset.SUPPORTED_DATASET_PATHS:
-            raise ValueError(
-                "BFCL is only supported by the online serving benchmark. Use "
-                "'vllm bench serve --backend openai-chat'."
-            )
         if args.dataset_path in (
             VisionArenaDataset.SUPPORTED_DATASET_PATHS.keys()
             | MultiModalConversationDataset.SUPPORTED_DATASET_PATHS

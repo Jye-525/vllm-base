@@ -10,13 +10,7 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.block_logger import BlockEventLogger
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-
-
-def _get_block_logger():
-    """Lazy accessor; returns None when VLLM_BLOCK_LOG is unset."""
-    return BlockEventLogger.get()
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -253,19 +247,8 @@ class KVCacheManager:
         """Record local prefix-cache hits for an admitted request.
 
         Prefix-cache lookup can happen before request admission. Keep the
-        accounting here so failed admission attempts do not inflate hit stats
-        or block-event logs.
+        accounting here so failed admission attempts do not inflate hit stats.
         """
-        # -- Experiment 1 instrumentation: log cache hits --
-        if num_new_computed_tokens > 0 and (_blog := _get_block_logger()):
-            block_size = self.coordinator.block_pool.hash_block_size
-            num_hit_blocks = num_new_computed_tokens // block_size
-            for bh in request.block_hashes[:num_hit_blocks]:
-                _blog.log_cache_hit(
-                    block_hash=bh,
-                    request_id=request.request_id,
-                )
-
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(

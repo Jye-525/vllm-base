@@ -22,16 +22,13 @@ def test_insert_remove_and_shared_prefix() -> None:
     assert index.upsert("r2", [a, b, d]) == {a: 2, b: 2, d: 1}
     assert index.upsert("r3", [a, e]) == {a: 3, e: 1}
     assert dict(index.demand_max_depths) == {a: 1, b: 2, c: 3, d: 3, e: 2}
-
-    assert index.longest_shared_prefix_blocks("r1") == 2
-    assert index.cluster_info("r1") == (b, 2, 2)
-    assert index.cluster_info("r3") == (a, 1, 3)
-    assert index.request_score("r1") == 6
+    assert index.pending_count(a) == 3
+    assert index.pending_count(b) == 2
 
     assert index.discard("r2") == {a: 2, b: 1, d: 0}
     assert dict(index.demand_max_depths) == {a: 1, b: 2, c: 3, e: 2}
-    assert index.longest_shared_prefix_blocks("r1") == 1
-    assert index.cluster_info("r1") == (a, 1, 2)
+    assert index.pending_count(b) == 1
+    assert index.pending_count(d) == 0
 
 
 def test_upsert_updates_only_changed_hash_counts() -> None:

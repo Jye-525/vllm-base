@@ -79,7 +79,6 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
-    chat_messages: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -298,17 +297,15 @@ async def async_request_openai_chat_completions(
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Chat Completions API", "chat/completions")
 
-    if request_func_input.chat_messages is not None:
-        messages = request_func_input.chat_messages
-    else:
-        content = _get_chat_content(request_func_input, mm_position=mm_position)
-        messages = [{"role": "user", "content": content}]
+    content = _get_chat_content(request_func_input, mm_position=mm_position)
 
     payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
-        "messages": messages,
+        "messages": [
+            {"role": "user", "content": content},
+        ],
         "max_completion_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {

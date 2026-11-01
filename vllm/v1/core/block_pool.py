@@ -32,7 +32,6 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
-from vllm.v1.core.tier_logger import _get_tier_logger
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -253,16 +252,6 @@ class BlockPool:
         # reuse sit in its side pool, evicted after free_block_queue. Set by
         # the scheduler; None for every other policy.
         self._retention: DemandRetention | None = None
-
-        # Orphan tracking is intentionally disabled for the demand-aware
-        # experiment. vLLM already frees request blocks in reverse order, so
-        # suffix blocks normally become eviction candidates before prefix
-        # blocks. Keeping an explicit orphan heuristic adds stale-state risk
-        # and can conflict with Peek's demand priority.
-        #
-        # OrphanKey = tuple[BlockHash, int]
-        # self._children: dict[OrphanKey, set[OrphanKey]] = defaultdict(set)
-        # self._orphaned: set[OrphanKey] = set()
 
         # Peek-eviction effectiveness counters. Pure observability —
         # they do not influence eviction.
@@ -689,28 +678,6 @@ class BlockPool:
             if track_last_access:
                 self._block_hash_last_access[block_hash] = now
 
-            # Orphan tracking disabled; keep this as historical reference.
-            # block_key = (block_hash, kv_cache_group_id)
-            # self._orphaned.discard(block_key)
-
-            # Register parent->child link for per-group orphan tracking.
-            # Disabled for the demand-aware experiment.
-            j = num_cached_blocks + i
-            # if j > 0:
-            #     parent_hash = block_hashes[j - 1]
-            #     parent_key = (parent_hash, kv_cache_group_id)
-            #     self._children[parent_key].add(block_key)
-
-            # --- EXP 2 HOOK: GPU store ---
-            if (_tlog := _get_tier_logger()):
-                _parent_hash = block_hashes[j - 1] if j > 0 else None
-                _tlog.log_event(
-                    "gpu_store", block_hash, "gpu",
-                    parent_hash=_parent_hash,
-                    request_id=request.request_id,
-                )
-            # --- END EXP 2 HOOK ---
-
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -935,22 +902,6 @@ class BlockPool:
         self.num_evicted_cached_blocks += 1
         block.reset_hash()
 
-        # Orphan tracking disabled for demand-aware eviction. Historical
-        # implementation kept per-group parent->child state here, but the
-        # heuristic can become stale and conflict with Peek demand.
-        # raw_hash = get_block_hash(block_hash)
-        # group_id = get_group_id(block_hash)
-        # block_key = (raw_hash, group_id)
-        # self._orphaned.discard(block_key)
-        # for child in self._children.get(block_key, set()):
-        #     self._orphaned.add(child)
-        # self._children.pop(block_key, None)
-
-        # --- EXP 2 HOOK: GPU evict ---
-        if (_tlog := _get_tier_logger()):
-            _tlog.log_event("gpu_evict", get_block_hash(block_hash), "gpu")
-        # --- END EXP 2 HOOK ---
-
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
                 BlockRemoved(
@@ -1074,9 +1025,7 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Clear published Peek demand. Orphan tracking is disabled.
-        # self._children.clear()
-        # self._orphaned.clear()
+        # Clear published Peek demand.
         self._demand_counts = {}
         self._demand_max_depths = {}
         self._block_hash_last_access = {}
