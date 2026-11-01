@@ -62,8 +62,11 @@ def test_resume_after_midprefill_preemption_keeps_first_admission_hit():
     assert output.num_scheduled_tokens == {"a": 32}
     assert outs == []  # no token yet: prefill stats not reported
 
+    # Preempted mid-prefill. Outside schedule(), so (as reset_prefix_cache does)
+    # forget that it ran in the previous step: a resumed request never did.
     scheduler.running.remove(request)
-    scheduler._preempt_request(request, 0.0)  # preempted mid-prefill
+    scheduler._preempt_request(request, 0.0)
+    scheduler.prev_step_scheduled_req_ids.discard("a")
 
     output, outs = _step(scheduler)  # resume: hits its own first 32 tokens
     assert output.num_scheduled_tokens == {"a": 32}
