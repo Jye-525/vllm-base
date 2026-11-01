@@ -626,17 +626,6 @@ class Scheduler(SchedulerInterface):
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
         self._lpm_scan_start_ns = 0
-        # In-flight prefix deferral (SPF/SSPF): it waits for prefix-cache
-        # hits, so it is off without prefix caching.
-        self._defer_inflight = config.defer_inflight_prefixes
-        if self._defer_inflight and not self.cache_config.enable_prefix_caching:
-            logger.warning_once(
-                "defer_inflight_prefixes requires prefix caching; disabled."
-            )
-            self._defer_inflight = False
-        # Steps each waiting request was deferred, logged at admission.
-        self._defer_counts: dict[str, int] = {}
-        self._step_defers = 0
         rankers: dict[SchedulingPolicy, Callable[[list[Request]], RankPlan]] = {
             SchedulingPolicy.LPM: self._rank_lpm_candidates,
             SchedulingPolicy.CLPM: self._rank_clpm_candidates,
@@ -652,12 +641,11 @@ class Scheduler(SchedulerInterface):
                 )
             logger.info(
                 "%s scheduling: age_alpha=%.3f tokens/s, window=%d, "
-                "rank_preempted=%s, defer_inflight_prefixes=%s",
+                "rank_preempted=%s",
                 name,
                 self._spf_age_alpha,
                 config.lpm_window_size,
                 self._rank_preempted,
-                self._defer_inflight,
             )
         if self._rank_per_admission:
             logger.info(
@@ -890,46 +878,6 @@ class Scheduler(SchedulerInterface):
                 - len(path) * block_size
             )
         return rank_sspf(candidates, costs, self._spf_age_alpha)
-
-    def _inflight_prefix_blocks(self) -> set[BlockHash]:
-        """Block hashes running requests have not computed yet.
-
-        ``num_computed_tokens`` advances only after scheduling, so this
-        includes blocks being computed this step. Those are already in the
-        prefix cache (blocks are cached at allocation), so they show up as
-        hits, not as a waiting request's next uncached block.
-        """
-        block_size = self.kv_cache_manager.block_pool.hash_block_size
-        blocks: set[BlockHash] = set()
-        for request in self.running:
-            first_uncomputed = request.num_computed_tokens // block_size
-            blocks.update(request.block_hashes[first_uncomputed:])
-        return blocks
-
-    def _next_block_inflight(
-        self,
-        request: Request,
-        num_local_hit_tokens: int,
-        inflight_blocks: set[BlockHash],
-    ) -> bool:
-        """Whether a fresh request's next uncached block is in flight."""
-        if (
-            request.status != RequestStatus.WAITING
-            or request.skip_reading_prefix_cache
-            or not inflight_blocks
-        ):
-            return False
-        block_hashes = request.block_hashes
-        block_size = self.kv_cache_manager.block_pool.hash_block_size
-        next_block = num_local_hit_tokens // block_size
-        # A block holding the last prompt token is recomputed even when
-        # cached (hits stop at num_tokens - 1): waiting for it gains nothing.
-        if (next_block + 1) * block_size >= request.num_tokens:
-            return False
-        return (
-            next_block < len(block_hashes)
-            and block_hashes[next_block] in inflight_blocks
-        )
 
     def _commit_clpm_admission(
         self, request_id: str, rank_plan: RankPlan | None
@@ -1189,7 +1137,6 @@ class Scheduler(SchedulerInterface):
         self._step_rerank_count = 0
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
-        self._step_defers = 0
         self._step_skip_protectable = []
         self._step_id += 1
         self._step_evicted_blocks_start = (
@@ -1464,11 +1411,6 @@ class Scheduler(SchedulerInterface):
             # LPM admission skips: unfit requests set aside this step, in
             # ranked order. One admission after a skip ends the step.
             lpm_skipped: list[Request] = []
-            # In-flight prefix deferral: requests held back this step, in
-            # ranked order, and the blocks running requests have yet to
-            # compute (built at the first check).
-            deferred: list[Request] = []
-            inflight_blocks: set[BlockHash] | None = None
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -1521,20 +1463,6 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
-                    if self._defer_inflight and request_queue is self.waiting:
-                        if inflight_blocks is None:
-                            inflight_blocks = self._inflight_prefix_blocks()
-                        if self._next_block_inflight(
-                            request, num_new_local_computed_tokens, inflight_blocks
-                        ):
-                            # Wait for the running request to cache it.
-                            request_queue.pop_request()
-                            deferred.append(request)
-                            self._defer_counts[request_id] = (
-                                self._defer_counts.get(request_id, 0) + 1
-                            )
-                            self._step_defers += 1
-                            continue
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1776,7 +1704,6 @@ class Scheduler(SchedulerInterface):
                     request.request_id, 0
                 )
                 self._lpm_last_skip_hits.pop(request.request_id, None)
-                deferred_steps = self._defer_counts.pop(request.request_id, 0)
                 if lpm_bypassed:
                     # Its hit blocks are allocated now; drop the protection.
                     self._unprotect_skipped_request(request)
@@ -1828,13 +1755,13 @@ class Scheduler(SchedulerInterface):
                 logger.info(
                     "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
                     "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s%s%s",
+                    "running=%d%s%s",
                     self._step_id,
                     request.request_id,
                     request.num_tokens,
                     num_new_local_computed_tokens,
                     num_new_tokens,
-                    len(self.waiting) + len(lpm_skipped) + len(deferred),
+                    len(self.waiting) + len(lpm_skipped),
                     len(self.running),
                     "" if pkas_target is None
                     else f" pkas_target_output_tokens={pkas_target}",
@@ -1842,16 +1769,9 @@ class Scheduler(SchedulerInterface):
                     f" lpm_first_skip_hit={lpm_first_skip_hit}"
                     if lpm_bypassed
                     else "",
-                    f" deferred_steps={deferred_steps}" if deferred_steps else "",
                 )
 
                 self.running.append(request)
-                if inflight_blocks is not None:
-                    # Its uncached blocks are in flight for later requests.
-                    hash_block_size = self.kv_cache_manager.block_pool.hash_block_size
-                    inflight_blocks.update(
-                        request.block_hashes[num_computed_tokens // hash_block_size :]
-                    )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1899,10 +1819,6 @@ class Scheduler(SchedulerInterface):
 
             if self._rank_per_admission:
                 self.kv_cache_manager.block_pool.stop_eviction_log()
-
-            # Return the deferred requests to the head in ranked order.
-            for deferred_request in reversed(deferred):
-                self.waiting.prepend_request(deferred_request)
 
             if lpm_skipped:
                 # Return the skipped requests to the head in ranked order.
@@ -1975,8 +1891,6 @@ class Scheduler(SchedulerInterface):
                 pool.num_skip_protected_evictions
                 - self._step_skip_protected_evictions_start
             )
-        if self._defer_inflight:
-            batch_record["deferred"] = self._step_defers
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -3156,7 +3070,6 @@ class Scheduler(SchedulerInterface):
             self._unprotect_skipped_request(request)
         self._lpm_first_skip_hits.pop(request.request_id, None)
         self._lpm_last_skip_hits.pop(request.request_id, None)
-        self._defer_counts.pop(request.request_id, None)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,

@@ -540,6 +540,7 @@ def test_scheduling_defaults_rank_whole_queue_without_aging_or_pkas():
         ["--scheduling-policy", "dspf"],
         ["--sjf-age-alpha", "1"],
         ["--pkas-output-predictor", "legacy"],
+        ["--defer-inflight-prefixes"],
     ],
 )
 def test_removed_scheduling_options_are_rejected(flags):

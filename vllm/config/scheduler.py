@@ -224,13 +224,6 @@ class SchedulerConfig:
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
 
-    defer_inflight_prefixes: bool = False
-    """For SPF and SSPF, hold back a fresh waiting request whose next
-    uncached prompt block a running request (or one admitted earlier in the
-    step) has yet to compute, so it later reads that block from the prefix
-    cache instead of computing it again. Admission continues with the next
-    request. Needs prefix caching."""
-
     rank_per_admission: bool = False
     """For LPM and SPF, re-rank the waiting window after an admission when
     that admission changed another waiting request's prefix hits (cached a
@@ -407,11 +400,6 @@ class SchedulerConfig:
             raise ValueError(
                 "rank_preempted_requests requires the 'spf' scheduling "
                 f"policy, not {self.policy!r}"
-            )
-        if self.defer_inflight_prefixes and self.policy not in ("spf", "sspf"):
-            raise ValueError(
-                "defer_inflight_prefixes requires the 'spf' or 'sspf' "
-                f"scheduling policy, not {self.policy!r}"
             )
         if self.rank_per_admission:
             if self.policy not in ("lpm", "spf"):

@@ -531,7 +531,7 @@ def test_sspf_amortizes_shared_uncached_prefix(policy, first):
         ]
 
 
-def _leader_sibling_other(policy: str, defer: bool) -> Scheduler:
+def _leader_sibling_other(policy: str) -> Scheduler:
     """Leader and sibling share a 64-token cold prefix; the leader prefills
     32 tokens per step, so the shared blocks are in flight for two steps."""
     scheduler = create_scheduler(
@@ -540,7 +540,6 @@ def _leader_sibling_other(policy: str, defer: bool) -> Scheduler:
         lpm_window_size=0,
         spf_age_alpha=0.0,
         long_prefill_token_threshold=32,
-        defer_inflight_prefixes=defer,
     )
     shared = list(range(1, 65))
     for request_id, prompt in (
@@ -553,75 +552,17 @@ def _leader_sibling_other(policy: str, defer: bool) -> Scheduler:
 
 
 @pytest.mark.parametrize("policy", ["spf", "sspf"])
-def test_defer_inflight_prefix_waits_for_cache_hit(policy):
-    scheduler = _leader_sibling_other(policy, defer=True)
-
-    # The leader caches blocks 0-1 at allocation; the sibling's next block
-    # (2) is still in flight, so it waits and "other" is admitted past it.
-    first = scheduler.schedule()
-    assert [req.req_id for req in first.scheduled_new_reqs] == ["leader", "other"]
-    assert [req.request_id for req in scheduler.waiting] == ["sibling"]
-    assert scheduler._step_defers == 1
-    assert scheduler._defer_counts == {"sibling": 1}
-
-    # The leader's second chunk caches blocks 2-3: the sibling now reads the
-    # whole shared prefix from the cache.
-    second = scheduler.schedule()
-    assert [req.req_id for req in second.scheduled_new_reqs] == ["sibling"]
-    assert second.scheduled_new_reqs[0].num_computed_tokens == 64
-    assert scheduler._step_defers == 0
-    assert scheduler._defer_counts == {}
-
-
-def test_defer_skips_a_last_block_recomputed_anyway():
-    scheduler = create_scheduler(
-        enable_prefix_caching=True,
-        scheduling_policy="sspf",
-        lpm_window_size=0,
-        spf_age_alpha=0.0,
-        defer_inflight_prefixes=True,
-    )
-    prompt = list(range(1, 65))
-    scheduler.add_request(_token_request("leader", prompt))
-    scheduler.add_request(_token_request("twin", prompt))
-
-    output = scheduler.schedule()
-
-    # Hits stop at num_tokens - 1, so the twin recomputes its last block
-    # whether or not it waits for the leader's copy.
-    new_reqs = {req.req_id: req for req in output.scheduled_new_reqs}
-    assert list(new_reqs) == ["leader", "twin"]
-    assert new_reqs["twin"].num_computed_tokens == 48
-    assert scheduler._step_defers == 0
-
-
-def test_without_defer_sibling_recomputes_inflight_prefix():
-    scheduler = _leader_sibling_other("spf", defer=False)
+def test_sibling_recomputes_unpublished_part_of_inflight_prefix(policy):
+    """Allocation publishes only the leader's scheduled chunk (blocks 0-1), so
+    a sibling admitted in the same step hits those and recomputes the
+    leader's still-unscheduled shared blocks (design D.3.4)."""
+    scheduler = _leader_sibling_other(policy)
 
     output = scheduler.schedule()
 
     new_reqs = {req.req_id: req for req in output.scheduled_new_reqs}
     assert list(new_reqs) == ["leader", "sibling", "other"]
     assert new_reqs["sibling"].num_computed_tokens == 32
-
-
-def test_defer_inflight_prefixes_requires_spf_or_sspf():
-    with pytest.raises(ValueError, match="defer_inflight_prefixes"):
-        create_scheduler(
-            enable_prefix_caching=True,
-            scheduling_policy="lpm",
-            defer_inflight_prefixes=True,
-        )
-
-
-def test_defer_inflight_prefixes_is_off_without_prefix_caching():
-    scheduler = create_scheduler(
-        enable_prefix_caching=False,
-        scheduling_policy="sspf",
-        defer_inflight_prefixes=True,
-    )
-    assert scheduler.policy == SchedulingPolicy.SSPF
-    assert not scheduler._defer_inflight
 
 
 def _lpm_skip_scheduler(lpm_admission_skips: int, **kwargs) -> Scheduler:
