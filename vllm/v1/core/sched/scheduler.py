@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.demand_retention import DemandRetention
 from vllm.v1.core.sched.session_credit import SessionCreditTracker, session_id_of
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
@@ -355,6 +356,39 @@ class Scheduler(SchedulerInterface):
                 "waiting requests, evicting them after all other free blocks.",
                 self._skip_eviction_max_protected,
             )
+        # Demand-aware retention (SSPF series): free cached blocks that waiting
+        # requests or held session turns will reuse are evicted last.
+        self._retention: DemandRetention | None = None
+        self._retention_ns_logged = 0
+        if self._eviction_policy == "demand":
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                len(groups) != 1
+                or groups[0].kv_cache_spec.block_size != block_pool.hash_block_size
+            ):
+                raise ValueError(
+                    "kv_cache_eviction_policy='demand' requires a single KV cache "
+                    "group whose block size equals the hash block size"
+                )
+            if self.connector is not None:
+                raise ValueError(
+                    "kv_cache_eviction_policy='demand' does not support KV connectors"
+                )
+            self._retention = DemandRetention(
+                block_pool,
+                self.pending_prefix_index.demand_counts,
+                self.pending_prefix_index.demand_max_depths,
+                ttl_factor=self.scheduler_config.demand_hold_ttl_factor,
+                initial_gap_s=self.scheduler_config.demand_hold_initial_gap_s,
+            )
+            block_pool._retention = self._retention
+            logger.info(
+                "Demand-aware retention: evict blocks with predicted reuse last; "
+                "hold finished session turns for %.1f x the predicted tool gap "
+                "(initially %.1f s).",
+                self.scheduler_config.demand_hold_ttl_factor,
+                self.scheduler_config.demand_hold_initial_gap_s,
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -620,6 +654,8 @@ class Scheduler(SchedulerInterface):
             ready=request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED),
         )
         self._update_pending_demand(counts)
+        if self._retention is not None and counts:
+            self._retention.on_demand_change(counts, request.block_hashes)
 
     def _set_waiting_request_ready(self, request: Request) -> None:
         self.pending_prefix_index.set_ready(
@@ -628,8 +664,11 @@ class Scheduler(SchedulerInterface):
         )
 
     def _untrack_waiting_request(self, request: Request) -> None:
+        path = self.pending_prefix_index.request_path(request.request_id)
         counts = self.pending_prefix_index.discard(request.request_id)
         self._update_pending_demand(counts)
+        if self._retention is not None and counts:
+            self._retention.on_demand_change(counts, path or ())
 
     def _republish_pending_demand(self) -> None:
         if self._eviction_policy != "peek":
@@ -1204,6 +1243,8 @@ class Scheduler(SchedulerInterface):
         schedule_start_ns = time.perf_counter_ns()
         if self._pending_batch_logs:
             self._flush_pending_batch_logs()
+        if self._retention is not None:
+            self._retention.expire_holds()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
@@ -1472,6 +1513,16 @@ class Scheduler(SchedulerInterface):
             rank_start_ns = time.perf_counter_ns()
             prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
+            if self._retention is not None and self.waiting:
+                # Ranks for retention: the waiting order (index paths) now.
+                index = self.pending_prefix_index
+                self._retention.set_snapshot([
+                    (
+                        index.request_path(r.request_id) or (),
+                        r.num_prompt_tokens // self.block_size,
+                    )
+                    for r in self.waiting
+                ])
             if self._skip_eviction and self._lpm_bypass_counts:
                 self._refresh_skip_protection()
             predictive_admission_state = None
@@ -1984,6 +2035,17 @@ class Scheduler(SchedulerInterface):
         self._step_arrival_ns = 0
         if self._session_credit is not None:
             batch_record["credited"] = self._step_credited
+        if self._retention is not None:
+            retention = self._retention
+            batch_record["retention_free_blocks"] = len(retention.side)
+            batch_record["retention_hold_evictions"] = retention.num_hold_evictions
+            batch_record["retention_demand_evictions"] = retention.num_demand_evictions
+            # Retention work since the previous step's record, including
+            # arrivals, holds and frees in between.
+            batch_record["retention_ns"] = (
+                retention.elapsed_ns - self._retention_ns_logged
+            )
+            self._retention_ns_logged = retention.elapsed_ns
         if self._skip_eviction:
             pool = self.kv_cache_manager.block_pool
             batch_record["skip_protected_reqs"] = len(self._skip_protected)
@@ -2271,6 +2333,8 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self._track_waiting_request(request)
+        if self._retention is not None:
+            self._retention.on_preempt(request.block_hashes)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -3133,6 +3197,12 @@ class Scheduler(SchedulerInterface):
                     self._session_credit.on_arrival(
                         request.request_id, session_id, path or ()
                     )
+            if self._retention is not None and not request.resumable:
+                session_id = session_id_of(request)
+                if session_id is not None:
+                    # The turn's own demand replaces its session's hold.
+                    self._retention.turn_arrived(session_id, request.arrival_time)
+                    self._retention.drop_hold(session_id)
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
@@ -3238,6 +3308,19 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if (
+            self._retention is not None
+            and not delay_free_blocks
+            and request.status
+            in (RequestStatus.FINISHED_STOPPED, RequestStatus.FINISHED_LENGTH_CAPPED)
+        ):
+            session_id = session_id_of(request)
+            if session_id is not None:
+                # Before freeing, so the turn's blocks go to the side pool.
+                self._retention.hold_turn(
+                    session_id,
+                    request.block_hashes[: request.num_tokens // self.block_size],
+                )
         if not delay_free_blocks:
             self._free_blocks(request)
 

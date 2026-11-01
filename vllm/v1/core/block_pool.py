@@ -7,7 +7,7 @@ import os
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -34,6 +34,9 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.tier_logger import _get_tier_logger
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.demand_retention import DemandRetention
 
 logger = init_logger(__name__)
 
@@ -246,6 +249,10 @@ class BlockPool:
         self._skip_victims: list[tuple[int, int, int]] | None = None
         # Protected blocks reused as new blocks (cumulative).
         self.num_skip_protected_evictions = 0
+        # Demand-aware retention ("demand"): free cached blocks with predicted
+        # reuse sit in its side pool, evicted after free_block_queue. Set by
+        # the scheduler; None for every other policy.
+        self._retention: DemandRetention | None = None
 
         # Orphan tracking is intentionally disabled for the demand-aware
         # experiment. vLLM already frees request blocks in reverse order, so
@@ -786,6 +793,13 @@ class BlockPool:
             if num_lru < num_blocks:
                 ret += self._pop_skip_protected_victims(num_blocks - num_lru)
             self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
+        elif self._retention is not None and self._retention.side:
+            # Demand-aware retention: plain LRU first, predicted reuse last.
+            num_lru = min(num_blocks, self.free_block_queue.num_free_blocks)
+            ret = self.free_block_queue.popleft_n(num_lru)
+            if num_lru < num_blocks:
+                ret += self._retention.pop_victims(num_blocks - num_lru)
+            self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
             self._trace_eviction_selection(num_blocks, ret, walked=num_blocks)
@@ -966,6 +980,10 @@ class BlockPool:
                 block.ref_cnt == 0
                 and not block.is_null
                 and self._skip_side_pool.pop(block.block_id, None) is None
+                and (
+                    self._retention is None
+                    or self._retention.side.pop(block.block_id, None) is None
+                )
             ):
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
@@ -995,6 +1013,17 @@ class BlockPool:
                 else:
                     unprotected.append(block)
             freed = unprotected
+        elif self._retention is not None:
+            retention = self._retention
+            unwanted = []
+            for block in freed:
+                if block.block_hash is not None and retention.wanted(
+                    get_block_hash(block.block_hash)
+                ):
+                    retention.add(block)
+                else:
+                    unwanted.append(block)
+            freed = unwanted
         self.free_block_queue.append_n(freed)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -1014,9 +1043,12 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            if (
-                self._maybe_evict_cached_block(block)
-                and self._skip_side_pool.pop(block_id, None) is not None
+            if self._maybe_evict_cached_block(block) and (
+                self._skip_side_pool.pop(block_id, None) is not None
+                or (
+                    self._retention is not None
+                    and self._retention.side.pop(block_id, None) is not None
+                )
             ):
                 # No longer cached, so no longer protected: reuse it first.
                 self.free_block_queue.appendleft(block)
@@ -1057,6 +1089,9 @@ class BlockPool:
         self._skip_protect_counts.clear()
         self._skip_eviction_keys = None
         self._skip_victims = None
+        # Drop retention: every prediction refers to KV being cleared.
+        if self._retention is not None:
+            self.free_block_queue.append_n(self._retention.reset())
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
@@ -1078,7 +1113,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks + len(self._skip_side_pool)
+        return (
+            self.free_block_queue.num_free_blocks
+            + len(self._skip_side_pool)
+            + (len(self._retention.side) if self._retention is not None else 0)
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

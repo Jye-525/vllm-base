@@ -22,7 +22,7 @@ RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sspf"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
-KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
+KVCacheEvictionPolicy = Literal["lru", "peek", "skip", "demand"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 PKASOutputPredictor = Literal["paper", "quantile"]
 PKASSimulation = Literal["paper", "repo"]
@@ -252,7 +252,19 @@ class SchedulerConfig:
     """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
     ``peek`` protects blocks demanded by waiting requests; ``skip`` protects
     the prefixes of waiting requests that LPM admission skipped (requires
-    ``lpm_admission_skips``)."""
+    ``lpm_admission_skips``); ``demand`` (SSPF series) evicts free cached
+    blocks with predicted reuse only after all others: finished session turns
+    held for their predicted tool gap first, then blocks waiting requests
+    need, worst-ranked request and deepest block first."""
+
+    demand_hold_ttl_factor: float = Field(default=2.0, gt=0.0)
+    """For ``demand`` eviction, hold a finished session turn's KV for this
+    many times the session's predicted tool gap (an average of observed
+    gaps between a turn's finish and the next turn's arrival)."""
+
+    demand_hold_initial_gap_s: float = Field(default=5.0, ge=0.0)
+    """For ``demand`` eviction, the predicted tool gap before any gap has been
+    observed."""
 
     skip_eviction_max_protected: int = Field(default=8, ge=1)
     """For ``skip`` eviction, the number of skipped waiting requests whose
