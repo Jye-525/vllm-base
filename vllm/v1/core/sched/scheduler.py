@@ -1626,8 +1626,15 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats is not None:
+                    # Track first scheduled prefill, not post-preemption repeat prefills.
+                    # The stats are only taken with the first output token, so a
+                    # request preempted mid-prefill still holds them on resume:
+                    # without the preemption check its resume would overwrite the
+                    # first admission's hit with the (larger) resume hit.
+                    if (
+                        request.prefill_stats is not None
+                        and request.num_preemptions == 0
+                    ):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
