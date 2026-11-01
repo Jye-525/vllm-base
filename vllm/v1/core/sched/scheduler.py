@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.session_credit import SessionCreditTracker, session_id_of
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
 from vllm.v1.core.sched.waiting_ranker import (
@@ -467,6 +468,22 @@ class Scheduler(SchedulerInterface):
         # Preemption victim: max() over self.running with this key, or None
         # for stock LIFO (running.pop()).
         self._victim_key = self._make_victim_key()
+        # SSPF session-history credit (None: disabled, no per-request work).
+        self._credit_weight = self.scheduler_config.sspf_session_credit_weight
+        self._session_credit: SessionCreditTracker | None = (
+            SessionCreditTracker() if self._credit_weight < 1.0 else None
+        )
+        # Last SSPF prices by request id (logged at admission) and the number
+        # of candidates whose price a credit lowered (schedule_batch).
+        self._sspf_costs: dict[str, float] = {}
+        self._step_credited = 0
+        if self._session_credit is not None:
+            logger.info(
+                "SSPF session credit: weight %.2f per evicted previous-turn "
+                "prompt block (session id from extra_args[%r]).",
+                self._credit_weight,
+                "session_id",
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -914,19 +931,28 @@ class Scheduler(SchedulerInterface):
         index = self.pending_prefix_index
         block_size = self.kv_cache_manager.block_pool.hash_block_size
         prefix_hits = self._prefix_hits(candidates)
+        tracker = self._session_credit
         costs: dict[str, float] = {}
+        credited = 0
         for request in candidates:
             request_id = request.request_id
             path = index.request_path(request_id)
             if path is None:
                 raise RuntimeError("Prefix index is inconsistent with waiting queue")
             hit_blocks = prefix_hits[request_id] // block_size
+            credit_blocks = 0 if tracker is None else tracker.credit(request_id)
+            credited += credit_blocks > hit_blocks
             costs[request_id] = sspf_cost(
                 request.num_tokens,
                 len(path),
                 block_size,
                 index.amortized_blocks(request_id, hit_blocks),
+                hit_blocks,
+                credit_blocks,
+                self._credit_weight,
             )
+        self._sspf_costs = costs
+        self._step_credited = credited
         return rank_sspf(candidates, costs, self._spf_age_alpha)
 
     def _commit_clpm_admission(
@@ -1181,6 +1207,8 @@ class Scheduler(SchedulerInterface):
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
+        self._sspf_costs = {}
+        self._step_credited = 0
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
         self._step_skip_protectable = []
@@ -1753,6 +1781,12 @@ class Scheduler(SchedulerInterface):
                 # policies have already reordered the bounded queue prefix.
                 request = request_queue.pop_request()
                 self._pkas_reject_cache.pop(request.request_id, None)
+                credit_blocks = (
+                    0
+                    if self._session_credit is None
+                    else self._session_credit.drop(request.request_id)
+                )
+                sspf_price = self._sspf_costs.pop(request.request_id, None)
                 lpm_bypassed = self._lpm_bypass_counts.pop(request.request_id, 0)
                 lpm_first_skip_hit = self._lpm_first_skip_hits.pop(
                     request.request_id, 0
@@ -1809,7 +1843,7 @@ class Scheduler(SchedulerInterface):
                 logger.info(
                     "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
                     "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s%s",
+                    "running=%d%s%s%s%s",
                     self._step_id,
                     request.request_id,
                     request.num_tokens,
@@ -1823,6 +1857,8 @@ class Scheduler(SchedulerInterface):
                     f" lpm_first_skip_hit={lpm_first_skip_hit}"
                     if lpm_bypassed
                     else "",
+                    "" if sspf_price is None else f" sspf_cost={sspf_price:.1f}",
+                    f" credit_blocks={credit_blocks}" if credit_blocks else "",
                 )
 
                 self.running.append(request)
@@ -1946,6 +1982,8 @@ class Scheduler(SchedulerInterface):
             pkas=self._pkas_step_stats,
         )
         self._step_arrival_ns = 0
+        if self._session_credit is not None:
+            batch_record["credited"] = self._step_credited
         if self._skip_eviction:
             pool = self.kv_cache_manager.block_pool
             batch_record["skip_protected_reqs"] = len(self._skip_protected)
@@ -3087,6 +3125,14 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self._track_waiting_request(request)
+            if self._session_credit is not None and not request.resumable:
+                session_id = session_id_of(request)
+                if session_id is not None:
+                    # The index path at arrival: prompt full blocks only.
+                    path = self.pending_prefix_index.request_path(request.request_id)
+                    self._session_credit.on_arrival(
+                        request.request_id, session_id, path or ()
+                    )
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
@@ -3169,6 +3215,8 @@ class Scheduler(SchedulerInterface):
             self._unprotect_skipped_request(request)
         self._lpm_first_skip_hits.pop(request.request_id, None)
         self._lpm_last_skip_hits.pop(request.request_id, None)
+        if self._session_credit is not None:
+            self._session_credit.drop(request.request_id)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,
@@ -3261,6 +3309,9 @@ class Scheduler(SchedulerInterface):
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_successful:
             self._republish_pending_demand()
+            if self._session_credit is not None:
+                # Warmup turns must not become the measured turns' history.
+                self._session_credit.clear_sessions()
             if reset_running_requests and self.predictive_admission is not None:
                 # Benchmarks reset between warmup and measurement; completed
                 # warmup lengths must not shape the measured forecast. Batch

@@ -623,6 +623,7 @@ class EngineArgs:
     spf_age_alpha: float = SchedulerConfig.spf_age_alpha
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
     preemption_victim: PreemptionVictim = SchedulerConfig.preemption_victim
+    sspf_session_credit_weight: float = SchedulerConfig.sspf_session_credit_weight
     rank_per_admission: bool = SchedulerConfig.rank_per_admission
     kv_cache_eviction_policy: KVCacheEvictionPolicy | None = None
     skip_eviction_max_protected: int = SchedulerConfig.skip_eviction_max_protected
@@ -1568,6 +1569,10 @@ class EngineArgs:
             "--preemption-victim", **scheduler_kwargs["preemption_victim"]
         )
         scheduler_group.add_argument(
+            "--sspf-session-credit-weight",
+            **scheduler_kwargs["sspf_session_credit_weight"],
+        )
+        scheduler_group.add_argument(
             "--rank-per-admission", **scheduler_kwargs["rank_per_admission"]
         )
         scheduler_group.add_argument(
@@ -2264,6 +2269,7 @@ class EngineArgs:
             spf_age_alpha=self.spf_age_alpha,
             rank_preempted_requests=self.rank_preempted_requests,
             preemption_victim=self.preemption_victim,
+            sspf_session_credit_weight=self.sspf_session_credit_weight,
             rank_per_admission=self.rank_per_admission,
             kv_cache_eviction_policy=self.kv_cache_eviction_policy,
             skip_eviction_max_protected=self.skip_eviction_max_protected,

@@ -101,17 +101,28 @@ def sspf_cost(
     num_full_blocks: int,
     block_size: int,
     amortized_blocks: float,
+    hit_blocks: int = 0,
+    credit_blocks: int = 0,
+    credit_weight: float = 1.0,
 ) -> float:
     """Sharing-amortized uncached prefill price of a waiting request, in tokens.
 
     ``amortized_blocks`` is the sum of ``1 / n(b)`` over the request's full
-    blocks past its usable prefix hit, where ``n(b)`` counts the waiting
-    requests (fresh or preempted) that contain block ``b``. The trailing
-    partial block, ``num_tokens - num_full_blocks * block_size`` tokens, is
-    private and counts in full. Same formula as the simulator's SSPF key
-    (``simulator/kvsim.py`` ``Sim.rank``).
+    blocks past its usable prefix hit (``hit_blocks``), where ``n(b)`` counts
+    the waiting requests (fresh or preempted) that contain block ``b``. The
+    trailing partial block, ``num_tokens - num_full_blocks * block_size``
+    tokens, is private and counts in full.
+
+    Session credit: each of the ``credit_blocks`` leading blocks shared with
+    the session's previous turn that is not a usable hit is discounted by
+    ``(1 - credit_weight) * block_size`` tokens. No clipping: the price can
+    go negative. Same key as the simulator (``simulator/kvsim.py``
+    ``Sim.rank``); with ``credit_weight == 1`` it is plain SSPF.
     """
-    return block_size * amortized_blocks + num_tokens - num_full_blocks * block_size
+    cost = block_size * amortized_blocks + num_tokens - num_full_blocks * block_size
+    if credit_weight != 1.0:
+        cost -= (1.0 - credit_weight) * block_size * max(0, credit_blocks - hit_blocks)
+    return cost
 
 
 def rank_sspf(

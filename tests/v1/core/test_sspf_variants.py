@@ -96,6 +96,25 @@ def test_sspf_cost_matches_simulator_formula(
     assert sspf_cost(num_tokens, num_full_blocks, BS, amortized) == expected
 
 
+@pytest.mark.parametrize(
+    ("hit_blocks", "credit_blocks", "weight", "expected"),
+    [
+        (0, 4, 1.0, 80.0),  # weight 1: plain SSPF, credit ignored
+        (4, 4, 0.5, 80.0),  # whole credited history still cached: no discount
+        (1, 4, 0.5, 56.0),  # 3 evicted credited blocks: 80 - 0.5 * 16 * 3
+        (0, 4, 0.0, 16.0),  # w = 0 fully offsets evicted history
+    ],
+)
+def test_sspf_cost_session_credit(hit_blocks, credit_blocks, weight, expected):
+    # 5 full blocks, all private (amortized 5), price 80 before credit.
+    assert sspf_cost(80, 5, BS, 5.0, hit_blocks, credit_blocks, weight) == expected
+
+
+def test_sspf_cost_session_credit_is_not_clipped():
+    # A shared credited block can leave a negative price (frozen rule).
+    assert sspf_cost(64, 4, BS, 4 / 4, 0, 4, 0.0) == pytest.approx(16 - 64)
+
+
 def test_sspf_without_sharing_orders_as_spf():
     prompts = {
         "a": list(range(1, 81)),

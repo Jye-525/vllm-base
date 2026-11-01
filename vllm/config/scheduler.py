@@ -225,6 +225,14 @@ class SchedulerConfig:
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
 
+    sspf_session_credit_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    """SSPF session-history credit weight ``w``. A request whose
+    ``SamplingParams.extra_args["session_id"]`` (OpenAI ``vllm_xargs``) names
+    a session gets, once at arrival, credit for the leading prompt blocks it
+    shares with that session's previous arrived turn. Each credited block
+    past the usable cache hit lowers its SSPF price by ``(1 - w)`` blocks of
+    tokens. 1.0 (the default) disables credit; the SSPF series uses 0.5."""
+
     preemption_victim: PreemptionVictim = "lifo"
     """Which running request to preempt when a running request cannot get KV
     blocks. ``lifo`` (stock vLLM) preempts the last admitted one;
@@ -405,6 +413,11 @@ class SchedulerConfig:
                 self.long_prefill_token_threshold,
             )
 
+        if self.sspf_session_credit_weight < 1.0 and self.policy != "sspf":
+            raise ValueError(
+                "sspf_session_credit_weight < 1 requires the 'sspf' scheduling "
+                f"policy, not {self.policy!r}"
+            )
         if self.preemption_victim != "lifo":
             if self.policy == "priority":
                 raise ValueError(
