@@ -62,6 +62,7 @@ from vllm.v1.core.sched.waiting_ranker import (
     rank_lpm,
     rank_spf,
     rank_sspf,
+    sspf_cost,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
@@ -485,9 +486,16 @@ class Scheduler(SchedulerInterface):
         self._completed_token_high: dict[str, int] = {}
         self._preemption_recovery_high: dict[str, int] = {}
         self._step_preempted_tokens = 0
+        # id(scheduler_output) -> (record, intervals, recomputed). Every step's
+        # schedule_batch line is written at the end of update_from_output, so
+        # it carries the scheduling and output-processing times. intervals is
+        # None for a step without cost accounting; recomputed is then logged.
         self._pending_batch_logs: dict[
-            int, tuple[tuple[Any, ...], dict[str, tuple[int, int, int]]]
+            int,
+            tuple[dict[str, Any], dict[str, tuple[int, int, int]] | None, int],
         ] = {}
+        # add_request work since the previous schedule() (arrival_ns).
+        self._step_arrival_ns = 0
 
     def _mamba_block_aligned_split(
         self,
@@ -872,10 +880,11 @@ class Scheduler(SchedulerInterface):
             if path is None:
                 raise RuntimeError("Prefix index is inconsistent with waiting queue")
             hit_blocks = prefix_hits[request_id] // block_size
-            costs[request_id] = (
-                block_size * index.amortized_blocks(request_id, hit_blocks)
-                + request.num_tokens
-                - len(path) * block_size
+            costs[request_id] = sspf_cost(
+                request.num_tokens,
+                len(path),
+                block_size,
+                index.amortized_blocks(request_id, hit_blocks),
             )
         return rank_sspf(candidates, costs, self._spf_age_alpha)
 
@@ -1125,13 +1134,9 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        schedule_start_ns = time.perf_counter_ns()
         if self._pending_batch_logs:
-            # Overlapping execution cannot use the synchronous accounting path.
-            self._preemption_cost_supported = False
-            for record, _ in self._pending_batch_logs.values():
-                record["preempted_tokens"] = -1
-                self._log_schedule_batch(record, -1)
-            self._pending_batch_logs.clear()
+            self._flush_pending_batch_logs()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
@@ -1198,6 +1203,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
+        running_start_ns = time.perf_counter_ns()
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -1370,6 +1376,8 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        running_ns = time.perf_counter_ns() - running_start_ns
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -1381,6 +1389,7 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         prefix_rank_plan: RankPlan | None = None
+        admit_ns = 0
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -1411,6 +1420,8 @@ class Scheduler(SchedulerInterface):
             # LPM admission skips: unfit requests set aside this step, in
             # ranked order. One admission after a skip ends the step.
             lpm_skipped: list[Request] = []
+            admit_start_ns = time.perf_counter_ns()
+            rank_ns_before_admit = self._step_rank_ns
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -1816,6 +1827,12 @@ class Scheduler(SchedulerInterface):
                 if lpm_skipped:
                     # Admitted past unfit requests: stop admitting this step.
                     break
+            # Re-ranks inside the loop are already in rank_ns.
+            admit_ns = (
+                time.perf_counter_ns()
+                - admit_start_ns
+                - (self._step_rank_ns - rank_ns_before_admit)
+            )
 
             if self._rank_per_admission:
                 self.kv_cache_manager.block_pool.stop_eviction_log()
@@ -1855,8 +1872,9 @@ class Scheduler(SchedulerInterface):
                 for rid, n in num_scheduled_tokens.items()
             })
         )
-        # One schedule_batch line per step, written once the batch has run
-        # (see _complete_batch_log); fields are in the order written.
+        # One schedule_batch line per step, written at the end of
+        # update_from_output; fields are in the order written. scheduler_ns,
+        # execution_ns and output_processing_ns are added later.
         batch_record: dict[str, Any] = dict(
             step=self._step_id,
             new=len(scheduled_new_reqs),
@@ -1870,7 +1888,10 @@ class Scheduler(SchedulerInterface):
             decode_tokens=decode_tokens,
             prefill_attention=prefill_attention,
             decode_context=decode_context,
+            running_ns=running_ns,
             rank_ns=self._step_rank_ns,
+            admit_ns=admit_ns,
+            arrival_ns=self._step_arrival_ns,
             reranks=self._step_rerank_count,
             lpm_skips=self._step_lpm_skips,
             lpm_scan_ns=self._step_lpm_scan_ns,
@@ -1881,6 +1902,7 @@ class Scheduler(SchedulerInterface):
             ),
             pkas=self._pkas_step_stats,
         )
+        self._step_arrival_ns = 0
         if self._skip_eviction:
             pool = self.kv_cache_manager.block_pool
             batch_record["skip_protected_reqs"] = len(self._skip_protected)
@@ -1990,14 +2012,19 @@ class Scheduler(SchedulerInterface):
                 )
                 for rid, n in num_scheduled_tokens.items()
             }
-            self._pending_batch_logs[id(scheduler_output)] = (batch_record, intervals)
+            self._pending_batch_logs[id(scheduler_output)] = (
+                batch_record, intervals, 0
+            )
         else:
             if not cost_supported:
                 batch_record["preempted_tokens"] = -1
-            self._log_schedule_batch(batch_record, 0 if cost_supported else -1)
+            self._pending_batch_logs[id(scheduler_output)] = (
+                batch_record, None, 0 if cost_supported else -1
+            )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        batch_record["scheduler_ns"] = time.perf_counter_ns() - schedule_start_ns
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2008,7 +2035,8 @@ class Scheduler(SchedulerInterface):
     @staticmethod
     def _log_schedule_batch(record: dict[str, Any], recomputed_tokens: int) -> None:
         """Write one step: counters, -1 when unavailable; PKAS counters only
-        when non-zero, and execution_ns only when the batch was timed."""
+        when non-zero, and execution_ns only when the batch was timed. A line
+        flushed without its model output has no output_processing_ns."""
         pkas = record["pkas"] or {}
         fields = " ".join(
             f"{key}={value}" for key, value in record.items() if key != "pkas"
@@ -2051,13 +2079,31 @@ class Scheduler(SchedulerInterface):
             decode_context += (end * (end + 1) - split * (split + 1)) // 2
         return prefill, decode, prefill_attention, decode_context
 
+    def _flush_pending_batch_logs(self) -> None:
+        """Write steps whose output never arrived. An accounted step left
+        pending means overlapping execution, which the synchronous recompute
+        accounting cannot follow; a step without accounting changes nothing."""
+        for record, intervals, recomputed in self._pending_batch_logs.values():
+            if intervals is not None:
+                self._preemption_cost_supported = False
+                record["preempted_tokens"] = -1
+                recomputed = -1
+            self._log_schedule_batch(record, recomputed)
+        self._pending_batch_logs.clear()
+
     def _complete_batch_log(
         self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
-    ) -> None:
+    ) -> tuple[dict[str, Any], int] | None:
+        """Finish a step's recompute accounting; return the record to log.
+
+        Runs at the top of update_from_output, before finished requests drop
+        their accounting state; the line is written at its end."""
         pending = self._pending_batch_logs.pop(id(scheduler_output), None)
         if pending is None:
-            return
-        args, intervals = pending
+            return None
+        args, intervals, recomputed = pending
+        if intervals is None:
+            return args, recomputed
         recomputed_tokens = 0
         for rid, (start, end, recovery_high) in intervals.items():
             if rid not in model_runner_output.req_id_to_index:
@@ -2069,7 +2115,7 @@ class Scheduler(SchedulerInterface):
                 )
                 if end >= recovery_high:
                     self._preemption_recovery_high.pop(rid, None)
-        self._log_schedule_batch(args, recomputed_tokens)
+        return args, recomputed_tokens
 
     def _preempt_request(
         self, request: Request, timestamp: float, reason: str = "memory_pressure"
@@ -2482,7 +2528,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self._complete_batch_log(scheduler_output, model_runner_output)
+        output_start_ns = time.perf_counter_ns()
+        batch_log = self._complete_batch_log(scheduler_output, model_runner_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2800,6 +2847,10 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if batch_log is not None:
+            record, recomputed_tokens = batch_log
+            record["output_processing_ns"] = time.perf_counter_ns() - output_start_ns
+            self._log_schedule_batch(record, recomputed_tokens)
         return engine_core_outputs
 
     @staticmethod
@@ -2960,6 +3011,11 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        start_ns = time.perf_counter_ns()
+        self._add_request(request)
+        self._step_arrival_ns += time.perf_counter_ns() - start_ns
+
+    def _add_request(self, request: Request) -> None:
         if self.predictive_admission is not None and (
             request.resumable
             or request.sampling_params is None
@@ -3263,9 +3319,7 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        for record, _ in self._pending_batch_logs.values():
-            self._log_schedule_batch(record, -1)
-        self._pending_batch_logs.clear()
+        self._flush_pending_batch_logs()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

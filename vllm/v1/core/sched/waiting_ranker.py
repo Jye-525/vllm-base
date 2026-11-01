@@ -96,6 +96,24 @@ def rank_spf(
     return _rank_by_aged_length(requests, uncached, age_alpha)
 
 
+def sspf_cost(
+    num_tokens: int,
+    num_full_blocks: int,
+    block_size: int,
+    amortized_blocks: float,
+) -> float:
+    """Sharing-amortized uncached prefill price of a waiting request, in tokens.
+
+    ``amortized_blocks`` is the sum of ``1 / n(b)`` over the request's full
+    blocks past its usable prefix hit, where ``n(b)`` counts the waiting
+    requests (fresh or preempted) that contain block ``b``. The trailing
+    partial block, ``num_tokens - num_full_blocks * block_size`` tokens, is
+    private and counts in full. Same formula as the simulator's SSPF key
+    (``simulator/kvsim.py`` ``Sim.rank``).
+    """
+    return block_size * amortized_blocks + num_tokens - num_full_blocks * block_size
+
+
 def rank_sspf(
     requests: list[Request],
     amortized_uncached: dict[str, float],
