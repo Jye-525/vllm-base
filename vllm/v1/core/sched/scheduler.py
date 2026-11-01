@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -39,7 +37,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.request_logger import RequestEventLogger
-from vllm.v1.core.sched.dspf import DSPFScheduler, check_dspf_scope
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -51,9 +48,6 @@ from vllm.v1.core.sched.predictive_admission import (
     PredictiveAdmissionController,
     RequestSnapshot,
 )
-from vllm.v1.core.sched.preemption_diagnostics import PreemptionDiagnostics
-from vllm.v1.core.sched.prefill_cost import PrefillCostShape
-from vllm.v1.core.sched.survival_diagnostics import SurvivalRecorder
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
@@ -63,11 +57,9 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.waiting_prefix_index import PendingPrefixIndex
 from vllm.v1.core.sched.waiting_ranker import (
-    DSPFRanking,
     RankPlan,
     rank_clpm,
     rank_lpm,
-    rank_sjf,
     rank_spf,
     rank_sspf,
 )
@@ -230,9 +222,6 @@ class Scheduler(SchedulerInterface):
         self._clpm_lane_b_pass = 0.0
         self._clpm_dynamic_b_share = 0.3
         self._init_waiting_rankers()
-        self._dspf: DSPFScheduler | None = None
-        if self.policy == SchedulingPolicy.DSPF:
-            self._dspf = self._init_dspf()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -500,70 +489,6 @@ class Scheduler(SchedulerInterface):
             int, tuple[tuple[Any, ...], dict[str, tuple[int, int, int]]]
         ] = {}
 
-        self.preemption_diagnostics: PreemptionDiagnostics | None = None
-        if directory := envs.VLLM_PREEMPTION_DIAGNOSTICS_DIR:
-            unsupported = []
-            if (
-                self.scheduler_config.async_scheduling
-                or type(self).__name__ == "AsyncScheduler"
-            ):
-                unsupported.append("async_scheduling")
-            if speculative_config is not None:
-                unsupported.append("speculative_decoding")
-            if self.connector is not None or self.ec_connector is not None:
-                unsupported.append("offload_or_transfer")
-            if self.use_pp or self.dcp_world_size > 1 or self.pcp_world_size > 1:
-                unsupported.append("pipeline_or_context_parallelism")
-            groups = kv_cache_config.kv_cache_groups
-            if (
-                len(groups) != 1
-                or type(groups[0].kv_cache_spec) is not FullAttentionSpec
-                or groups[0].kv_cache_spec.sliding_window is not None
-                or groups[0].kv_cache_spec.attention_chunk_size is not None
-            ):
-                unsupported.append("hybrid_or_non_full_attention")
-            if self.is_encoder_decoder:
-                unsupported.append("encoder_decoder")
-            self.preemption_diagnostics = PreemptionDiagnostics(
-                directory,
-                dict(
-                    policy=self.policy.value,
-                    block_size=block_size,
-                    num_blocks=kv_cache_config.num_blocks,
-                    prefix_caching=self.cache_config.enable_prefix_caching,
-                    chunked_prefill=self.scheduler_config.enable_chunked_prefill,
-                    max_num_seqs=self.max_num_running_reqs,
-                    max_num_batched_tokens=self.max_num_scheduled_tokens,
-                    max_model_len=self.max_model_len,
-                    eviction_policy=self._eviction_policy,
-                    peek_eviction_mode=self._peek_eviction_mode,
-                    async_scheduling=self.scheduler_config.async_scheduling,
-                    speculative_decoding=speculative_config is not None,
-                    kv_transfer=self.connector is not None,
-                    kv_cache_groups=len(groups),
-                    pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
-                    decode_context_parallel_size=self.dcp_world_size,
-                    prefill_context_parallel_size=self.pcp_world_size,
-                ),
-                unsupported,
-            )
-        self.survival_diagnostics: SurvivalRecorder | None = None
-        if self.preemption_diagnostics is not None and not unsupported:
-            # A subdirectory keeps survival records out of tools that read
-            # every preemption-diagnostics JSONL file in the parent directory.
-            self.survival_diagnostics = SurvivalRecorder(
-                os.path.join(envs.VLLM_PREEMPTION_DIAGNOSTICS_DIR, "survival"),
-                self.kv_cache_manager,
-                dict(
-                    policy=self.policy.value,
-                    eviction_policy=self._eviction_policy,
-                    block_size=block_size,
-                    num_blocks=kv_cache_config.num_blocks,
-                    prefix_caching=self.cache_config.enable_prefix_caching,
-                    predictive_admission=self.predictive_admission is not None,
-                ),
-            )
-
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -683,15 +608,8 @@ class Scheduler(SchedulerInterface):
         Policies without a ranker (FCFS, PRIORITY) keep their queue order.
         """
         config = self.scheduler_config
-        # Default aging: a request that waited 60 s outranks any fresh one,
-        # since vLLM bounds prompt and output lengths by max_model_len.
-        default_alpha = self.max_model_len / 60.0
-        self._spf_age_alpha = (
-            default_alpha if config.spf_age_alpha is None else config.spf_age_alpha
-        )
-        self._sjf_age_alpha = (
-            default_alpha if config.sjf_age_alpha is None else config.sjf_age_alpha
-        )
+        # SPF/SSPF aging is off unless spf_age_alpha is set.
+        self._spf_age_alpha = config.spf_age_alpha
         self._rank_preempted = config.rank_preempted_requests
         self._rank_per_admission = config.rank_per_admission
         self._step_rank_ns = 0
@@ -724,7 +642,6 @@ class Scheduler(SchedulerInterface):
             SchedulingPolicy.CLPM: self._rank_clpm_candidates,
             SchedulingPolicy.SPF: self._rank_spf_candidates,
             SchedulingPolicy.SSPF: self._rank_sspf_candidates,
-            SchedulingPolicy.SJF: self._rank_sjf_candidates,
         }
         self._waiting_ranker = rankers.get(self.policy)
         if self.policy in (SchedulingPolicy.SPF, SchedulingPolicy.SSPF):
@@ -741,14 +658,6 @@ class Scheduler(SchedulerInterface):
                 config.lpm_window_size,
                 self._rank_preempted,
                 self._defer_inflight,
-            )
-        elif self.policy == SchedulingPolicy.SJF:
-            logger.info(
-                "SJF scheduling: age_alpha=%.3f tokens/s, window=%d, "
-                "rank_preempted=%s",
-                self._sjf_age_alpha,
-                config.lpm_window_size,
-                self._rank_preempted,
             )
         if self._rank_per_admission:
             logger.info(
@@ -1022,49 +931,6 @@ class Scheduler(SchedulerInterface):
             and block_hashes[next_block] in inflight_blocks
         )
 
-    def _rank_sjf_candidates(self, candidates: list[Request]) -> RankPlan:
-        # Ranks on max_tokens alone: no prefix-cache lookups.
-        return rank_sjf(candidates, self._sjf_age_alpha)
-
-    def _init_dspf(self) -> DSPFScheduler:
-        """Check DSPF's scope and build its cost model and state."""
-        model_config = self.vllm_config.model_config
-        check_dspf_scope(
-            **{
-                "LoRA": self.lora_config is not None,
-                "KV connectors": self.connector is not None,
-                "encoder cache connectors": self.ec_connector is not None,
-                "encoder-decoder models": self.is_encoder_decoder,
-                "multimodal models": model_config.is_multimodal_model,
-                "pipeline parallelism": self.parallel_config.pipeline_parallel_size
-                > 1,
-            }
-        )
-        window_size = self.scheduler_config.lpm_window_size
-        if window_size > 0:
-            logger.warning_once(
-                "DSPF ranks only the first %d waiting requests; later ones get "
-                "no deadline until they enter the window. Use "
-                "--lpm-window-size 0 to rank the whole queue.",
-                window_size,
-            )
-        return DSPFScheduler(
-            PrefillCostShape.from_model_config(model_config),
-            window_size,
-            # Looked up on each call, so the manager can be created later.
-            lambda request: self.kv_cache_manager.get_computed_prefix_len(request),
-        )
-
-    def _dspf_rank(self, token_budget: int, record_step: bool) -> DSPFRanking:
-        assert self._dspf is not None and isinstance(self.waiting, FCFSRequestQueue)
-        return self._dspf.rank(
-            self.waiting,
-            self.skipped_waiting,
-            token_budget,
-            self.max_num_running_reqs - len(self.running),
-            record_step,
-        )
-
     def _commit_clpm_admission(
         self, request_id: str, rank_plan: RankPlan | None
     ) -> None:
@@ -1320,8 +1186,6 @@ class Scheduler(SchedulerInterface):
             self._pending_batch_logs.clear()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
-        if self._dspf is not None:
-            self._dspf.start_step()
         self._step_rerank_count = 0
         self._step_lpm_skips = 0
         self._step_lpm_scan_ns = 0
@@ -1352,12 +1216,6 @@ class Scheduler(SchedulerInterface):
             if self.predictive_admission is not None
             else None
         )
-        diagnostics = self.preemption_diagnostics
-        if diagnostics is not None:
-            diagnostics.begin_step()
-        survival = self.survival_diagnostics
-        if survival is not None:
-            survival.begin_step()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1479,21 +1337,12 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
-                        failure_observer=(
-                            diagnostics.allocation_failed if diagnostics else None
-                        ),
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
-                        if diagnostics is not None:
-                            diagnostics.end_episode(proceeded=True)
                         break
 
-                    if diagnostics is not None:
-                        diagnostics.start_episode(
-                            self, request, num_new_tokens, num_scheduled_tokens
-                        )
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -1527,8 +1376,6 @@ class Scheduler(SchedulerInterface):
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
-                        if diagnostics is not None:
-                            diagnostics.end_episode(proceeded=False)
                         break
 
             if new_blocks is None:
@@ -1591,15 +1438,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
-            # Ranked policies (LPM, cLPM, SPF, SJF): reorder the bounded
+            # Ranked policies (LPM, cLPM, SPF, SSPF): reorder the bounded
             # rankable prefix of self.waiting once per step (LPM and SPF may
             # re-rank between admissions); admission below still pops from
             # the queue head.
             rank_start_ns = time.perf_counter_ns()
-            if self._dspf is not None:
-                self._dspf_rank(token_budget, record_step=True)
-            else:
-                prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
+            prefix_rank_plan = self._reorder_waiting_requests(scheduled_loras)
             self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
             if self._skip_eviction and self._lpm_bypass_counts:
                 self._refresh_skip_protection()
@@ -1677,17 +1521,6 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
-                    if self._dspf is not None and self._dspf.cost_grew(
-                        request, num_new_local_computed_tokens
-                    ):
-                        # An earlier admission this step evicted its blocks:
-                        # re-rank with its real cost and retry the head.
-                        rerank_start_ns = time.perf_counter_ns()
-                        self._dspf_rank(token_budget, record_step=False)
-                        self._step_rank_ns += time.perf_counter_ns() - rerank_start_ns
-                        self._step_rerank_count += 1
-                        continue
-
                     if self._defer_inflight and request_queue is self.waiting:
                         if inflight_blocks is None:
                             inflight_blocks = self._inflight_prefix_blocks()
@@ -1828,7 +1661,7 @@ class Scheduler(SchedulerInterface):
                 # PKAS rejects this setting: its simulation already reserves
                 # the rest of the prompt and the predicted decode.
                 if self.scheduler_reserve_full_isl:
-                    fits, required_blocks, free_blocks = (
+                    fits, _, _ = (
                         self.kv_cache_manager.full_sequence_fits(
                             request,
                             num_new_computed_tokens=num_new_local_computed_tokens,
@@ -1838,10 +1671,6 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                     if not fits:
-                        if diagnostics is not None:
-                            diagnostics.admission_failed(
-                                request_id, required_blocks, free_blocks
-                            )
                         if request.has_encoder_inputs:
                             self.encoder_cache_manager.free(request)
                         if self._can_skip_unfit_request(
@@ -1900,9 +1729,6 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     # The full-ISL check already ran above, before PKAS.
-                    failure_observer=(
-                        diagnostics.admission_failed if diagnostics else None
-                    ),
                 )
 
                 if new_blocks is None:
@@ -1991,11 +1817,6 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self._commit_clpm_admission(request.request_id, prefix_rank_plan)
-                dspf_fields = (
-                    self._dspf.admit(request, num_computed_tokens)
-                    if self._dspf is not None
-                    else ""
-                )
 
                 self.kv_cache_manager.record_local_prefix_cache_hit(
                     request,
@@ -2007,7 +1828,7 @@ class Scheduler(SchedulerInterface):
                 logger.info(
                     "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
                     "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s%s%s%s",
+                    "running=%d%s%s%s",
                     self._step_id,
                     request.request_id,
                     request.num_tokens,
@@ -2022,7 +1843,6 @@ class Scheduler(SchedulerInterface):
                     if lpm_bypassed
                     else "",
                     f" deferred_steps={deferred_steps}" if deferred_steps else "",
-                    dspf_fields,
                 )
 
                 self.running.append(request)
@@ -2032,8 +1852,6 @@ class Scheduler(SchedulerInterface):
                     inflight_blocks.update(
                         request.block_hashes[num_computed_tokens // hash_block_size :]
                     )
-                if survival is not None:
-                    survival.admitted(request, num_new_local_computed_tokens)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -2042,8 +1860,6 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
-                    if diagnostics is not None:
-                        diagnostics.resumed(request, num_new_local_computed_tokens)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -2161,10 +1977,6 @@ class Scheduler(SchedulerInterface):
             )
         if self._defer_inflight:
             batch_record["deferred"] = self._step_defers
-        if self._dspf is not None:
-            batch_record["dspf_feasible"] = self._dspf.step_feasible
-            batch_record["dspf_edd"] = self._dspf.step_edd
-            batch_record["dspf_late"] = self._dspf.step_late
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -2270,14 +2082,8 @@ class Scheduler(SchedulerInterface):
                 batch_record["preempted_tokens"] = -1
             self._log_schedule_batch(batch_record, 0 if cost_supported else -1)
 
-        if diagnostics is not None:
-            diagnostics.scheduled(scheduler_output, self.requests)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        if diagnostics is not None:
-            diagnostics.end_step()
-        if survival is not None:
-            survival.end_step()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2362,7 +2168,6 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        diagnostics = self.preemption_diagnostics
         free_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if reason == "memory_pressure":
             if (
@@ -2384,12 +2189,6 @@ class Scheduler(SchedulerInterface):
         self._pkas_block_ids.pop(request.request_id, None)
         self._pkas_reject_cache.pop(request.request_id, None)
         self._pkas_epoch += 1
-        survival = self.survival_diagnostics
-        victim = (
-            survival.capture_victim(request)
-            if survival is not None and reason == "memory_pressure"
-            else None
-        )
         self.kv_cache_manager.free(request)
         free_after = self.kv_cache_manager.block_pool.get_num_free_blocks()
         # Its next admitted_prefix_cache line (same request_id) is the resume.
@@ -2419,8 +2218,6 @@ class Scheduler(SchedulerInterface):
             request.num_preemptions + 1,
             pkas,
         )
-        if survival is not None:
-            survival.preempted(request, victim)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -2433,8 +2230,6 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self._track_waiting_request(request)
-        if diagnostics is not None:
-            diagnostics.preempt(request, free_before, free_after, reason)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -2919,10 +2714,6 @@ class Scheduler(SchedulerInterface):
                     request.resumable = False
                     stopped = True
 
-            if self.preemption_diagnostics is not None:
-                self.preemption_diagnostics.completed(
-                    scheduler_output, request, bool(new_token_ids)
-                )
             routed_experts = None
             if (
                 self.enable_return_routed_experts
@@ -3017,9 +2808,6 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
-
-        if self.preemption_diagnostics is not None:
-            self.preemption_diagnostics.end_output(scheduler_output)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -3121,8 +2909,6 @@ class Scheduler(SchedulerInterface):
             SchedulingPolicy.CLPM,
             SchedulingPolicy.SPF,
             SchedulingPolicy.SSPF,
-            SchedulingPolicy.SJF,
-            SchedulingPolicy.DSPF,
         ):
             return self.skipped_waiting or self.waiting or None
 
@@ -3284,15 +3070,6 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
-            if (
-                self.policy == SchedulingPolicy.SJF
-                and request.sampling_params is not None
-                and not request.sampling_params.ignore_eos
-            ):
-                logger.warning_once(
-                    "SJF ranks by max_tokens, which is only an upper bound on "
-                    "output length for requests without ignore_eos."
-                )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -3300,10 +3077,6 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
-            if self.preemption_diagnostics is not None:
-                self.preemption_diagnostics.add_request(request)
-            if self.survival_diagnostics is not None:
-                self.survival_diagnostics.request_waiting(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -3384,8 +3157,6 @@ class Scheduler(SchedulerInterface):
         self._lpm_first_skip_hits.pop(request.request_id, None)
         self._lpm_last_skip_hits.pop(request.request_id, None)
         self._defer_counts.pop(request.request_id, None)
-        if self._dspf is not None:
-            self._dspf.forget(request.request_id)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,
@@ -3394,10 +3165,6 @@ class Scheduler(SchedulerInterface):
             self.predictive_admission.observe_completion(request.num_output_tokens)
         self._completed_token_high.pop(request.request_id, None)
         self._preemption_recovery_high.pop(request.request_id, None)
-        if self.preemption_diagnostics is not None:
-            self.preemption_diagnostics.finish(request)
-        if self.survival_diagnostics is not None:
-            self.survival_diagnostics.finished(request)
 
         request_logger = RequestEventLogger.get()
         if request_logger is not None:
@@ -3501,10 +3268,6 @@ class Scheduler(SchedulerInterface):
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
 
-        if self.preemption_diagnostics is not None:
-            self.preemption_diagnostics.cache_reset(reset_successful)
-        if self.survival_diagnostics is not None:
-            self.survival_diagnostics.cache_reset(reset_successful)
         return reset_successful
 
     def reset_connector_cache(self) -> bool:
@@ -3590,10 +3353,6 @@ class Scheduler(SchedulerInterface):
         for record, _ in self._pending_batch_logs.values():
             self._log_schedule_batch(record, -1)
         self._pending_batch_logs.clear()
-        if self.preemption_diagnostics is not None:
-            self.preemption_diagnostics.shutdown()
-        if self.survival_diagnostics is not None:
-            self.survival_diagnostics.shutdown()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

@@ -8,8 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-import numpy as np
-
 from vllm.v1.core.sched.waiting_prefix_index import PendingRankInfo
 from vllm.v1.request import Request
 
@@ -86,7 +84,7 @@ def rank_spf(
     prefix_hits: dict[str, int],
     age_alpha: float,
 ) -> RankPlan:
-    """Shortest prefill first: fewest uncached tokens, with linear aging.
+    """Shortest prefill first: fewest uncached tokens, with optional aging.
 
     A preempted request's ``num_tokens`` includes its generated tokens, which
     must be replayed, so the same formula covers it.
@@ -103,7 +101,7 @@ def rank_sspf(
     amortized_uncached: dict[str, float],
     age_alpha: float,
 ) -> RankPlan:
-    """Sharing-amortized SPF: fewest amortized uncached tokens, with aging.
+    """Sharing-amortized SPF: fewest amortized uncached tokens, optional aging.
 
     ``amortized_uncached`` prices each uncached block at its size divided by
     the number of waiting requests that contain it, so serving one member
@@ -111,104 +109,6 @@ def rank_sspf(
     group follows. With no sharing it equals the uncached tokens of SPF.
     """
     return _rank_by_aged_length(requests, amortized_uncached, age_alpha)
-
-
-@dataclass(frozen=True, slots=True)
-class DSPFRanking:
-    plan: RankPlan
-    # The ranked set could meet every deadline from the current work clock.
-    feasible: bool
-    # Placements that took the EDD head instead of the cheapest request.
-    edd_placements: int
-
-
-def rank_dspf(
-    requests: list[Request],
-    costs: dict[str, int],
-    deadlines: dict[str, int],
-    head_cost: int,
-    prefill_tokens: dict[str, int],
-    token_budget: int,
-    max_placements: int,
-) -> DSPFRanking:
-    """Deadline-guarded shortest prefill first.
-
-    ``costs`` are prefill FLOPs. ``deadlines`` are start deadlines on the
-    committed-work clock, relative to its current value (V - W): a request
-    must be admitted before committed work passes its deadline, so it must
-    complete by deadline + cost. ``head_cost`` is work admitted before any
-    ranked request (preempted and other unranked requests).
-
-    Each placement takes the cheapest request unless that would leave a
-    request earlier in EDD order (deadline + cost) unable to complete in
-    time; then it takes the EDD head. EDD minimises maximum lateness when
-    every request is available (Jackson's rule), so a set that can meet all
-    deadlines keeps doing so, and a set that cannot is served in EDD order.
-    Placement stops once the planned requests fill the step
-    (``max_placements`` requests or ``token_budget`` prefill tokens); the
-    rest follow in EDD order and are re-ranked next step. Sorts are stable,
-    so ties keep the current queue order. Arithmetic is float64: summed
-    FLOPs of a long queue can exceed int64.
-    """
-    n = len(requests)
-    ids = [request.request_id for request in requests]
-    cost = np.array([costs[i] for i in ids], dtype=np.float64)
-    due = np.array([deadlines[i] + costs[i] for i in ids], dtype=np.float64)
-    by_cost = np.argsort(cost, kind="stable")
-    edd = np.argsort(due, kind="stable")
-    position = np.empty(n, dtype=np.int64)
-    position[edd] = np.arange(n)
-    # In EDD order: completion deadline minus the work up to and including
-    # each request. The set is feasible from ``base`` iff base <= min(slack).
-    slack = due[edd] - np.cumsum(cost[edd])
-    unplaced = np.ones(n, dtype=bool)
-    base = float(head_cost)
-    feasible = n == 0 or base <= slack.min()
-
-    order: list[int] = []
-    edd_placements = 0
-    planned_tokens = 0
-    cheapest = edd_head = 0
-    while len(order) < min(n, max_placements) and planned_tokens < token_budget:
-        while not unplaced[position[by_cost[cheapest]]]:
-            cheapest += 1
-        while not unplaced[edd_head]:
-            edd_head += 1
-        candidate = by_cost[cheapest]
-        pick = edd[edd_head]
-        if base <= slack[unplaced].min():
-            k = position[candidate]
-            ahead = slack[:k][unplaced[:k]]
-            if ahead.size == 0 or base + cost[candidate] <= ahead.min():
-                pick = candidate
-        if pick != candidate:
-            edd_placements += 1
-        # Placing ``pick`` first moves the start of everything behind it in
-        # EDD order by its cost and removes it from their prefix: their
-        # slack against ``base`` is unchanged.
-        k = position[pick]
-        unplaced[k] = False
-        slack[k + 1 :] += cost[pick]
-        base += cost[pick]
-        order.append(int(pick))
-        planned_tokens += prefill_tokens[ids[pick]]
-    order.extend(int(edd[k]) for k in range(n) if unplaced[k])
-    return DSPFRanking(
-        RankPlan([requests[i] for i in order], {}), bool(feasible), edd_placements
-    )
-
-
-def rank_sjf(requests: list[Request], age_alpha: float) -> RankPlan:
-    """Shortest job first on remaining output tokens, with linear aging.
-
-    ``max_tokens`` is the true output length only when the client sets
-    ``ignore_eos``; otherwise it is an upper bound.
-    """
-    remaining = {
-        request.request_id: request.max_tokens - request.num_output_tokens
-        for request in requests
-    }
-    return _rank_by_aged_length(requests, remaining, age_alpha)
 
 
 def _group_major_order(

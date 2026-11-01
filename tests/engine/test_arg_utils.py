@@ -521,6 +521,33 @@ def test_kvreuse_policy_profile_allows_prefix_caching_off():
     assert engine_args.scheduler_reserve_full_isl is False
 
 
+def test_scheduling_defaults_rank_whole_queue_without_aging_or_pkas():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    for profile in ([], ["--policy-profile", "lpm"]):
+        engine_args = EngineArgs.from_cli_args(
+            parser.parse_args([*CACHED_MODEL, *profile])
+        )
+        assert engine_args.admission_policy == "none"
+        assert engine_args.lpm_window_size == 0
+        assert engine_args.spf_age_alpha == 0.0
+        assert engine_args.rank_per_admission is False
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--scheduling-policy", "sjf"],
+        ["--scheduling-policy", "dspf"],
+        ["--sjf-age-alpha", "1"],
+        ["--pkas-output-predictor", "legacy"],
+    ],
+)
+def test_removed_scheduling_options_are_rejected(flags):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args([*CACHED_MODEL, *flags])
+
+
 @pytest.mark.parametrize(
     ("arg", "expected", "option"),
     [
@@ -680,9 +707,9 @@ def test_pkas_output_estimator_and_reject_cache_cli():
     default = EngineArgs.from_cli_args(
         parser.parse_args([*CACHED_MODEL, "--policy-profile", "kvreuse"])
     )
-    assert default.pkas_output_predictor == "legacy"
+    assert default.pkas_output_predictor == "paper"
     assert default.pkas_output_quantile == 0.9
-    assert default.pkas_output_history is None
+    assert default.pkas_output_history == 0
     assert default.pkas_output_confidence == 0.95
     assert default.pkas_reject_cache_steps == 16
     assert default.pkas_simulation == "paper"

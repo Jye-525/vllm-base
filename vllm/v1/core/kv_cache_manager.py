@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -329,7 +329,6 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        failure_observer: Callable[[str, int, int], None] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -356,7 +355,6 @@ class KVCacheManager:
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
 
-            failure_observer: Optional diagnostic callback at the capacity check.
 
         Blocks layout:
         ```
@@ -433,7 +431,7 @@ class KVCacheManager:
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            fits, required, available = self.full_sequence_fits(
+            fits, _, _ = self.full_sequence_fits(
                 request,
                 num_new_computed_tokens=num_new_computed_tokens,
                 new_computed_blocks=new_computed_blocks,
@@ -441,8 +439,6 @@ class KVCacheManager:
                 num_encoder_tokens=num_encoder_tokens,
             )
             if not fits:
-                if failure_observer is not None:
-                    failure_observer(request.request_id, required, available)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -470,12 +466,7 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        available_blocks = self.block_pool.get_num_free_blocks()
-        if num_blocks_to_allocate > available_blocks:
-            if failure_observer is not None:
-                failure_observer(
-                    request.request_id, num_blocks_to_allocate, available_blocks
-                )
+        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
 

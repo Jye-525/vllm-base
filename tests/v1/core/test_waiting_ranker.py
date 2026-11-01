@@ -8,9 +8,7 @@ from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm.v1.core.sched.waiting_prefix_index import PendingRankInfo
 from vllm.v1.core.sched.waiting_ranker import (
     rank_clpm,
-    rank_dspf,
     rank_lpm,
-    rank_sjf,
     rank_spf,
     rank_sspf,
 )
@@ -114,15 +112,11 @@ def _job(
     *,
     arrival_time: float = 0.0,
     num_tokens: int = 0,
-    max_tokens: int = 0,
-    num_output_tokens: int = 0,
 ):
     return SimpleNamespace(
         request_id=request_id,
         arrival_time=arrival_time,
         num_tokens=num_tokens,
-        max_tokens=max_tokens,
-        num_output_tokens=num_output_tokens,
     )
 
 
@@ -205,114 +199,3 @@ def test_sspf_ties_and_aging_match_spf() -> None:
         "short_twin",
         "long",
     ]
-
-
-def test_sjf_orders_by_remaining_output_tokens() -> None:
-    requests = [
-        _job("big", max_tokens=500),
-        _job("small", max_tokens=50),
-        # A preempted request that already produced 450 of 480 tokens.
-        _job("nearly_done", max_tokens=480, num_output_tokens=450),
-    ]
-
-    plan = rank_sjf(requests, age_alpha=0.0)
-
-    assert _ids(plan) == ["nearly_done", "small", "big"]
-
-
-def test_sjf_aging_promotes_old_long_job() -> None:
-    requests = [
-        _job("short", arrival_time=100.0, max_tokens=10),
-        _job("long", arrival_time=0.0, max_tokens=1000),
-    ]
-
-    assert _ids(rank_sjf(requests, age_alpha=0.0)) == ["short", "long"]
-    # 100 s of extra wait at 20 tokens/s outweighs a 990-token gap.
-    assert _ids(rank_sjf(requests, age_alpha=20.0)) == ["long", "short"]
-
-
-def _dspf(
-    jobs: list[tuple[str, int, int]],
-    head_cost: int = 0,
-    token_budget: int = 10**9,
-    max_placements: int = 10**9,
-):
-    """Rank (id, cost, deadline) jobs in queue order; one token per cost unit."""
-    requests = [_request(job_id) for job_id, _, _ in jobs]
-    costs = {job_id: cost for job_id, cost, _ in jobs}
-    deadlines = {job_id: deadline for job_id, _, deadline in jobs}
-    return rank_dspf(
-        requests, costs, deadlines, head_cost, costs, token_budget, max_placements
-    )
-
-
-def _starts(ranking, jobs, head_cost: int = 0) -> dict[str, int]:
-    costs = {job_id: cost for job_id, cost, _ in jobs}
-    starts, clock = {}, head_cost
-    for request in ranking.plan.ordered_requests:
-        starts[request.request_id] = clock
-        clock += costs[request.request_id]
-    return starts
-
-
-def test_dspf_protects_every_deadline_not_only_the_earliest() -> None:
-    # Reviewer counterexample: guarding only the earliest deadline ran the
-    # nine small jobs, then A, and started B at 19, past its deadline 12.
-    jobs = [("A", 10, 10), ("B", 2, 12)]
-    jobs += [(f"s{i}", 1, 12 + i) for i in range(1, 10)]
-
-    ranking = _dspf(jobs)
-
-    assert ranking.feasible
-    assert _ids(ranking.plan) == [f"s{i}" for i in range(1, 9)] + ["B", "A", "s9"]
-    starts = _starts(ranking, jobs)
-    assert all(starts[job_id] <= deadline for job_id, _, deadline in jobs)
-    assert ranking.edd_placements == 2
-
-
-def test_dspf_is_spf_when_no_deadline_binds() -> None:
-    jobs = [("big", 9, 1000), ("tie1", 2, 1000), ("small", 1, 1000), ("tie2", 2, 1000)]
-
-    ranking = _dspf(jobs)
-
-    # Cheapest first; equal costs keep queue order.
-    assert _ids(ranking.plan) == ["small", "tie1", "tie2", "big"]
-    assert ranking.edd_placements == 0
-
-
-def test_dspf_infeasible_set_is_served_in_edd_order() -> None:
-    # Deadline + cost: late_big 5, late_small 6, fresh 101.
-    jobs = [("fresh", 1, 100), ("late_big", 8, -3), ("late_small", 1, 5)]
-
-    ranking = _dspf(jobs)
-
-    assert not ranking.feasible
-    assert _ids(ranking.plan) == ["late_big", "late_small", "fresh"]
-
-
-def test_dspf_counts_head_work_before_ranked_requests() -> None:
-    # Y must start by 3. With no head work the cheap X fits before it; with
-    # 3 units of preempted work ahead, X would push Y to 4.
-    jobs = [("X", 1, 100), ("Y", 5, 3)]
-
-    assert _ids(_dspf(jobs).plan) == ["X", "Y"]
-    assert _ids(_dspf(jobs, head_cost=3).plan) == ["Y", "X"]
-
-
-def test_dspf_plans_one_step_then_follows_edd_order() -> None:
-    jobs = [("late", 4, 50), ("early", 4, 10), ("cheap", 1, 1000)]
-
-    by_count = _dspf(jobs, max_placements=1)
-    by_tokens = _dspf(jobs, token_budget=1)
-
-    # One placement (the cheapest), then EDD: early (14) before late (54).
-    assert _ids(by_count.plan) == ["cheap", "early", "late"]
-    assert _ids(by_tokens.plan) == ["cheap", "early", "late"]
-    assert _ids(_dspf(jobs, max_placements=0).plan) == ["early", "late", "cheap"]
-
-
-def test_dspf_empty_window() -> None:
-    ranking = _dspf([])
-
-    assert ranking.feasible
-    assert ranking.plan.ordered_requests == []

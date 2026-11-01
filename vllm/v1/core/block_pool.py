@@ -199,11 +199,6 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Optional observational hook (survival diagnostics). It must provide
-        # on_allocate(num_blocks) and on_evict(raw_block_hash) and must not
-        # change allocation or eviction decisions.
-        self.observer: Any | None = None
-
         # Raw hashes whose last cached copy was evicted since the last drain.
         # None (the default) records nothing; the scheduler turns it on only
         # while re-ranking waiting requests per admission.
@@ -781,8 +776,6 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
-        if self.observer is not None:
-            self.observer.on_allocate(num_blocks)
 
         if self.enable_caching and self._eviction_policy == "peek":
             ret = self._select_victims_peek(num_blocks)
@@ -920,13 +913,10 @@ class BlockPool:
         # Blocks are not de-duplicated: report a hash only when its last
         # cached copy goes, i.e. when the content stops being reusable.
         if (
-            self.observer is not None or self._eviction_log is not None
-        ) and self.cached_block_hash_to_block.get_one_block(block_hash) is None:
-            raw_hash = get_block_hash(block_hash)
-            if self.observer is not None:
-                self.observer.on_evict(raw_hash)
-            if self._eviction_log is not None:
-                self._eviction_log.append(raw_hash)
+            self._eviction_log is not None
+            and self.cached_block_hash_to_block.get_one_block(block_hash) is None
+        ):
+            self._eviction_log.append(get_block_hash(block_hash))
 
         self.num_evicted_cached_blocks += 1
         block.reset_hash()

@@ -19,14 +19,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal[
-    "fcfs", "priority", "lpm", "clpm", "spf", "sspf", "sjf", "dspf"
-]
+SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sspf"]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek", "skip"]
 PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
-PKASOutputPredictor = Literal["legacy", "paper", "quantile"]
+PKASOutputPredictor = Literal["paper", "quantile"]
 PKASSimulation = Literal["paper", "repo"]
 
 
@@ -121,30 +119,24 @@ class SchedulerConfig:
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
-    - "lpm" orders a bounded waiting window by locally cached prefix length
-      descending, preserving current queue order on ties.
+    - "lpm" orders the waiting queue (or the first ``lpm_window_size``
+      requests) by locally cached prefix length descending, preserving
+      current queue order on ties.
     - "clpm" adds clustered demand and an age-aware fairness lane.
-    - "spf" orders the same window by uncached prompt tokens ascending, with
-      linear aging (shortest prefill first, as in PrefillOnly).
+    - "spf" orders the same window by uncached prompt tokens ascending
+      (shortest prefill first, as in PrefillOnly). No aging unless
+      ``spf_age_alpha`` is set.
     - "sspf" is SPF with each uncached prompt block's tokens divided by the
       number of waiting requests that contain it (sharing-amortized SPF).
-      It uses ``spf_age_alpha``. With no sharing it orders as SPF.
-    - "sjf" orders the same window by ``max_tokens`` ascending, with linear
-      aging. It is an oracle only when clients set ``ignore_eos``.
-    - "dspf" orders the same window by estimated prefill FLOPs ascending,
-      guarded by per-request deadlines on a committed-prefill-work clock: a
-      request may be bypassed only while it can still be admitted before
-      arrival-order service would have finished it. No aging constant.
-      Supports Qwen3 and Qwen3-MoE text generation without LoRA, KV
-      connectors or pipeline parallelism."""
+      It uses ``spf_age_alpha``. With no sharing it orders as SPF."""
 
     admission_policy: AdmissionPolicy = "none"
-    """Waiting-request admission policy. ``none`` uses stock vLLM admission;
-    ``pkas`` applies prefix-aware predictive admission after LPM ranking:
-    admission stops at the first request PKAS rejects. PKAS requires
-    ``scheduler_reserve_full_isl=False``."""
+    """Waiting-request admission policy. ``none`` (the default) uses stock
+    vLLM admission; ``pkas`` applies prefix-aware predictive admission after
+    LPM ranking: admission stops at the first request PKAS rejects. PKAS
+    requires ``scheduler_reserve_full_isl=False``."""
 
-    pkas_output_predictor: PKASOutputPredictor = "legacy"
+    pkas_output_predictor: PKASOutputPredictor = "paper"
     """Output-length forecast PKAS reserves future decode KV for.
     - "paper": the PKAS paper's Eq. 1, ``ceil(|mean - std|)`` of every
       completed output (Welford); one more token for a request already past
@@ -152,9 +144,7 @@ class SchedulerConfig:
     - "quantile": ``pkas_output_quantile`` of completed outputs, used only
       once enough completions exist to bound that quantile with
       ``pkas_output_confidence`` (distribution-free); before that, and for
-      requests past every completed length, one more token.
-    - "legacy": the earlier quantile forecast with a fixed 512-token cold
-      forecast until 32 completions; kept only to reproduce older runs."""
+      requests past every completed length, one more token."""
 
     pkas_simulation: PKASSimulation = "paper"
     """How PKAS simulates KV growth before admitting a request. Both count
@@ -168,14 +158,13 @@ class SchedulerConfig:
       chunk is shrunk to the free KV instead of preempting."""
 
     pkas_output_quantile: float = Field(default=0.9, gt=0.0, le=1.0)
-    """Quantile of completed output lengths that the "quantile" and "legacy"
-    predictors reserve KV for. Lower values admit more aggressively and rely
+    """Quantile of completed output lengths that the "quantile" predictor
+    reserves KV for. Lower values admit more aggressively and rely
     on preemption/replay when a request outgrows its forecast."""
 
-    pkas_output_history: int | None = Field(default=None, ge=0)
-    """Recent completed outputs the "quantile" and "legacy" predictors keep.
-    None uses each predictor's default (all outputs for "quantile", 256 for
-    "legacy"); 0 keeps all outputs."""
+    pkas_output_history: int = Field(default=0, ge=0)
+    """Recent completed outputs the "quantile" predictor keeps; 0 keeps all
+    outputs."""
 
     pkas_output_confidence: float = Field(default=0.95, gt=0.0, lt=1.0)
     """Confidence with which the "quantile" predictor's sample must bound the
@@ -186,12 +175,12 @@ class SchedulerConfig:
     request is admitted, finishes, or is preempted. Zero re-simulates every
     rejected candidate on every step."""
 
-    lpm_window_size: int = Field(default=128, ge=0)
-    """For LPM, cLPM, SPF and SJF, the number of waiting requests to reorder
-    per scheduler step. Zero means the full waiting queue."""
+    lpm_window_size: int = Field(default=0, ge=0)
+    """For LPM, cLPM, SPF and SSPF, the number of waiting requests to reorder
+    per scheduler step. Zero (the default) means the full waiting queue."""
 
     lpm_fallback_threshold: int = Field(default=0, ge=0)
-    """For LPM, cLPM, SPF and SJF, fall back to FCFS when the total waiting
+    """For LPM, cLPM, SPF and SSPF, fall back to FCFS when the total waiting
     queue is larger than this threshold. Zero disables the fallback."""
 
     lpm_admission_skips: int = Field(default=0, ge=0)
@@ -225,17 +214,13 @@ class SchedulerConfig:
     clpm_slo_budget_s: float = Field(default=2.0, gt=0.0)
     """Waiting-time budget used to normalize cLPM's dynamic age pressure."""
 
-    spf_age_alpha: float | None = Field(default=None, ge=0.0)
-    """SPF aging: uncached-token credit per second of waiting. None uses
-    ``max_model_len / 60`` so a request that waited 60 s outranks any fresh
-    one. Zero disables aging."""
-
-    sjf_age_alpha: float | None = Field(default=None, ge=0.0)
-    """SJF aging: output-token credit per second of waiting. None uses
-    ``max_model_len / 60``. Zero disables aging."""
+    spf_age_alpha: float = Field(default=0.0, ge=0.0)
+    """SPF and SSPF aging: uncached-token credit per second of waiting. Zero
+    (the default) disables aging; e.g. ``max_model_len / 60`` makes a
+    request that waited 60 s outrank any fresh one."""
 
     rank_preempted_requests: bool = False
-    """For SPF and SJF, rank preempted requests by their remaining work.
+    """For SPF, rank preempted requests by their remaining work.
     False keeps them unranked at the head of the waiting queue, so they
     resume first (stock vLLM, FCFS and LPM behavior)."""
 
@@ -249,8 +234,9 @@ class SchedulerConfig:
     rank_per_admission: bool = False
     """For LPM and SPF, re-rank the waiting window after an admission when
     that admission changed another waiting request's prefix hits (cached a
-    block it shares, or evicted a block it uses). False ranks once per step.
-    A step that admits at most one request never re-ranks."""
+    block it shares, or evicted a block it uses). False (the default) ranks
+    once per scheduler step. A step that admits at most one request never
+    re-ranks."""
 
     kv_cache_eviction_policy: KVCacheEvictionPolicy = "lru"
     """GPU prefix-cache eviction policy. ``lru`` is stock vLLM behavior;
@@ -417,10 +403,10 @@ class SchedulerConfig:
                 self.long_prefill_token_threshold,
             )
 
-        if self.rank_preempted_requests and self.policy not in ("spf", "sjf"):
+        if self.rank_preempted_requests and self.policy != "spf":
             raise ValueError(
-                "rank_preempted_requests requires the 'spf' or 'sjf' "
-                f"scheduling policy, not {self.policy!r}"
+                "rank_preempted_requests requires the 'spf' scheduling "
+                f"policy, not {self.policy!r}"
             )
         if self.defer_inflight_prefixes and self.policy not in ("spf", "sspf"):
             raise ValueError(
@@ -449,17 +435,6 @@ class SchedulerConfig:
                     "lpm_admission_skips is not supported with "
                     f"admission_policy={self.admission_policy!r}"
                 )
-        if self.policy == "dspf" and self.admission_policy != "none":
-            raise ValueError(
-                "The 'dspf' scheduling policy is not supported with "
-                f"admission_policy={self.admission_policy!r}"
-            )
-        if self.policy == "dspf" and self.lpm_fallback_threshold:
-            # Falling back to FCFS would leave queued requests without
-            # deadlines until the queue shrinks.
-            raise ValueError(
-                "The 'dspf' scheduling policy requires lpm_fallback_threshold=0"
-            )
         if self.kv_cache_eviction_policy == "skip" and not self.lpm_admission_skips:
             raise ValueError(
                 "kv_cache_eviction_policy='skip' requires lpm_admission_skips > 0"

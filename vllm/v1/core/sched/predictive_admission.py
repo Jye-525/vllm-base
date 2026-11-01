@@ -27,57 +27,6 @@ class OutputLengthEstimator(Protocol):
     def target(self, observed_tokens: int) -> int: ...
 
 
-class CausalOutputLengthEstimator:
-    """Upper-quantile forecast from recent completed outputs only.
-
-    Legacy predictor (``pkas_output_predictor="legacy"``), kept to reproduce
-    runs made before 2026-10-12. Its 512-token cold forecast, 32-sample
-    warm-up and 8-sample tail threshold are fixed choices without a
-    derivation; use ``QuantileOutputLengthEstimator`` for new experiments.
-    """
-
-    def __init__(self, quantile: float = 0.9, history: int = 256) -> None:
-        if not 0 < quantile <= 1:
-            raise ValueError("quantile must be in (0, 1]")
-        if history < 8:
-            raise ValueError("history must be at least 8")
-        self.quantile = quantile
-        self.max_history = history
-        self.min_samples = min(32, history // 2)
-        self.history: deque[int] = deque()
-        self.sorted_lengths: list[int] = []
-
-    @property
-    def count(self) -> int:
-        return len(self.history)
-
-    def reset(self) -> None:
-        self.history.clear()
-        self.sorted_lengths.clear()
-
-    def observe(self, output_tokens: int) -> None:
-        if len(self.history) == self.max_history:
-            oldest = self.history.popleft()
-            self.sorted_lengths.pop(bisect_left(self.sorted_lengths, oldest))
-        self.history.append(output_tokens)
-        insort(self.sorted_lengths, output_tokens)
-
-    def predict(self) -> int:
-        if self.count < self.min_samples:
-            return 512
-        return max(1, self.sorted_lengths[int(self.quantile * (self.count - 1))])
-
-    def target(self, observed_tokens: int) -> int:
-        predicted = self.predict()
-        if observed_tokens < predicted:
-            return predicted
-        first = bisect_right(self.sorted_lengths, observed_tokens)
-        survivors = self.count - first
-        if survivors >= 8:
-            return self.sorted_lengths[first + int(self.quantile * (survivors - 1))]
-        return observed_tokens + predicted
-
-
 class PaperOutputLengthEstimator:
     """PKAS paper predictor (Eq. 1): ``ceil(|M1 - sqrt(M2 / (N - 1)))|``.
 
@@ -201,19 +150,13 @@ def make_output_length_estimator(
     predictor: str,
     *,
     quantile: float,
-    history: int | None,
+    history: int,
     confidence: float,
 ) -> OutputLengthEstimator:
-    if predictor == "legacy":
-        return CausalOutputLengthEstimator(
-            quantile, 256 if history is None else history
-        )
     if predictor == "paper":
         return PaperOutputLengthEstimator()
     if predictor == "quantile":
-        return QuantileOutputLengthEstimator(
-            quantile, 0 if history is None else history, confidence
-        )
+        return QuantileOutputLengthEstimator(quantile, history, confidence)
     raise ValueError(f"Unknown PKAS output predictor: {predictor}")
 
 
@@ -258,9 +201,9 @@ class PredictiveAdmissionController:
         token_budget: int,
         long_prefill_token_threshold: int,
         max_model_len: int,
-        output_predictor: str = "legacy",
+        output_predictor: str = "paper",
         output_quantile: float = 0.9,
-        output_history: int | None = None,
+        output_history: int = 0,
         output_confidence: float = 0.95,
     ) -> None:
         self.block_size = block_size

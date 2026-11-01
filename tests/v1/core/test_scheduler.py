@@ -26,7 +26,6 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.predictive_admission import AdmissionDecision
-from vllm.v1.core.sched.prefill_cost import PrefillCostShape
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -330,35 +329,17 @@ def test_spf_aging_lets_old_long_request_go_first():
     assert [req.req_id for req in output.scheduled_new_reqs] == ["old_long"]
 
 
-def test_sjf_schedules_smallest_max_tokens_without_cache_lookups():
-    scheduler = _ranked_scheduler("sjf", sjf_age_alpha=0.0)
-    for req_id, max_tokens in (("big", 500), ("small", 50), ("mid", 200)):
-        request = create_requests(
-            1, max_tokens=max_tokens, ignore_eos=True, req_ids=[req_id]
-        )[0]
-        _add_at(scheduler, request, 0.0)
-    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
-
-    output = scheduler.schedule()
-
-    assert [req.req_id for req in output.scheduled_new_reqs] == ["small"]
-    assert [req.request_id for req in scheduler.waiting] == ["mid", "big"]
-    scheduler.kv_cache_manager.get_computed_prefix_len.assert_not_called()
-
-
-def test_sjf_respects_bounded_window():
+def test_spf_respects_bounded_window():
     scheduler = create_scheduler(
         max_num_seqs=1,
         enable_prefix_caching=True,
-        scheduling_policy="sjf",
-        sjf_age_alpha=0.0,
+        scheduling_policy="spf",
         lpm_window_size=2,
     )
-    for req_id, max_tokens in (("a", 300), ("b", 200), ("c", 10)):
-        request = create_requests(
-            1, max_tokens=max_tokens, ignore_eos=True, req_ids=[req_id]
-        )[0]
+    for req_id, num_tokens in (("a", 300), ("b", 200), ("c", 10)):
+        request = create_requests(1, num_tokens=num_tokens, req_ids=[req_id])[0]
         _add_at(scheduler, request, 0.0)
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
 
     output = scheduler.schedule()
 
@@ -366,23 +347,20 @@ def test_sjf_respects_bounded_window():
     assert [req.req_id for req in output.scheduled_new_reqs] == ["b"]
 
 
-def test_ranked_policies_default_age_alpha_is_max_model_len_per_minute():
-    for policy, attr in (
-        ("spf", "_spf_age_alpha"),
-        ("sspf", "_spf_age_alpha"),
-        ("sjf", "_sjf_age_alpha"),
-    ):
+def test_ranked_policy_defaults_rank_whole_queue_once_per_step_without_aging():
+    for policy in ("lpm", "spf", "sspf"):
         scheduler = create_scheduler(
             enable_prefix_caching=True, scheduling_policy=policy
         )
-        assert getattr(scheduler, attr) == pytest.approx(scheduler.max_model_len / 60)
+        assert scheduler.scheduler_config.lpm_window_size == 0
+        assert scheduler._rank_per_admission is False
+        if policy != "lpm":
+            assert scheduler._spf_age_alpha == 0.0
 
 
 def _preempted_then_short(rank_preempted: bool) -> SchedulerOutput:
-    scheduler = _ranked_scheduler(
-        "sjf", sjf_age_alpha=0.0, rank_preempted_requests=rank_preempted
-    )
-    victim = create_requests(1, max_tokens=100, ignore_eos=True, req_ids=["victim"])[0]
+    scheduler = _ranked_scheduler("spf", rank_preempted_requests=rank_preempted)
+    victim = create_requests(1, num_tokens=100, req_ids=["victim"])[0]
     _add_at(scheduler, victim, 0.0)
     scheduler.schedule()
     assert scheduler.running == [victim]
@@ -390,7 +368,10 @@ def _preempted_then_short(rank_preempted: bool) -> SchedulerOutput:
     scheduler._preempt_request(victim, 0.0)
     # A real preemption happens in a step that does not schedule the victim.
     scheduler.prev_step_scheduled_req_ids.discard("victim")
-    short = create_requests(1, max_tokens=10, ignore_eos=True, req_ids=["short"])[0]
+    # Rank both as cold, so the victim's 100 tokens to replay exceed the
+    # short request's 10.
+    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(return_value=0)
+    short = create_requests(1, num_tokens=10, req_ids=["short"])[0]
     _add_at(scheduler, short, 1.0)
     return scheduler.schedule()
 
@@ -409,7 +390,7 @@ def test_preempted_request_is_ranked_when_enabled():
     assert output.scheduled_cached_reqs.req_ids == []
 
 
-def test_rank_preempted_requests_requires_spf_or_sjf():
+def test_rank_preempted_requests_requires_spf():
     with pytest.raises(ValueError, match="rank_preempted_requests"):
         create_scheduler(
             enable_prefix_caching=True,
@@ -511,7 +492,7 @@ def test_rank_per_admission_reranks_after_evicting_waiting_prefix():
 
 @pytest.mark.parametrize(
     ("policy", "admission_policy"),
-    [("sjf", "none"), ("clpm", "none"), ("fcfs", "none"), ("lpm", "pkas")],
+    [("sspf", "none"), ("clpm", "none"), ("fcfs", "none"), ("lpm", "pkas")],
 )
 def test_rank_per_admission_requires_lpm_or_spf_without_pkas(
     policy, admission_policy
@@ -768,7 +749,7 @@ def test_lpm_admission_skips_stop_at_preempted_request():
         ("fcfs", "none"),
         ("clpm", "none"),
         ("spf", "none"),
-        ("sjf", "none"),
+        ("sspf", "none"),
         ("lpm", "pkas"),
     ],
 )
@@ -5467,6 +5448,7 @@ def test_pkas_prefix_reset_clears_estimator_and_rejection_cache():
         enable_prefix_caching=True,
         scheduling_policy="lpm",
         admission_policy="pkas",
+        pkas_output_predictor="quantile",
         pkas_output_quantile=0.5,
         pkas_output_history=64,
     )
@@ -5484,7 +5466,7 @@ def test_pkas_prefix_reset_clears_estimator_and_rejection_cache():
 
     assert scheduler.reset_prefix_cache(reset_running_requests=True)
     assert controller.estimator.count == 0
-    assert controller.estimator.predict() == 512
+    assert controller.estimator.predict() == 1
     assert scheduler._pkas_reject_cache == {}
     assert scheduler._pkas_epoch > epoch
 
@@ -5624,257 +5606,3 @@ def test_pkas_repo_shrinks_running_chunk_to_free_kv(
     output = scheduler.schedule()
     assert not output.num_scheduled_tokens
     assert request.status == RequestStatus.PREEMPTED
-
-
-# DSPF (deadline-guarded shortest prefill first). The cost model is patched to
-# one FLOP per uncached token, so every cost below is an uncached-token count.
-
-
-def _dspf_scheduler(monkeypatch, **kwargs) -> Scheduler:
-    monkeypatch.setattr(
-        PrefillCostShape,
-        "from_model_config",
-        classmethod(lambda cls, model_config: PrefillCostShape(1, 0, 0)),
-    )
-    kwargs.setdefault("enable_prefix_caching", True)
-    return create_scheduler(scheduling_policy="dspf", lpm_window_size=0, **kwargs)
-
-
-def _dspf_job(req_id: str, num_tokens: int) -> Request:
-    return create_requests(1, num_tokens=num_tokens, req_ids=[req_id])[0]
-
-
-def _waiting_ids(scheduler: Scheduler) -> list[str]:
-    return [request.request_id for request in scheduler.waiting]
-
-
-def _no_hits(scheduler: Scheduler) -> None:
-    manager = scheduler.kv_cache_manager
-    manager.get_computed_prefix_len = Mock(return_value=0)
-    manager.get_computed_blocks = Mock(return_value=(manager.empty_kv_cache_blocks, 0))
-
-
-def test_dspf_burst_in_one_step_is_shortest_prefill_first(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch, max_num_seqs=1)
-    for req_id, num_tokens in (("long", 100), ("short", 40), ("mid", 70)):
-        scheduler.add_request(_dspf_job(req_id, num_tokens))
-    _no_hits(scheduler)
-
-    output = scheduler.schedule()
-
-    assert [req.req_id for req in output.scheduled_new_reqs] == ["short"]
-    assert _waiting_ids(scheduler) == ["mid", "long"]
-    # Same-step arrivals form an SPF reference: 40, 40 + 70, 110 + 100.
-    assert scheduler._dspf.deadlines == {"mid": 110, "long": 210}
-    assert scheduler._dspf.work == 40
-
-
-def test_dspf_deadlines_follow_arrival_steps(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    _no_hits(scheduler)
-    scheduler.add_request(_dspf_job("long", 100))
-    scheduler._dspf_rank(10**6, record_step=False)
-    scheduler.add_request(_dspf_job("short", 10))
-    scheduler._dspf_rank(10**6, record_step=False)
-
-    # Across steps the reference is arrival order: short waits behind long.
-    assert scheduler._dspf.deadlines == {"long": 100, "short": 110}
-
-
-def test_dspf_bypasses_an_older_request_only_within_its_slack(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    _no_hits(scheduler)
-    scheduler.add_request(_dspf_job("long", 100))
-    scheduler._dspf_rank(10**6, record_step=False)
-    for i in range(1, 5):
-        scheduler.add_request(_dspf_job(f"s{i}", 30))
-
-    ranking = scheduler._dspf_rank(10**6, record_step=False)
-
-    # long must start by 100: three 30-token jobs fit ahead of it, not four.
-    assert _waiting_ids(scheduler) == ["s1", "s2", "s3", "long", "s4"]
-    assert ranking.feasible
-    assert ranking.edd_placements == 1
-
-
-def test_dspf_empty_system_deadline_is_own_cost(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    _no_hits(scheduler)
-    scheduler.add_request(_dspf_job("first", 10))
-    scheduler.schedule()
-    scheduler.add_request(_dspf_job("second", 10))
-
-    scheduler._dspf_rank(0, record_step=False)
-
-    # Earlier saved or committed work gives no slack: V = W + own cost.
-    assert scheduler._dspf.work == 10
-    assert scheduler._dspf.deadlines == {"second": 20}
-
-
-def test_dspf_abort_leaves_other_deadlines_unchanged(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    _no_hits(scheduler)
-    scheduler.add_request(_dspf_job("A", 100))
-    scheduler._dspf_rank(0, record_step=False)
-    scheduler.add_request(_dspf_job("B", 10))
-    scheduler._dspf_rank(0, record_step=False)
-
-    scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
-
-    assert scheduler._dspf.deadlines == {"B": 110}
-
-
-def test_dspf_new_deadline_before_an_older_one_stays_feasible(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    hits = {"A": 0, "B": 0}
-    scheduler.kv_cache_manager.get_computed_prefix_len = Mock(
-        side_effect=lambda req: hits[req.request_id]
-    )
-    scheduler.add_request(_dspf_job("A", 100))
-    scheduler._dspf_rank(0, record_step=False)
-    hits["A"] = 99  # A's document got cached meanwhile: it now costs 1.
-    scheduler.add_request(_dspf_job("B", 1))
-
-    ranking = scheduler._dspf_rank(10**6, record_step=False)
-
-    # B's deadline (W + A's current 1 + 1) sorts before A's 100.
-    assert scheduler._dspf.deadlines == {"A": 100, "B": 2}
-    assert ranking.feasible
-    assert _waiting_ids(scheduler) == ["A", "B"]
-
-
-def _evict_on_admission(scheduler: Scheduler, hits: dict[str, int]) -> None:
-    """Read-only lookups see ``hits`` until admission's authoritative
-    lookup finds the blocks evicted (zero hits from then on)."""
-    manager = scheduler.kv_cache_manager
-    evicted: set[str] = set()
-
-    def computed_blocks(request):
-        evicted.add(request.request_id)
-        return manager.empty_kv_cache_blocks, 0
-
-    manager.get_computed_prefix_len = Mock(
-        side_effect=lambda req: 0 if req.request_id in evicted else hits[req.request_id]
-    )
-    manager.get_computed_blocks = Mock(side_effect=computed_blocks)
-
-
-def test_dspf_cache_loss_at_admission_reranks(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch, max_num_seqs=1)
-    _evict_on_admission(scheduler, {"R1": 80, "R2": 0})
-    scheduler.add_request(_dspf_job("R2", 50))
-    scheduler._dspf_rank(0, record_step=False)  # an earlier step: deadline 50
-    scheduler.add_request(_dspf_job("R1", 100))  # planned cost 20, deadline 70
-
-    output = scheduler.schedule()
-
-    # R1 lost its 80 cached tokens at admission (cost 100): R2 goes first.
-    assert [req.req_id for req in output.scheduled_new_reqs] == ["R2"]
-    assert _waiting_ids(scheduler) == ["R1"]
-    assert scheduler._step_rerank_count == 1
-
-
-def test_dspf_single_candidate_cache_loss_is_admitted_without_looping(
-    monkeypatch,
-):
-    scheduler = _dspf_scheduler(monkeypatch, max_num_seqs=1)
-    _evict_on_admission(scheduler, {"only": 80})
-    scheduler.add_request(_dspf_job("only", 100))
-
-    output = scheduler.schedule()
-
-    assert [req.req_id for req in output.scheduled_new_reqs] == ["only"]
-    assert scheduler._step_rerank_count == 1
-    assert scheduler._dspf.work == 100
-
-
-def test_dspf_charges_a_resumed_request_again(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch, max_num_seqs=1)
-    _no_hits(scheduler)
-    request = _dspf_job("R", 100)
-    scheduler.add_request(request)
-    output = scheduler.schedule()
-    scheduler.update_from_output(
-        output,
-        ModelRunnerOutput(
-            req_ids=[request.request_id],
-            req_id_to_index={request.request_id: 0},
-            sampled_token_ids=[[1]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-        ),
-    )
-    scheduler.running.remove(request)
-    scheduler._preempt_request(request, 0.0)
-    # A real preemption happens inside schedule(), so the preempted request
-    # is not in the previous step's batch when it resumes.
-    scheduler.prev_step_scheduled_req_ids.discard(request.request_id)
-
-    output = scheduler.schedule()
-
-    assert output.scheduled_cached_reqs.resumed_req_ids == {"R"}
-    # 100 prompt tokens, then the replay of 100 prompt + 1 output tokens.
-    assert scheduler._dspf.work == 100 + 101
-
-
-def test_dspf_takes_skipped_queue_first_like_other_fcfs_queues(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    skipped = _dspf_job("skipped", 10)
-    scheduler.skipped_waiting.add_request(skipped)
-    scheduler.waiting.add_request(_dspf_job("waiting", 10))
-
-    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.skipped_waiting
-
-
-@pytest.mark.parametrize(
-    "kwargs, match",
-    [
-        ({"admission_policy": "pkas", "scheduler_reserve_full_isl": False}, "dspf"),
-        ({"use_kv_connector": True}, "KV connectors"),
-        ({"lpm_fallback_threshold": 64}, "lpm_fallback_threshold"),
-    ],
-)
-def test_dspf_rejects_unsupported_setups(monkeypatch, kwargs, match):
-    with pytest.raises(ValueError, match=match):
-        _dspf_scheduler(monkeypatch, **kwargs)
-
-
-def test_dspf_rejects_unsupported_architecture():
-    # The test model is OPT, which DSPF's cost model does not cover.
-    with pytest.raises(ValueError, match="dspf"):
-        create_scheduler(scheduling_policy="dspf", enable_prefix_caching=True)
-
-
-def test_dspf_logs_its_fields(monkeypatch):
-    scheduler = _dspf_scheduler(monkeypatch)
-    _no_hits(scheduler)
-    scheduler.add_request(_dspf_job("R", 10))
-    with patch("vllm.v1.core.sched.scheduler.logger") as log:
-        scheduler.schedule()
-
-    admitted = [
-        c for c in log.info.call_args_list if "admitted_prefix_cache" in c.args[0]
-    ]
-    assert admitted[0].args[-1] == " dspf_cost_gflop=0.0 dspf_slack_gflop=0.0"
-    records = [record for record, _ in scheduler._pending_batch_logs.values()]
-    assert {"dspf_feasible", "dspf_edd", "dspf_late"} <= records[0].keys()
-
-
-@pytest.mark.parametrize("policy", ["fcfs", "lpm", "spf"])
-def test_other_policies_log_no_dspf_fields(policy):
-    scheduler = create_scheduler(
-        scheduling_policy=policy, enable_prefix_caching=True, lpm_window_size=0
-    )
-    scheduler.add_request(create_requests(1, num_tokens=32)[0])
-    with patch("vllm.v1.core.sched.scheduler.logger") as log:
-        scheduler.schedule()
-
-    assert scheduler._dspf is None
-    admitted = [
-        c for c in log.info.call_args_list if "admitted_prefix_cache" in c.args[0]
-    ]
-    # The extra %s slot is empty, so the line is byte-identical to before.
-    assert admitted[0].args[-1] == ""
-    for record, _ in scheduler._pending_batch_logs.values():
-        assert not [key for key in record if key.startswith("dspf_")]

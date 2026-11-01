@@ -606,7 +606,7 @@ class EngineArgs:
     pkas_output_predictor: PKASOutputPredictor = SchedulerConfig.pkas_output_predictor
     pkas_simulation: PKASSimulation = SchedulerConfig.pkas_simulation
     pkas_output_quantile: float = SchedulerConfig.pkas_output_quantile
-    pkas_output_history: int | None = SchedulerConfig.pkas_output_history
+    pkas_output_history: int = SchedulerConfig.pkas_output_history
     pkas_output_confidence: float = SchedulerConfig.pkas_output_confidence
     pkas_reject_cache_steps: int = SchedulerConfig.pkas_reject_cache_steps
     lpm_window_size: int | None = None
@@ -619,8 +619,7 @@ class EngineArgs:
     clpm_group_major: bool | None = None
     clpm_dynamic_lane: bool | None = None
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
-    spf_age_alpha: float | None = SchedulerConfig.spf_age_alpha
-    sjf_age_alpha: float | None = SchedulerConfig.sjf_age_alpha
+    spf_age_alpha: float = SchedulerConfig.spf_age_alpha
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
     rank_per_admission: bool = SchedulerConfig.rank_per_admission
     defer_inflight_prefixes: bool = SchedulerConfig.defer_inflight_prefixes
@@ -1561,9 +1560,6 @@ class EngineArgs:
             "--spf-age-alpha", **scheduler_kwargs["spf_age_alpha"]
         )
         scheduler_group.add_argument(
-            "--sjf-age-alpha", **scheduler_kwargs["sjf_age_alpha"]
-        )
-        scheduler_group.add_argument(
             "--rank-preempted-requests",
             **scheduler_kwargs["rank_preempted_requests"],
         )
@@ -2266,7 +2262,6 @@ class EngineArgs:
             clpm_dynamic_lane=self.clpm_dynamic_lane,
             clpm_slo_budget_s=self.clpm_slo_budget_s,
             spf_age_alpha=self.spf_age_alpha,
-            sjf_age_alpha=self.sjf_age_alpha,
             rank_preempted_requests=self.rank_preempted_requests,
             rank_per_admission=self.rank_per_admission,
             defer_inflight_prefixes=self.defer_inflight_prefixes,
