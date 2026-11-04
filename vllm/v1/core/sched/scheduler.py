@@ -1443,8 +1443,11 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
-                # Cannot schedule this request.
-                break
+                # The request preempted itself and left self.running at
+                # req_index, so the next running request is already there.
+                # (LIFO only preempts the requester when it is the last one,
+                # so the loop ends as before.)
+                continue
 
             # Schedule the request.
             scheduled_running_reqs.append(request)

@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Least-done preemption victim (SSPF series), against stock LIFO.
 
-The simulator's rule (KVReuse ``simulator/kvsim.py`` ``pick_victim``):
-preempt the running request with the fewest computed tokens, the earliest
-admitted on ties, repeating until the allocation fits or the requester
-itself is chosen. Decision parity is tested in
-``simulator/test_vllm_parity.py``.
+The simulator's rule (KVReuse ``simulator/sched-sim/kvsim.py``
+``pick_victim``): preempt the running request with the fewest computed
+tokens, the earliest admitted on ties, repeating until the allocation fits or
+the requester itself is chosen; then go on with the next running request.
+Decision parity is tested in ``simulator/sched-sim/test_vllm_parity.py``.
 """
 
 import pytest
@@ -116,8 +116,9 @@ def test_victim_rule(victim, expected_victims, expected_scheduled):
     [
         ("lifo", ["c"], {"a": 1, "b": 1}),
         # a and b tie at 16 computed tokens: the earliest admitted, a, goes
-        # first. a is the requester, so the running loop stops.
-        ("least_done", ["a"], {}),
+        # first and preempts itself. The loop goes on: b takes a's block,
+        # then c needs one and unschedules b (the least done).
+        ("least_done", ["a", "b"], {"c": 1}),
     ],
 )
 def test_least_done_ties_go_to_the_earliest_admitted(
@@ -127,6 +128,27 @@ def test_least_done_ties_go_to_the_earliest_admitted(
     scheduled, victims = _step(scheduler)
     assert victims == expected_victims
     assert scheduled == expected_scheduled
+
+
+@pytest.mark.parametrize(
+    ("victim", "expected_victims", "expected_scheduled"),
+    [
+        # a (16 computed) needs a 2nd block; the pool (5 usable) is full.
+        # LIFO preempts c, freeing 2 blocks: a and b both grow.
+        ("lifo", ["c"], {"a": 1, "b": 1}),
+        # least_done: a is the least done and preempts itself; b and c are
+        # mid-block and still decode in the same step.
+        ("least_done", ["a"], {"b": 1, "c": 1}),
+    ],
+)
+def test_least_done_self_preemption_keeps_scheduling(
+    victim, expected_victims, expected_scheduled
+):
+    scheduler = _running(victim, 6, [("a", 16), ("b", 20), ("c", 20)])
+    scheduled, victims = _step(scheduler)
+    assert victims == expected_victims
+    assert scheduled == expected_scheduled
+    assert {r.request_id for r in scheduler.running} == set(expected_scheduled)
 
 
 @pytest.mark.parametrize(
