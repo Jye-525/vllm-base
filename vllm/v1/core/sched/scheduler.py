@@ -133,6 +133,59 @@ class _StepState:
     admit_ns: int = 0
 
 
+@dataclass(slots=True)
+class _WaitingAdmission:
+    """State of one step's pass over the waiting queues."""
+
+    # Requests set aside this step (blocked, over the LoRA limit, unknown
+    # connector hits, async KV loads); re-queued ahead of older skipped ones.
+    step_skipped_waiting: RequestQueue
+    predictive_admission_state: _PredictiveAdmissionState | None
+    # LPM admission skips: unfit requests set aside this step, in ranked
+    # order. One admission after a skip ends the step.
+    lpm_skipped: list[Request] = field(default_factory=list)
+    # Per-admission re-ranking: re-rank lazily, only before the next
+    # admission attempt, so a step that admits once never re-ranks.
+    rerank_pending: bool = False
+
+
+@dataclass(slots=True)
+class _CachedPrefix:
+    """Cached tokens of a waiting request at its admission attempt."""
+
+    new_computed_blocks: KVCacheBlocks
+    num_new_local_computed_tokens: int
+    # Local plus external, or the tokens already received by a request
+    # whose async KV load finished.
+    num_computed_tokens: int
+    num_external_computed_tokens: int = 0
+    load_kv_async: bool = False
+    connector_prefix_cache_queries: int = 0
+    connector_prefix_cache_hits: int = 0
+
+
+@dataclass(slots=True)
+class _WaitingChunk:
+    """What a waiting request would be scheduled for this step."""
+
+    num_new_tokens: int = 0
+    encoder_inputs_to_schedule: list[int] | None = None
+    new_encoder_compute_budget: int = 0
+    external_load_encoder_input: list[int] = field(default_factory=list)
+    # Cross-attention tokens (encoder-decoder models).
+    num_encoder_tokens: int = 0
+
+
+@dataclass(slots=True)
+class _AdmissionNotes:
+    """Per-request waiting state dropped at admission, for its log line."""
+
+    credit_blocks: int
+    sspf_price: float | None
+    lpm_bypassed: int
+    lpm_first_skip_hit: int
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1500,6 +1553,533 @@ class Scheduler(SchedulerInterface):
                 request.get_num_encoder_embeds(i) for i in encoder_inputs
             )
 
+    def _schedule_waiting_requests(self, step: _StepState) -> None:
+        """Admit WAITING requests from the queue head (ranked policies reorder
+        it first) until the token budget, the running-request limit or a
+        request that cannot be admitted stops admission for this step."""
+        admission = self._prepare_waiting_admission(step)
+        admit_start_ns = time.perf_counter_ns()
+        rank_ns_before_admit = self._step_rank_ns
+        while (self.waiting or self.skipped_waiting) and step.token_budget > 0:
+            if len(self.running) == self.max_num_running_reqs:
+                break
+            if admission.rerank_pending:
+                admission.rerank_pending = False
+                self._rerank_waiting_requests(step.scheduled_loras)
+            if not self._try_admit_waiting_head(step, admission):
+                break
+        # Re-ranks inside the loop are already in rank_ns.
+        step.admit_ns = (
+            time.perf_counter_ns()
+            - admit_start_ns
+            - (self._step_rank_ns - rank_ns_before_admit)
+        )
+        self._finish_waiting_admission(admission)
+
+    def _prepare_waiting_admission(self, step: _StepState) -> _WaitingAdmission:
+        """Rank the waiting queue and set up this step's admission pass."""
+        # Ranked policies (LPM, cLPM, SPF, SSPF): reorder the bounded
+        # rankable prefix of self.waiting once per step (LPM and SPF may
+        # re-rank between admissions); admission still pops from the queue
+        # head.
+        rank_start_ns = time.perf_counter_ns()
+        step.prefix_rank_plan = self._reorder_waiting_requests(step.scheduled_loras)
+        self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
+        if self._retention is not None and self.waiting:
+            # Ranks for retention: the waiting order (index paths) now.
+            index = self.pending_prefix_index
+            self._retention.set_snapshot([
+                (
+                    index.request_path(r.request_id) or (),
+                    r.num_prompt_tokens // self.block_size,
+                )
+                for r in self.waiting
+            ])
+        if self._skip_eviction and self._lpm_bypass_counts:
+            self._refresh_skip_protection()
+        predictive_admission_state = None
+        if (
+            (self.waiting or self.skipped_waiting)
+            and step.token_budget > 0
+            and len(self.running) < self.max_num_running_reqs
+        ):
+            predictive_admission_state = self._build_predictive_admission_state(
+                step.num_scheduled_tokens
+            )
+        if self._rank_per_admission:
+            self.kv_cache_manager.block_pool.start_eviction_log()
+        return _WaitingAdmission(
+            step_skipped_waiting=create_request_queue(self.policy),
+            predictive_admission_state=predictive_admission_state,
+        )
+
+    def _finish_waiting_admission(self, admission: _WaitingAdmission) -> None:
+        """Put the requests set aside during admission back in the queues."""
+        if self._rank_per_admission:
+            self.kv_cache_manager.block_pool.stop_eviction_log()
+
+        if admission.lpm_skipped:
+            # Return the skipped requests to the head in ranked order.
+            self._step_lpm_scan_ns = time.perf_counter_ns() - self._lpm_scan_start_ns
+            for skipped_request in reversed(admission.lpm_skipped):
+                self.waiting.prepend_request(skipped_request)
+
+        # re-queue requests skipped in this pass ahead of older skipped items.
+        if admission.step_skipped_waiting:
+            self.skipped_waiting.prepend_requests(admission.step_skipped_waiting)
+
+    def _try_admit_waiting_head(
+        self, step: _StepState, admission: _WaitingAdmission
+    ) -> bool:
+        """Try to admit the request at the head of the waiting queues.
+
+        Returns True to go on with the next waiting request (this one was
+        admitted or set aside) and False to stop admitting this step.
+        """
+        request_queue = self._select_waiting_queue_for_scheduling()
+        assert request_queue is not None
+
+        request = request_queue.peek_request()
+
+        request_id = request.request_id
+
+        # try to promote blocked statuses while traversing skipped queue.
+        if self._is_blocked_waiting_status(
+            request.status
+        ) and not self._try_promote_blocked_waiting_request(request):
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                logger.debug(
+                    "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                    request_id,
+                )
+            request_queue.pop_request()
+            admission.step_skipped_waiting.prepend_request(request)
+            return True
+
+        # Check that adding the request still respects the max_loras
+        # constraint.
+        if (
+            self.lora_config
+            and request.lora_request
+            and (
+                len(step.scheduled_loras) == self.lora_config.max_loras
+                and request.lora_request.lora_int_id not in step.scheduled_loras
+            )
+        ):
+            # Scheduling would exceed max_loras, skip.
+            request_queue.pop_request()
+            admission.step_skipped_waiting.prepend_request(request)
+            return True
+
+        prefix = self._lookup_cached_prefix(request)
+        if prefix is None:
+            # The request cannot be scheduled because the KVConnector
+            # couldn't determine the number of matched tokens.
+            request_queue.pop_request()
+            admission.step_skipped_waiting.prepend_request(request)
+            return True
+
+        chunk = self._plan_waiting_chunk(request, prefix, step)
+        if chunk is None:
+            return False
+
+        # Full-ISL admission check (upstream scheduler_reserve_full_isl).
+        # PKAS rejects this setting: its simulation already reserves
+        # the rest of the prompt and the predicted decode.
+        if self.scheduler_reserve_full_isl:
+            fits, _, _ = self.kv_cache_manager.full_sequence_fits(
+                request,
+                num_new_computed_tokens=prefix.num_new_local_computed_tokens,
+                new_computed_blocks=prefix.new_computed_blocks,
+                num_external_computed_tokens=prefix.num_external_computed_tokens,
+                num_encoder_tokens=chunk.num_encoder_tokens,
+            )
+            if not fits:
+                # Upstream behaviour: stop admitting this step (unless LPM
+                # admission skips set the request aside).
+                return self._release_unfit_waiting_request(
+                    request,
+                    request_queue,
+                    admission.lpm_skipped,
+                    prefix.num_new_local_computed_tokens,
+                )
+
+        if not self._predictive_admission_allows(
+            admission.predictive_admission_state,
+            request,
+            prefix.new_computed_blocks,
+            prefix.num_computed_tokens,
+            chunk.num_new_tokens,
+        ):
+            self._record_pkas_refusal(
+                request, prefix.num_computed_tokens, step.token_budget
+            )
+            return False
+
+        # Handles an edge case when P/D Disaggregation
+        # is used with Spec Decoding where an
+        # extra block gets allocated which
+        # creates a mismatch between the number
+        # of local and remote blocks.
+        effective_lookahead_tokens = (
+            0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+        )
+
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            chunk.num_new_tokens,
+            num_new_computed_tokens=prefix.num_new_local_computed_tokens,
+            new_computed_blocks=prefix.new_computed_blocks,
+            num_lookahead_tokens=effective_lookahead_tokens,
+            num_external_computed_tokens=prefix.num_external_computed_tokens,
+            delay_cache_blocks=prefix.load_kv_async,
+            num_encoder_tokens=chunk.num_encoder_tokens,
+            # The full-ISL check already ran above, before PKAS.
+        )
+
+        if new_blocks is None:
+            # The request cannot be scheduled. NOTE: this untouches
+            # the request from the encoder cache manager.
+            return self._release_unfit_waiting_request(
+                request,
+                request_queue,
+                admission.lpm_skipped,
+                prefix.num_new_local_computed_tokens,
+            )
+
+        # KVTransfer: the connector uses this info to determine
+        # if a load is needed. Note that
+        # This information is used to determine if a load is
+        # needed for this request.
+        if self.connector is not None:
+            self._update_connector_after_alloc(request, prefix)
+
+        # Remove the request only after allocation succeeds. Prefix
+        # policies have already reordered the bounded queue prefix.
+        request = request_queue.pop_request()
+        notes = self._on_waiting_admitted(
+            request, prefix, chunk.num_new_tokens, admission
+        )
+        if prefix.load_kv_async:
+            # If loading async, allocate memory and put request
+            # into the WAITING_FOR_REMOTE_KV state.
+            request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            admission.step_skipped_waiting.prepend_request(request)
+            # Set num_computed_tokens even though KVs are not yet loaded.
+            # request.num_computed_tokens will not be used anywhere until
+            # the request finished the KV transfer.
+            #
+            # If a transfer error is reported by the connector,
+            # request.num_computed_tokens will be re-set accordingly in
+            # _update_requests_with_invalid_blocks.
+            #
+            # When the transfer is finished, either successfully or not,
+            # request.num_computed_tokens will correctly reflect the number
+            # of computed tokens.
+            # _update_waiting_for_remote_kv will then cache
+            # only the successfully loaded tokens.
+            request.num_computed_tokens = prefix.num_computed_tokens
+            # Still pending (not ready) until the remote KVs arrive.
+            self._track_waiting_request(request)
+        else:
+            self._commit_waiting_admission(
+                request, prefix, chunk, notes, admission, step
+            )
+        # Admitted past unfit requests: stop admitting this step.
+        return not admission.lpm_skipped
+
+    def _lookup_cached_prefix(self, request: Request) -> _CachedPrefix | None:
+        """Locally and externally cached tokens of a waiting request; None if
+        the KV connector cannot tell yet."""
+        if request.num_computed_tokens > 0:
+            # KVTransfer: WAITING reqs have num_computed_tokens > 0
+            # after async KV recvs are completed.
+            return _CachedPrefix(
+                new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks,
+                num_new_local_computed_tokens=0,
+                num_computed_tokens=request.num_computed_tokens,
+            )
+
+        # Get locally-cached tokens.
+        new_computed_blocks, num_new_local_computed_tokens = (
+            self.kv_cache_manager.get_computed_blocks(request)
+        )
+        prefix = _CachedPrefix(
+            new_computed_blocks=new_computed_blocks,
+            num_new_local_computed_tokens=num_new_local_computed_tokens,
+            num_computed_tokens=num_new_local_computed_tokens,
+        )
+
+        # Get externally-cached tokens if using a KVConnector.
+        if self.connector is not None:
+            ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+                request, num_new_local_computed_tokens
+            )
+            if ext_tokens is None:
+                return None
+            prefix.num_external_computed_tokens = ext_tokens
+            prefix.load_kv_async = load_kv_async
+            prefix.connector_prefix_cache_queries = (
+                request.num_tokens - num_new_local_computed_tokens
+            )
+            prefix.connector_prefix_cache_hits = ext_tokens
+            # Total computed tokens (local + external).
+            prefix.num_computed_tokens += ext_tokens
+        assert prefix.num_computed_tokens <= request.num_tokens
+
+        # Track first scheduled prefill, not post-preemption repeat prefills.
+        # The stats are only taken with the first output token, so a
+        # request preempted mid-prefill still holds them on resume:
+        # without the preemption check its resume would overwrite the
+        # first admission's hit with the (larger) resume hit.
+        if request.prefill_stats is not None and request.num_preemptions == 0:
+            assert prefix.num_computed_tokens <= request.num_prompt_tokens
+            request.prefill_stats.set(
+                num_prompt_tokens=request.num_prompt_tokens,
+                num_local_cached_tokens=num_new_local_computed_tokens,
+                num_external_cached_tokens=prefix.num_external_computed_tokens,
+            )
+        return prefix
+
+    def _plan_waiting_chunk(
+        self, request: Request, prefix: _CachedPrefix, step: _StepState
+    ) -> _WaitingChunk | None:
+        """Tokens and encoder inputs to schedule for a waiting request this
+        step; None when admission must stop at this request."""
+        chunk = _WaitingChunk(new_encoder_compute_budget=step.encoder_compute_budget)
+        if prefix.load_kv_async:
+            # KVTransfer: loading remote KV, do not allocate for new work.
+            assert prefix.num_external_computed_tokens > 0
+        else:
+            # Number of tokens to be scheduled.
+            # We use `request.num_tokens` instead of
+            # `request.num_prompt_tokens` to consider the resumed
+            # requests, which have output tokens.
+            num_new_tokens = request.num_tokens - prefix.num_computed_tokens
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
+
+            # chunked prefill has to be enabled explicitly to allow
+            # pooling requests to be chunked
+            if (
+                not self.scheduler_config.enable_chunked_prefill
+                and num_new_tokens > step.token_budget
+            ):
+                # If chunked_prefill is disabled,
+                # we can stop the scheduling here.
+                return None
+
+            num_new_tokens = min(num_new_tokens, step.token_budget)
+            assert num_new_tokens > 0
+
+            # Schedule encoder inputs.
+            if request.has_encoder_inputs:
+                (
+                    chunk.encoder_inputs_to_schedule,
+                    num_new_tokens,
+                    chunk.new_encoder_compute_budget,
+                    chunk.external_load_encoder_input,
+                ) = self._try_schedule_encoder_inputs(
+                    request,
+                    prefix.num_computed_tokens,
+                    num_new_tokens,
+                    step.encoder_compute_budget,
+                    shift_computed_tokens=1 if self.use_eagle else 0,
+                )
+                if num_new_tokens == 0:
+                    # The request cannot be scheduled.
+                    return None
+            chunk.num_new_tokens = num_new_tokens
+
+        if self.need_mamba_block_aligned_split:
+            chunk.num_new_tokens = self._mamba_block_aligned_split(
+                request,
+                chunk.num_new_tokens,
+                prefix.num_new_local_computed_tokens,
+                prefix.num_external_computed_tokens,
+            )
+            if chunk.num_new_tokens == 0:
+                return None
+
+        # Determine if we need to allocate cross-attention blocks.
+        if (
+            self.is_encoder_decoder
+            and request.has_encoder_inputs
+            and chunk.encoder_inputs_to_schedule
+        ):
+            chunk.num_encoder_tokens = sum(
+                request.get_num_encoder_embeds(i)
+                for i in chunk.encoder_inputs_to_schedule
+            )
+        return chunk
+
+    def _record_pkas_refusal(
+        self, request: Request, num_computed_tokens: int, token_budget: int
+    ) -> None:
+        """PKAS refused the waiting request at the head: admission stops."""
+        # Release encoder-cache references taken while checking
+        # this request, as the allocation-failure path does.
+        if request.has_encoder_inputs:
+            self.encoder_cache_manager.free(request)
+        stats = self._pkas_step_stats
+        assert stats is not None
+        if request.num_preemptions > 0 and num_computed_tokens > 0:
+            # A preempted request is waiting to resume and PKAS
+            # refused it: admission stops behind it.
+            stats["recovery_stops"] += 1
+        stats["blocked_budget"] = token_budget
+
+    def _update_connector_after_alloc(
+        self, request: Request, prefix: _CachedPrefix
+    ) -> None:
+        assert self.connector is not None
+        self.connector.update_state_after_alloc(
+            request,
+            self.kv_cache_manager.get_blocks(request.request_id),
+            prefix.num_external_computed_tokens,
+        )
+        if (
+            self.connector_prefix_cache_stats is not None
+            and prefix.connector_prefix_cache_queries != 0
+        ):
+            self.connector_prefix_cache_stats.record(
+                num_tokens=prefix.connector_prefix_cache_queries,
+                num_hits=prefix.connector_prefix_cache_hits,
+                preempted=request.num_preemptions > 0,
+            )
+
+    def _on_waiting_admitted(
+        self,
+        request: Request,
+        prefix: _CachedPrefix,
+        num_new_tokens: int,
+        admission: _WaitingAdmission,
+    ) -> _AdmissionNotes:
+        """Drop the per-request waiting state of a request that just left
+        the waiting queue (PKAS reject cache, SSPF price and session credit,
+        LPM skip history and protection, waiting-prefix demand)."""
+        request_id = request.request_id
+        self._pkas_reject_cache.pop(request_id, None)
+        credit_blocks = (
+            0
+            if self._session_credit is None
+            else self._session_credit.drop(request_id)
+        )
+        sspf_price = self._sspf_costs.pop(request_id, None)
+        lpm_bypassed = self._lpm_bypass_counts.pop(request_id, 0)
+        lpm_first_skip_hit = self._lpm_first_skip_hits.pop(request_id, 0)
+        self._lpm_last_skip_hits.pop(request_id, None)
+        if lpm_bypassed:
+            # Its hit blocks are allocated now; drop the protection.
+            self._unprotect_skipped_request(request)
+        self._pkas_epoch += 1
+        self._untrack_waiting_request(request)
+        if self._rank_per_admission:
+            admission.rerank_pending = (
+                self._admission_changed_waiting_hits(
+                    request,
+                    prefix.num_new_local_computed_tokens,
+                    prefix.num_computed_tokens + num_new_tokens,
+                )
+                or admission.rerank_pending
+            )
+        return _AdmissionNotes(
+            credit_blocks=credit_blocks,
+            sspf_price=sspf_price,
+            lpm_bypassed=lpm_bypassed,
+            lpm_first_skip_hit=lpm_first_skip_hit,
+        )
+
+    def _commit_waiting_admission(
+        self,
+        request: Request,
+        prefix: _CachedPrefix,
+        chunk: _WaitingChunk,
+        notes: _AdmissionNotes,
+        admission: _WaitingAdmission,
+        step: _StepState,
+    ) -> None:
+        """Move an admitted waiting request to RUNNING and into this step."""
+        request_id = request.request_id
+        num_new_tokens = chunk.num_new_tokens
+        num_computed_tokens = prefix.num_computed_tokens
+        self._commit_clpm_admission(request_id, step.prefix_rank_plan)
+
+        self.kv_cache_manager.record_local_prefix_cache_hit(
+            request,
+            prefix.num_new_local_computed_tokens,
+        )
+        self._log_waiting_admission(request, prefix, chunk, notes, admission)
+
+        self.running.append(request)
+        if self.log_stats:
+            request.record_event(
+                EngineCoreEventType.SCHEDULED, step.scheduled_timestamp
+            )
+        if request.status == RequestStatus.WAITING:
+            step.scheduled_new_reqs.append(request)
+        elif request.status == RequestStatus.PREEMPTED:
+            step.scheduled_resumed_reqs.append(request)
+        else:
+            raise RuntimeError(f"Invalid request status: {request.status}")
+
+        if self.lora_config and request.lora_request:
+            step.scheduled_loras.add(request.lora_request.lora_int_id)
+        step.req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
+            request_id
+        )
+        step.num_scheduled_tokens[request_id] = num_new_tokens
+        step.token_budget -= num_new_tokens
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = num_computed_tokens
+        self._update_predictive_admission_state(
+            admission.predictive_admission_state,
+            request,
+            num_computed_tokens + num_new_tokens,
+            step.req_to_new_blocks[request_id],
+        )
+        self._allocate_encoder_inputs(
+            request,
+            step,
+            chunk.encoder_inputs_to_schedule,
+            chunk.new_encoder_compute_budget,
+            chunk.external_load_encoder_input,
+        )
+
+    def _log_waiting_admission(
+        self,
+        request: Request,
+        prefix: _CachedPrefix,
+        chunk: _WaitingChunk,
+        notes: _AdmissionNotes,
+        admission: _WaitingAdmission,
+    ) -> None:
+        # A resumed request (prompt_tokens includes its output so far)
+        # appears again; its first line is the original admission.
+        pkas_target = self._pkas_last_gate_target.get(request.request_id)
+        logger.info(
+            "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
+            "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
+            "running=%d%s%s%s%s",
+            self._step_id,
+            request.request_id,
+            request.num_tokens,
+            prefix.num_new_local_computed_tokens,
+            chunk.num_new_tokens,
+            len(self.waiting) + len(admission.lpm_skipped),
+            len(self.running),
+            "" if pkas_target is None
+            else f" pkas_target_output_tokens={pkas_target}",
+            f" lpm_bypassed={notes.lpm_bypassed}"
+            f" lpm_first_skip_hit={notes.lpm_first_skip_hit}"
+            if notes.lpm_bypassed
+            else "",
+            "" if notes.sspf_price is None
+            else f" sspf_cost={notes.sspf_price:.1f}",
+            f" credit_blocks={notes.credit_blocks}" if notes.credit_blocks else "",
+        )
+
     def schedule(self) -> SchedulerOutput:
         schedule_start_ns = time.perf_counter_ns()
         step = self._begin_step()
@@ -1518,459 +2098,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not step.preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
-            # Ranked policies (LPM, cLPM, SPF, SSPF): reorder the bounded
-            # rankable prefix of self.waiting once per step (LPM and SPF may
-            # re-rank between admissions); admission below still pops from
-            # the queue head.
-            rank_start_ns = time.perf_counter_ns()
-            step.prefix_rank_plan = self._reorder_waiting_requests(step.scheduled_loras)
-            self._step_rank_ns = time.perf_counter_ns() - rank_start_ns
-            if self._retention is not None and self.waiting:
-                # Ranks for retention: the waiting order (index paths) now.
-                index = self.pending_prefix_index
-                self._retention.set_snapshot([
-                    (
-                        index.request_path(r.request_id) or (),
-                        r.num_prompt_tokens // self.block_size,
-                    )
-                    for r in self.waiting
-                ])
-            if self._skip_eviction and self._lpm_bypass_counts:
-                self._refresh_skip_protection()
-            predictive_admission_state = None
-            if (
-                (self.waiting or self.skipped_waiting)
-                and step.token_budget > 0
-                and len(self.running) < self.max_num_running_reqs
-            ):
-                predictive_admission_state = self._build_predictive_admission_state(
-                    step.num_scheduled_tokens
-                )
-            # Per-admission re-ranking: re-rank lazily, only before the next
-            # admission attempt, so a step that admits once never re-ranks.
-            rerank_pending = False
-            if self._rank_per_admission:
-                self.kv_cache_manager.block_pool.start_eviction_log()
-            # LPM admission skips: unfit requests set aside this step, in
-            # ranked order. One admission after a skip ends the step.
-            lpm_skipped: list[Request] = []
-            admit_start_ns = time.perf_counter_ns()
-            rank_ns_before_admit = self._step_rank_ns
-            while (self.waiting or self.skipped_waiting) and step.token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
-                    break
-                if rerank_pending:
-                    rerank_pending = False
-                    self._rerank_waiting_requests(step.scheduled_loras)
-
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
-
-                request = request_queue.peek_request()
-
-                request_id = request.request_id
-
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                # Check that adding the request still respects the max_loras
-                # constraint.
-                if (
-                    self.lora_config
-                    and request.lora_request
-                    and (
-                        len(step.scheduled_loras) == self.lora_config.max_loras
-                        and request.lora_request.lora_int_id not in step.scheduled_loras
-                    )
-                ):
-                    # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                num_external_computed_tokens = 0
-                load_kv_async = False
-                connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
-
-                # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
-
-                    # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
-                            )
-                        )
-
-                        if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-
-                        num_external_computed_tokens = ext_tokens
-
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
-                        )
-                        connector_prefix_cache_hits = num_external_computed_tokens
-
-                    # Total computed tokens (local + external).
-                    num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
-                    )
-                    assert num_computed_tokens <= request.num_tokens
-
-                    # Track first scheduled prefill, not post-preemption repeat prefills.
-                    # The stats are only taken with the first output token, so a
-                    # request preempted mid-prefill still holds them on resume:
-                    # without the preemption check its resume would overwrite the
-                    # first admission's hit with the (larger) resume hit.
-                    if (
-                        request.prefill_stats is not None
-                        and request.num_preemptions == 0
-                    ):
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
-                else:
-                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
-                    # after async KV recvs are completed.
-                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0
-                    num_computed_tokens = request.num_computed_tokens
-
-                encoder_inputs_to_schedule = None
-                external_load_encoder_input = []
-                new_encoder_compute_budget = step.encoder_compute_budget
-
-                if load_kv_async:
-                    # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0
-                    num_new_tokens = 0
-                else:
-                    # Number of tokens to be scheduled.
-                    # We use `request.num_tokens` instead of
-                    # `request.num_prompt_tokens` to consider the resumed
-                    # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
-
-                    # chunked prefill has to be enabled explicitly to allow
-                    # pooling requests to be chunked
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > step.token_budget
-                    ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
-                        break
-
-                    num_new_tokens = min(num_new_tokens, step.token_budget)
-                    assert num_new_tokens > 0
-
-                    # Schedule encoder inputs.
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            step.encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            # The request cannot be scheduled.
-                            break
-
-                if self.need_mamba_block_aligned_split:
-                    num_new_tokens = self._mamba_block_aligned_split(
-                        request,
-                        num_new_tokens,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
-                    )
-                    if num_new_tokens == 0:
-                        break
-
-                # Determine if we need to allocate cross-attention blocks.
-                num_encoder_tokens = 0
-                if (
-                    self.is_encoder_decoder
-                    and request.has_encoder_inputs
-                    and encoder_inputs_to_schedule
-                ):
-                    num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
-                        for i in encoder_inputs_to_schedule
-                    )
-
-                # Full-ISL admission check (upstream scheduler_reserve_full_isl).
-                # PKAS rejects this setting: its simulation already reserves
-                # the rest of the prompt and the predicted decode.
-                if self.scheduler_reserve_full_isl:
-                    fits, _, _ = (
-                        self.kv_cache_manager.full_sequence_fits(
-                            request,
-                            num_new_computed_tokens=num_new_local_computed_tokens,
-                            new_computed_blocks=new_computed_blocks,
-                            num_external_computed_tokens=num_external_computed_tokens,
-                            num_encoder_tokens=num_encoder_tokens,
-                        )
-                    )
-                    if not fits:
-                        if self._release_unfit_waiting_request(
-                            request,
-                            request_queue,
-                            lpm_skipped,
-                            num_new_local_computed_tokens,
-                        ):
-                            continue
-                        # Upstream behaviour: stop admitting this step.
-                        break
-
-                if not self._predictive_admission_allows(
-                    predictive_admission_state,
-                    request,
-                    new_computed_blocks,
-                    num_computed_tokens,
-                    num_new_tokens,
-                ):
-                    # Release encoder-cache references taken while checking
-                    # this request, as the allocation-failure path does.
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    stats = self._pkas_step_stats
-                    assert stats is not None
-                    if request.num_preemptions > 0 and num_computed_tokens > 0:
-                        # A preempted request is waiting to resume and PKAS
-                        # refused it: admission stops behind it.
-                        stats["recovery_stops"] += 1
-                    stats["blocked_budget"] = step.token_budget
-                    break
-
-                # Handles an edge case when P/D Disaggregation
-                # is used with Spec Decoding where an
-                # extra block gets allocated which
-                # creates a mismatch between the number
-                # of local and remote blocks.
-                effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
-                )
-
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                    # The full-ISL check already ran above, before PKAS.
-                )
-
-                if new_blocks is None:
-                    # The request cannot be scheduled. NOTE: this untouches
-                    # the request from the encoder cache manager.
-                    if self._release_unfit_waiting_request(
-                        request,
-                        request_queue,
-                        lpm_skipped,
-                        num_new_local_computed_tokens,
-                    ):
-                        continue
-                    break
-
-                # KVTransfer: the connector uses this info to determine
-                # if a load is needed. Note that
-                # This information is used to determine if a load is
-                # needed for this request.
-                if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        self.kv_cache_manager.get_blocks(request_id),
-                        num_external_computed_tokens,
-                    )
-                    if (
-                        self.connector_prefix_cache_stats is not None
-                        and connector_prefix_cache_queries != 0
-                    ):
-                        self.connector_prefix_cache_stats.record(
-                            num_tokens=connector_prefix_cache_queries,
-                            num_hits=connector_prefix_cache_hits,
-                            preempted=request.num_preemptions > 0,
-                        )
-
-                # Remove the request only after allocation succeeds. Prefix
-                # policies have already reordered the bounded queue prefix.
-                request = request_queue.pop_request()
-                self._pkas_reject_cache.pop(request.request_id, None)
-                credit_blocks = (
-                    0
-                    if self._session_credit is None
-                    else self._session_credit.drop(request.request_id)
-                )
-                sspf_price = self._sspf_costs.pop(request.request_id, None)
-                lpm_bypassed = self._lpm_bypass_counts.pop(request.request_id, 0)
-                lpm_first_skip_hit = self._lpm_first_skip_hits.pop(
-                    request.request_id, 0
-                )
-                self._lpm_last_skip_hits.pop(request.request_id, None)
-                if lpm_bypassed:
-                    # Its hit blocks are allocated now; drop the protection.
-                    self._unprotect_skipped_request(request)
-                self._pkas_epoch += 1
-                self._untrack_waiting_request(request)
-                if self._rank_per_admission:
-                    rerank_pending = (
-                        self._admission_changed_waiting_hits(
-                            request,
-                            num_new_local_computed_tokens,
-                            num_computed_tokens + num_new_tokens,
-                        )
-                        or rerank_pending
-                    )
-                if load_kv_async:
-                    # If loading async, allocate memory and put request
-                    # into the WAITING_FOR_REMOTE_KV state.
-                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
-                    # Set num_computed_tokens even though KVs are not yet loaded.
-                    # request.num_computed_tokens will not be used anywhere until
-                    # the request finished the KV transfer.
-                    #
-                    # If a transfer error is reported by the connector,
-                    # request.num_computed_tokens will be re-set accordingly in
-                    # _update_requests_with_invalid_blocks.
-                    #
-                    # When the transfer is finished, either successfully or not,
-                    # request.num_computed_tokens will correctly reflect the number
-                    # of computed tokens.
-                    # _update_waiting_for_remote_kv will then cache
-                    # only the successfully loaded tokens.
-                    request.num_computed_tokens = num_computed_tokens
-                    # Still pending (not ready) until the remote KVs arrive.
-                    self._track_waiting_request(request)
-                    if lpm_skipped:
-                        break
-                    continue
-
-                self._commit_clpm_admission(request.request_id, step.prefix_rank_plan)
-
-                self.kv_cache_manager.record_local_prefix_cache_hit(
-                    request,
-                    num_new_local_computed_tokens,
-                )
-                # A resumed request (prompt_tokens includes its output so far)
-                # appears again; its first line is the original admission.
-                pkas_target = self._pkas_last_gate_target.get(request.request_id)
-                logger.info(
-                    "admitted_prefix_cache: step=%d request_id=%s prompt_tokens=%d "
-                    "local_hit_tokens=%d num_new_tokens=%d waiting_after_pop=%d "
-                    "running=%d%s%s%s%s",
-                    self._step_id,
-                    request.request_id,
-                    request.num_tokens,
-                    num_new_local_computed_tokens,
-                    num_new_tokens,
-                    len(self.waiting) + len(lpm_skipped),
-                    len(self.running),
-                    "" if pkas_target is None
-                    else f" pkas_target_output_tokens={pkas_target}",
-                    f" lpm_bypassed={lpm_bypassed}"
-                    f" lpm_first_skip_hit={lpm_first_skip_hit}"
-                    if lpm_bypassed
-                    else "",
-                    "" if sspf_price is None else f" sspf_cost={sspf_price:.1f}",
-                    f" credit_blocks={credit_blocks}" if credit_blocks else "",
-                )
-
-                self.running.append(request)
-                if self.log_stats:
-                    request.record_event(
-                        EngineCoreEventType.SCHEDULED, step.scheduled_timestamp
-                    )
-                if request.status == RequestStatus.WAITING:
-                    step.scheduled_new_reqs.append(request)
-                elif request.status == RequestStatus.PREEMPTED:
-                    step.scheduled_resumed_reqs.append(request)
-                else:
-                    raise RuntimeError(f"Invalid request status: {request.status}")
-
-                if self.lora_config and request.lora_request:
-                    step.scheduled_loras.add(request.lora_request.lora_int_id)
-                step.req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
-                )
-                step.num_scheduled_tokens[request_id] = num_new_tokens
-                step.token_budget -= num_new_tokens
-                request.status = RequestStatus.RUNNING
-                request.num_computed_tokens = num_computed_tokens
-                self._update_predictive_admission_state(
-                    predictive_admission_state,
-                    request,
-                    num_computed_tokens + num_new_tokens,
-                    step.req_to_new_blocks[request.request_id],
-                )
-                self._allocate_encoder_inputs(
-                    request,
-                    step,
-                    encoder_inputs_to_schedule,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                )
-                if lpm_skipped:
-                    # Admitted past unfit requests: stop admitting this step.
-                    break
-            # Re-ranks inside the loop are already in rank_ns.
-            step.admit_ns = (
-                time.perf_counter_ns()
-                - admit_start_ns
-                - (self._step_rank_ns - rank_ns_before_admit)
-            )
-
-            if self._rank_per_admission:
-                self.kv_cache_manager.block_pool.stop_eviction_log()
-
-            if lpm_skipped:
-                # Return the skipped requests to the head in ranked order.
-                self._step_lpm_scan_ns = (
-                    time.perf_counter_ns() - self._lpm_scan_start_ns
-                )
-                for skipped_request in reversed(lpm_skipped):
-                    self.waiting.prepend_request(skipped_request)
-
-            # re-queue requests skipped in this pass ahead of older skipped items.
-            if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            self._schedule_waiting_requests(step)
 
         total_num_scheduled_tokens = self._check_step_constraints(step)
         batch_record = self._build_batch_record(step, total_num_scheduled_tokens)
