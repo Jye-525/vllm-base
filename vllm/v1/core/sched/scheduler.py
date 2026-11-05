@@ -2102,7 +2102,21 @@ class Scheduler(SchedulerInterface):
 
         total_num_scheduled_tokens = self._check_step_constraints(step)
         batch_record = self._build_batch_record(step, total_num_scheduled_tokens)
+        scheduler_output = self._build_scheduler_output(
+            step, total_num_scheduled_tokens
+        )
+        self._queue_batch_log(
+            step, scheduler_output, batch_record, total_num_scheduled_tokens
+        )
 
+        with record_function_or_nullcontext("schedule: update_after_schedule"):
+            self._update_after_schedule(scheduler_output)
+        batch_record["scheduler_ns"] = time.perf_counter_ns() - schedule_start_ns
+        return scheduler_output
+
+    def _build_scheduler_output(
+        self, step: _StepState, total_num_scheduled_tokens: int
+    ) -> SchedulerOutput:
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -2184,7 +2198,17 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+        return scheduler_output
 
+    def _queue_batch_log(
+        self,
+        step: _StepState,
+        scheduler_output: SchedulerOutput,
+        batch_record: dict[str, Any],
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        """Hold this step's schedule_batch record until its output arrives,
+        with the token intervals the preemption-cost accounting needs."""
         self._preemption_cost_supported = self._preemption_cost_supported and all(
             not request.resumable
             and request.sampling_params is not None
@@ -2193,14 +2217,9 @@ class Scheduler(SchedulerInterface):
         )
         cost_supported = self._preemption_cost_supported
         if cost_supported and total_num_scheduled_tokens:
-            intervals = {
-                rid: (
-                    self.requests[rid].num_computed_tokens,
-                    self.requests[rid].num_computed_tokens + n,
-                    self._preemption_recovery_high.get(rid, 0),
-                )
-                for rid, n in step.num_scheduled_tokens.items()
-            }
+            intervals = self._scheduled_intervals(
+                step.num_scheduled_tokens, self._preemption_recovery_high
+            )
             self._pending_batch_logs[id(scheduler_output)] = (
                 batch_record, intervals, 0
             )
@@ -2211,10 +2230,19 @@ class Scheduler(SchedulerInterface):
                 batch_record, None, 0 if cost_supported else -1
             )
 
-        with record_function_or_nullcontext("schedule: update_after_schedule"):
-            self._update_after_schedule(scheduler_output)
-        batch_record["scheduler_ns"] = time.perf_counter_ns() - schedule_start_ns
-        return scheduler_output
+    def _scheduled_intervals(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        recovery_high: Mapping[str, int] | None = None,
+    ) -> dict[str, tuple[int, int, int]]:
+        """Token interval (start, end) each scheduled request computes this
+        step, with its preemption-recovery high mark (0 if not given)."""
+        intervals: dict[str, tuple[int, int, int]] = {}
+        for rid, n in num_scheduled_tokens.items():
+            start = self.requests[rid].num_computed_tokens
+            high = 0 if recovery_high is None else recovery_high.get(rid, 0)
+            intervals[rid] = (start, start + n, high)
+        return intervals
 
     def _check_step_constraints(self, step: _StepState) -> int:
         """Assert the step respects the scheduling limits; return its total
@@ -2239,14 +2267,7 @@ class Scheduler(SchedulerInterface):
         """This step's schedule_batch record (counters only; timings that
         follow the step are added when it is written)."""
         prefill_tokens, decode_tokens, prefill_attention, decode_context = (
-            self._execution_work({
-                rid: (
-                    self.requests[rid].num_computed_tokens,
-                    self.requests[rid].num_computed_tokens + n,
-                    0,
-                )
-                for rid, n in step.num_scheduled_tokens.items()
-            })
+            self._execution_work(self._scheduled_intervals(step.num_scheduled_tokens))
         )
         # One schedule_batch line per step, written at the end of
         # update_from_output; fields are in the order written. scheduler_ns,
