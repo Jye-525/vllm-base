@@ -1294,21 +1294,8 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
         return step
 
-    def schedule(self) -> SchedulerOutput:
-        schedule_start_ns = time.perf_counter_ns()
-        step = self._begin_step()
-        # NOTE(woosuk) on the scheduling algorithm:
-        # There's no "decoding phase" nor "prefill phase" in the scheduler.
-        # Each request just has the num_computed_tokens and
-        # num_tokens_with_spec. num_tokens_with_spec =
-        # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
-        # At each step, the scheduler tries to assign tokens to the requests
-        # so that each request's num_computed_tokens can catch up its
-        # num_tokens_with_spec. This is general enough to cover
-        # chunked prefills, prefix caching, speculative decoding,
-        # and the "jump decoding" optimization in the future.
-
-        # First, schedule the RUNNING requests.
+    def _schedule_running_requests(self, step: _StepState) -> None:
+        """Schedule the RUNNING requests, preempting under KV pressure."""
         running_start_ns = time.perf_counter_ns()
         req_index = 0
         while req_index < len(self.running) and step.token_budget > 0:
@@ -1391,53 +1378,9 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
-
-                    if new_blocks is not None:
-                        # The request can be scheduled.
-                        break
-
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self._victim_key is not None:
-                        preempted_req = max(self.running, key=self._victim_key)
-                        victim_pos = self.running.index(preempted_req)
-                        del self.running[victim_pos]
-                        if preempted_req in step.scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            step.scheduled_running_reqs.remove(preempted_req)
-                            step.token_budget += step.num_scheduled_tokens.pop(preempted_req_id)
-                            step.req_to_new_blocks.pop(preempted_req_id)
-                            step.scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = step.scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                step.encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                        elif self._preempt_least_done and victim_pos < req_index:
-                            # An unscheduled request before this one (skipped
-                            # this step) left the list: keep the position.
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
-
-                    self._preempt_request(preempted_req, step.scheduled_timestamp)
-                    step.preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        # No more request to preempt. Cannot schedule this request.
-                        break
+                new_blocks, req_index = self._allocate_or_preempt(
+                    request, num_new_tokens, req_index, step
+                )
 
             if new_blocks is None:
                 if not self._preempt_least_done:
@@ -1468,7 +1411,7 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    step.scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    step.scheduled_spec_decode_tokens[request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -1492,6 +1435,86 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(step.scheduled_loras) <= self.lora_config.max_loras
+
+    def _allocate_or_preempt(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        req_index: int,
+        step: _StepState,
+    ) -> tuple[KVCacheBlocks | None, int]:
+        """Allocate KV slots for the running request at ``req_index``,
+        preempting victims until the allocation fits or the request itself is
+        preempted (then the blocks are None).
+
+        Returns the blocks and the request's updated index: removing a victim
+        before it in ``self.running`` shifts it left. Requests scheduled this
+        step always sit before ``req_index``. Under PRIORITY an unscheduled
+        victim before it does not shift the index (upstream behaviour).
+        """
+        while True:
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+            )
+            if new_blocks is not None:
+                return new_blocks, req_index
+
+            # The request cannot be scheduled.
+            # Preempt the lowest-priority request.
+            if self._victim_key is not None:
+                preempted_req = max(self.running, key=self._victim_key)
+                victim_pos = self.running.index(preempted_req)
+                del self.running[victim_pos]
+                if preempted_req.request_id in step.num_scheduled_tokens:
+                    self._unschedule_running_request(preempted_req, step)
+                    req_index -= 1
+                elif self._preempt_least_done and victim_pos < req_index:
+                    # An unscheduled request before this one (skipped
+                    # this step) left the list: keep the position.
+                    req_index -= 1
+            else:
+                preempted_req = self.running.pop()
+
+            self._preempt_request(preempted_req, step.scheduled_timestamp)
+            step.preempted_reqs.append(preempted_req)
+            if preempted_req == request:
+                # No more request to preempt. Cannot schedule this request.
+                return None, req_index
+
+    @staticmethod
+    def _unschedule_running_request(request: Request, step: _StepState) -> None:
+        """Return a running request scheduled earlier in this step, and now
+        preempted, to the step's token and encoder budgets."""
+        req_id = request.request_id
+        step.scheduled_running_reqs.remove(request)
+        step.token_budget += step.num_scheduled_tokens.pop(req_id)
+        step.req_to_new_blocks.pop(req_id)
+        step.scheduled_spec_decode_tokens.pop(req_id, None)
+        encoder_inputs = step.scheduled_encoder_inputs.pop(req_id, None)
+        if encoder_inputs:
+            # Restore encoder compute budget if the preempted
+            # request had encoder inputs scheduled in this step.
+            step.encoder_compute_budget += sum(
+                request.get_num_encoder_embeds(i) for i in encoder_inputs
+            )
+
+    def schedule(self) -> SchedulerOutput:
+        schedule_start_ns = time.perf_counter_ns()
+        step = self._begin_step()
+        # NOTE(woosuk) on the scheduling algorithm:
+        # There's no "decoding phase" nor "prefill phase" in the scheduler.
+        # Each request just has the num_computed_tokens and
+        # num_tokens_with_spec. num_tokens_with_spec =
+        # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
+        # At each step, the scheduler tries to assign tokens to the requests
+        # so that each request's num_computed_tokens can catch up its
+        # num_tokens_with_spec. This is general enough to cover
+        # chunked prefills, prefix caching, speculative decoding,
+        # and the "jump decoding" optimization in the future.
+
+        self._schedule_running_requests(step)
 
         # Next, schedule the WAITING requests.
         if not step.preempted_reqs and self._pause_state == PauseState.UNPAUSED:
