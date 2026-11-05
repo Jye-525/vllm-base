@@ -1139,8 +1139,10 @@ class Scheduler(SchedulerInterface):
 
         hit_blocks = computed_blocks.blocks[0]
         hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
+        # pkas_simulation="repo" runs the PKAS repository's simulation.
+        evaluate = controller.evaluate_repo if self._pkas_repo else controller.evaluate
         start_ns = time.perf_counter_ns()
-        decision = controller.evaluate(
+        decision = evaluate(
             state.running,
             RequestSnapshot(
                 request_id=request.request_id,
@@ -1179,83 +1181,55 @@ class Scheduler(SchedulerInterface):
         )
         if decision.feasible:
             # Reported on the request's admitted_prefix_cache line, and on
-            # its preempted line if PKAS's forecast turns out short.
-            self._pkas_last_gate_target[request.request_id] = (
-                controller.estimator.target(request.num_output_tokens)
-            )
-        return decision.feasible
-
-    def _predictive_admission_allows_repo(
-        self,
-        state: _PredictiveAdmissionState | None,
-        request: Request,
-        computed_blocks: KVCacheBlocks,
-        num_computed_tokens: int,
-        num_new_tokens: int,
-    ) -> bool:
-        """Copy of ``_predictive_admission_allows`` that runs the PKAS
-        repository simulation (``pkas_simulation="repo"``)."""
-        controller = self.predictive_admission
-        if controller is None:
-            return True
-        assert state is not None
-        assert self._pkas_step_stats is not None
-
-        cached = self._pkas_reject_cache.get(request.request_id)
-        if cached is not None:
-            epoch, expires = cached
-            if epoch == self._pkas_epoch and self._step_id <= expires:
-                self._pkas_step_stats["cached_rejections"] += 1
-                self._pkas_step_stats["rejections"] += 1
-                return False
-            del self._pkas_reject_cache[request.request_id]
-
-        hit_blocks = computed_blocks.blocks[0]
-        hit_ids = tuple(block.block_id for block in hit_blocks if not block.is_null)
-        start_ns = time.perf_counter_ns()
-        decision = controller.evaluate_repo(
-            state.running,
-            RequestSnapshot(
-                request_id=request.request_id,
-                prompt_tokens=request.num_prompt_tokens,
-                computed_tokens=num_computed_tokens + num_new_tokens,
-                output_tokens=request.num_output_tokens,
-                block_ids=(),
-            ),
-            candidate_hit_block_ids=hit_ids,
-            block_ref_counts=state.block_ref_counts,
-            initial_pinned_blocks=state.pinned_block_count,
-        )
-        stats = self._pkas_step_stats
-        stats["evaluate_ns"] += time.perf_counter_ns() - start_ns
-        stats["evaluations"] += 1
-        stats["bound_accepts"] += int(decision.peak_is_upper_bound)
-        stats["simulations"] += int(not decision.peak_is_upper_bound)
-        stats["rejections"] += int(not decision.feasible)
-        cache_steps = self.scheduler_config.pkas_reject_cache_steps
-        if not decision.feasible and cache_steps > 0:
-            self._pkas_reject_cache[request.request_id] = (
-                self._pkas_epoch,
-                self._step_id + cache_steps,
-            )
-        logger.debug(
-            "predictive_admission: request_id=%s feasible=%s "
-            "predicted_output_tokens=%d prefix_hit_blocks=%d "
-            "peak_pinned_blocks=%d capacity_blocks=%d peak_is_upper_bound=%s",
-            request.request_id,
-            decision.feasible,
-            decision.predicted_output_tokens,
-            decision.prefix_hit_blocks,
-            decision.peak_pinned_blocks,
-            decision.capacity_blocks,
-            decision.peak_is_upper_bound,
-        )
-        if decision.feasible:
-            # The repository reserves a full forecast past the tokens so far.
+            # its preempted line if PKAS's forecast turns out short. The
+            # repository reserves a full forecast past the tokens so far.
             self._pkas_last_gate_target[request.request_id] = (
                 request.num_output_tokens + controller.estimator.predict()
+                if self._pkas_repo
+                else controller.estimator.target(request.num_output_tokens)
             )
         return decision.feasible
+
+    def _release_unfit_waiting_request(
+        self,
+        request: Request,
+        request_queue: RequestQueue,
+        skipped: list[Request],
+        num_local_hit_tokens: int,
+    ) -> bool:
+        """A waiting request does not fit in KV: release the encoder-cache
+        references taken while checking it, then skip past it if LPM
+        admission skips allow (True) or stop admitting this step (False)."""
+        if request.has_encoder_inputs:
+            self.encoder_cache_manager.free(request)
+        if self._can_skip_unfit_request(request, request_queue, skipped):
+            self._skip_unfit_request(request_queue, skipped, num_local_hit_tokens)
+            return True
+        return False
+
+    def _allocate_encoder_inputs(
+        self,
+        request: Request,
+        step: _StepState,
+        encoder_inputs_to_schedule: list[int] | None,
+        new_encoder_compute_budget: int,
+        external_load_encoder_input: list[int],
+    ) -> None:
+        """Allocate a scheduled request's encoder inputs (charging the encoder
+        budget) and those loaded from an external encoder cache."""
+        if encoder_inputs_to_schedule:
+            step.scheduled_encoder_inputs[request.request_id] = (
+                encoder_inputs_to_schedule
+            )
+            for i in encoder_inputs_to_schedule:
+                self.encoder_cache_manager.allocate(request, i)
+                if self.ec_connector is not None:
+                    self.ec_connector.update_state_after_alloc(request, i)
+            step.encoder_compute_budget = new_encoder_compute_budget
+        for i in external_load_encoder_input:
+            self.encoder_cache_manager.allocate(request, i)
+            if self.ec_connector is not None:
+                self.ec_connector.update_state_after_alloc(request, i)
 
     def _pkas_repo_clamp_to_free_kv(self, num_new_tokens: int) -> int:
         """PKAS repository behaviour: shrink a running request's chunk to the
@@ -1500,20 +1474,13 @@ class Scheduler(SchedulerInterface):
                 # next step when applicable.
                 request.spec_token_ids = []
 
-            # Encoder-related.
-            if encoder_inputs_to_schedule:
-                step.scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                # Allocate the encoder cache.
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                step.encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
+            self._allocate_encoder_inputs(
+                request,
+                step,
+                encoder_inputs_to_schedule,
+                new_encoder_compute_budget,
+                external_load_encoder_input,
+            )
 
         step.running_ns = time.perf_counter_ns() - running_start_ns
 
@@ -1756,26 +1723,17 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                     if not fits:
-                        if request.has_encoder_inputs:
-                            self.encoder_cache_manager.free(request)
-                        if self._can_skip_unfit_request(
-                            request, request_queue, lpm_skipped
+                        if self._release_unfit_waiting_request(
+                            request,
+                            request_queue,
+                            lpm_skipped,
+                            num_new_local_computed_tokens,
                         ):
-                            self._skip_unfit_request(
-                                request_queue,
-                                lpm_skipped,
-                                num_new_local_computed_tokens,
-                            )
                             continue
                         # Upstream behaviour: stop admitting this step.
                         break
 
-                admission_allows = (
-                    self._predictive_admission_allows_repo
-                    if self._pkas_repo
-                    else self._predictive_admission_allows
-                )
-                if not admission_allows(
+                if not self._predictive_admission_allows(
                     predictive_admission_state,
                     request,
                     new_computed_blocks,
@@ -1817,18 +1775,14 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
-
-                    # NOTE: we need to untouch the request from the encode cache
-                    # manager
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    if self._can_skip_unfit_request(
-                        request, request_queue, lpm_skipped
+                    # The request cannot be scheduled. NOTE: this untouches
+                    # the request from the encoder cache manager.
+                    if self._release_unfit_waiting_request(
+                        request,
+                        request_queue,
+                        lpm_skipped,
+                        num_new_local_computed_tokens,
                     ):
-                        self._skip_unfit_request(
-                            request_queue, lpm_skipped, num_new_local_computed_tokens
-                        )
                         continue
                     break
 
@@ -1963,21 +1917,13 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens + num_new_tokens,
                     step.req_to_new_blocks[request.request_id],
                 )
-                # Encoder-related.
-                if encoder_inputs_to_schedule:
-                    step.scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                    # Allocate the encoder cache.
-                    for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-                    step.encoder_compute_budget = new_encoder_compute_budget
-                # Allocate for external load encoder cache
-                if external_load_encoder_input:
-                    for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
+                self._allocate_encoder_inputs(
+                    request,
+                    step,
+                    encoder_inputs_to_schedule,
+                    new_encoder_compute_budget,
+                    external_load_encoder_input,
+                )
                 if lpm_skipped:
                     # Admitted past unfit requests: stop admitting this step.
                     break
