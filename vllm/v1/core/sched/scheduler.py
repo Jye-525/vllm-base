@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -989,6 +990,12 @@ class Scheduler(SchedulerInterface):
             return None
 
         plan = ranker(candidates)
+        ordered = plan.ordered_requests
+        if len(ordered) == len(candidates) and all(
+            ranked is queued for ranked, queued in zip(ordered, candidates)
+        ):
+            # The ranking kept the queue order: nothing to move.
+            return plan
         self.waiting.reorder_rankable_prefix(
             window_size,
             plan.ordered_requests,
@@ -1073,6 +1080,9 @@ class Scheduler(SchedulerInterface):
                 self._credit_weight,
             )
         self._sspf_costs = costs
+        # Candidates whose price the session credit lowered, as of the last
+        # ranking that ran this step: a per-admission re-rank overwrites it
+        # (summing would count a request once per re-rank).
         self._step_credited = credited
         return rank_sspf(candidates, costs, self._spf_age_alpha)
 
@@ -2055,6 +2065,8 @@ class Scheduler(SchedulerInterface):
         notes: _AdmissionNotes,
         admission: _WaitingAdmission,
     ) -> None:
+        if not logger.isEnabledFor(logging.INFO):
+            return
         # A resumed request (prompt_tokens includes its output so far)
         # appears again; its first line is the original admission.
         pkas_target = self._pkas_last_gate_target.get(request.request_id)
@@ -2129,7 +2141,9 @@ class Scheduler(SchedulerInterface):
 
         # Construct the scheduler output.
         if self.use_v2_model_runner:
-            step.scheduled_new_reqs = step.scheduled_new_reqs + step.scheduled_resumed_reqs
+            step.scheduled_new_reqs = (
+                step.scheduled_new_reqs + step.scheduled_resumed_reqs
+            )
             step.scheduled_resumed_reqs = []
             new_reqs_data = [
                 NewRequestData.from_request(
