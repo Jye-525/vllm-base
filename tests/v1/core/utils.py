@@ -53,6 +53,7 @@ def create_scheduler(
     num_blocks: int = 10000,
     block_size: int = 16,
     max_model_len: int | None = None,
+    model_max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
@@ -114,6 +115,14 @@ def create_scheduler(
         dtype="float16",
         seed=42,
         skip_tokenizer_init=skip_tokenizer_init,
+        # The scheduler's max_model_len comes from the model config; the
+        # default is the test model's own (2048 for opt-125m). A longer one
+        # needs VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 (no weights are loaded).
+        **(
+            {}
+            if model_max_model_len is None
+            else {"max_model_len": model_max_model_len}
+        ),
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
