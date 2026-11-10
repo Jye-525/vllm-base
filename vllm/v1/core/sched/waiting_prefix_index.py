@@ -30,6 +30,12 @@ class PendingPrefixIndex:
     also the number of pending requests sharing the prefix ending at that
     block. Updates return the absolute counts of changed hashes so consumers
     can maintain derived state incrementally.
+
+    Derived per-request values (cLPM rank info, the SSPF run sum) depend only
+    on the ready counts along the request's own path. Every request that
+    contains one of those hashes shares the path's first hash (its *root*),
+    so a change to any request's path or readiness bumps only its root's
+    version, and a cached value stays valid while its root's version does.
     """
 
     def __init__(self) -> None:
@@ -42,10 +48,16 @@ class PendingPrefixIndex:
         self._pending_max_depths: dict[BlockHash, int] = {}
         self._ready_counts: dict[BlockHash, int] = {}
         self._version = 0
-        self._rank_info_cache_version = 0
+        # Root (first path hash) -> version, bumped whenever a request whose
+        # path starts there is inserted, removed, replaced or changes
+        # readiness. Dropped once no pending path uses the root.
+        self._root_versions: dict[BlockHash, int] = {}
+        # request id -> (root version, info), per (claim depth, score flag).
         self._rank_info_cache: dict[
-            tuple[int, bool], dict[str, PendingRankInfo]
+            tuple[int, bool], dict[str, tuple[int, PendingRankInfo]]
         ] = {}
+        # request id -> (start block, root version, amortized blocks).
+        self._amortized_cache: dict[str, tuple[int, int, float]] = {}
 
     def __len__(self) -> int:
         return len(self._request_paths)
@@ -93,6 +105,26 @@ class PendingPrefixIndex:
             else:
                 counts.pop(block_hash, None)
 
+    def _touch(self, path: Sequence[BlockHash] | None) -> None:
+        """A request with this path changed: its root's derived values are stale."""
+        if path:
+            root = path[0]
+            self._root_versions[root] = self._root_versions.get(root, 0) + 1
+
+    def _root_version(self, path: Sequence[BlockHash]) -> int:
+        return self._root_versions.get(path[0], 0) if path else -1
+
+    def _forget_derived(self, request_id: str) -> None:
+        self._amortized_cache.pop(request_id, None)
+        for cache in self._rank_info_cache.values():
+            cache.pop(request_id, None)
+
+    def _drop_unused_root(self, path: Sequence[BlockHash] | None) -> None:
+        """Forget the version of a root no pending path uses any more (no
+        cached value can refer to it: its requests' entries are gone)."""
+        if path and path[0] not in self._pending_counts:
+            self._root_versions.pop(path[0], None)
+
     def upsert(
         self,
         request_id: str,
@@ -116,6 +148,7 @@ class PendingPrefixIndex:
             self._apply_count_delta(self._ready_counts, path_hashes, 1 if ready else -1)
             self._request_ready[request_id] = ready
             self._version += 1
+            self._touch(new_path)
             return {}
 
         old_hashes = set(old_path or ())
@@ -139,6 +172,10 @@ class PendingPrefixIndex:
         self._request_paths[request_id] = new_path
         self._request_ready[request_id] = ready
         self._version += 1
+        self._touch(old_path)
+        self._touch(new_path)
+        self._forget_derived(request_id)
+        self._drop_unused_root(old_path)
         return {
             block_hash: self._pending_counts.get(block_hash, 0)
             for block_hash in changed_hashes
@@ -167,6 +204,9 @@ class PendingPrefixIndex:
             self._apply_count_delta(self._ready_counts, path_hashes, -1)
 
         self._version += 1
+        self._touch(path)
+        self._forget_derived(request_id)
+        self._drop_unused_root(path)
         return changed_counts
 
     def clear(self) -> dict[BlockHash, int]:
@@ -180,6 +220,9 @@ class PendingPrefixIndex:
         self._pending_max_depths.clear()
         self._ready_counts.clear()
         self._version += 1
+        self._root_versions.clear()
+        self._rank_info_cache.clear()
+        self._amortized_cache.clear()
         return changed_counts
 
     def set_ready(self, request_id: str, ready: bool) -> bool:
@@ -196,6 +239,7 @@ class PendingPrefixIndex:
         self._apply_count_delta(self._ready_counts, set(path), 1 if ready else -1)
         self._request_ready[request_id] = ready
         self._version += 1
+        self._touch(path)
         return True
 
     def rank_info_many(
@@ -207,71 +251,70 @@ class PendingPrefixIndex:
     ) -> dict[str, PendingRankInfo]:
         """Build ready-only sharing metadata for a batch of requests.
 
-        Sharing metadata remains valid until the indexed waiting set changes.
+        A request's metadata stays cached while its root's version does: only
+        requests sharing its path's first hash can change the counts on it.
         """
-        if self._rank_info_cache_version != self._version:
-            self._rank_info_cache.clear()
-            self._rank_info_cache_version = self._version
-
         cache = self._rank_info_cache.setdefault(
             (claim_depth_blocks, include_request_score), {}
         )
+        out: dict[str, PendingRankInfo] = {}
         for request_id in request_ids:
-            if request_id in cache:
-                continue
             path = self._request_paths.get(request_id)
             if path is None or not self._request_ready[request_id]:
                 continue
+            version = self._root_version(path)
+            hit = cache.get(request_id)
+            if hit is not None and hit[0] == version:
+                out[request_id] = hit[1]
+                continue
+            info = self._rank_info(path, claim_depth_blocks, include_request_score)
+            cache[request_id] = (version, info)
+            out[request_id] = info
+        return out
 
-            cluster_hash = None
-            cluster_depth = 0
-            cluster_size = 1
-            for depth in range(len(path), 0, -1):
-                block_hash = path[depth - 1]
-                count = self._ready_counts.get(block_hash, 0)
-                if count >= 2:
-                    cluster_hash = block_hash
-                    cluster_depth = depth
-                    cluster_size = count
-                    break
-
-            claim_hash = (
-                path[claim_depth_blocks - 1]
-                if claim_depth_blocks > 0 and len(path) >= claim_depth_blocks
-                else None
-            )
-            cache[request_id] = PendingRankInfo(
-                request_score=(
-                    sum(self._ready_counts.get(h, 0) for h in path)
-                    if include_request_score
-                    else 0
-                ),
-                cluster_hash=cluster_hash,
-                cluster_depth=cluster_depth,
-                cluster_size=cluster_size,
-                claim_hash=claim_hash,
-            )
-        return {
-            request_id: cache[request_id]
-            for request_id in request_ids
-            if request_id in cache
-        }
-
-    def amortized_blocks(self, request_id: str, start_block: int) -> float:
-        """Return ``sum(1 / ready_count(h))`` over the path from ``start_block``.
-
-        Each block counts once per rank-ready request that contains it, so a
-        block shared by n waiting requests costs 1/n. Hashes are cumulative,
-        so counts never increase along a path: the sum is taken one run of
-        equal counts at a time, each run's end found by binary search.
-        Counts are floored at 1 (a request that is not ready yet).
-        """
-        path = self._request_paths.get(request_id)
-        if path is None:
-            return 0.0
+    def _rank_info(
+        self,
+        path: tuple[BlockHash, ...],
+        claim_depth_blocks: int,
+        include_request_score: bool,
+    ) -> PendingRankInfo:
         counts = self._ready_counts
-        total = 0.0
-        i = max(start_block, 0)
+        # Deepest block shared by at least two ready requests. Ready counts
+        # never increase along a (cumulative) path, so the blocks with a
+        # count of two or more form a prefix: binary-search its end.
+        lo, hi = 0, len(path)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if counts.get(path[mid], 0) >= 2:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo:
+            cluster_hash: BlockHash | None = path[lo - 1]
+            cluster_depth = lo
+            cluster_size = counts[path[lo - 1]]
+        else:
+            cluster_hash, cluster_depth, cluster_size = None, 0, 1
+        claim_hash = (
+            path[claim_depth_blocks - 1]
+            if claim_depth_blocks > 0 and len(path) >= claim_depth_blocks
+            else None
+        )
+        return PendingRankInfo(
+            request_score=(self._count_sum(path) if include_request_score else 0),
+            cluster_hash=cluster_hash,
+            cluster_depth=cluster_depth,
+            cluster_size=cluster_size,
+            claim_hash=claim_hash,
+        )
+
+    def _runs(self, path: tuple[BlockHash, ...], start: int):
+        """(run length, raw ready count) of the runs of equal counts along
+        ``path[start:]``, each run's end found by binary search (counts never
+        increase along a path). A count below 1 is its own run of the floored
+        count, as ``amortized_blocks`` has always summed it."""
+        counts = self._ready_counts
+        i = max(start, 0)
         n = len(path)
         while i < n:
             count = max(counts.get(path[i], 0), 1)
@@ -283,6 +326,35 @@ class PendingPrefixIndex:
                     lo = mid + 1
                 else:
                     hi = mid
-            total += (lo - i) / count
+            yield lo - i, count, counts.get(path[i], 0)
             i = lo
+
+    def _count_sum(self, path: tuple[BlockHash, ...]) -> int:
+        """``sum(ready_count(h) for h in path)`` by runs of equal counts."""
+        total = 0
+        for length, _, raw in self._runs(path, 0):
+            total += length * raw
+        return total
+
+    def amortized_blocks(self, request_id: str, start_block: int) -> float:
+        """Return ``sum(1 / ready_count(h))`` over the path from ``start_block``.
+
+        Each block counts once per rank-ready request that contains it, so a
+        block shared by n waiting requests costs 1/n. Hashes are cumulative,
+        so counts never increase along a path: the sum is taken one run of
+        equal counts at a time, each run's end found by binary search.
+        Counts are floored at 1 (a request that is not ready yet). The sum is
+        cached per request while its start block and root version hold.
+        """
+        path = self._request_paths.get(request_id)
+        if path is None:
+            return 0.0
+        version = self._root_version(path)
+        hit = self._amortized_cache.get(request_id)
+        if hit is not None and hit[0] == start_block and hit[1] == version:
+            return hit[2]
+        total = 0.0
+        for length, count, _ in self._runs(path, start_block):
+            total += length / count
+        self._amortized_cache[request_id] = (start_block, version, total)
         return total
