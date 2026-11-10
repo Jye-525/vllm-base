@@ -40,7 +40,6 @@ import heapq
 import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from itertools import islice
 from typing import TYPE_CHECKING
 
 from vllm.v1.core.kv_cache_utils import (
@@ -132,14 +131,8 @@ class DemandRetention:
                         lo = mid + 1
                     else:
                         hi = mid
-                # Every hash from lo on is new (distinct within a path), so
-                # bulk inserts give the per-hash loop's map: prompt blocks
-                # rank pos, generated blocks (preempted requests) rank 0.
-                split = max(lo, num_prompt_blocks)
-                if lo < split:
-                    ranks.update(dict.fromkeys(islice(path, lo, split), pos))
-                if split < len(path):
-                    ranks.update(dict.fromkeys(islice(path, split, None), 0))
+                for i in range(lo, len(path)):
+                    ranks[path[i]] = 0 if i >= num_prompt_blocks else pos
             self._rank_map = ranks
         return self._rank_map.get(block_hash, math.inf)
 
