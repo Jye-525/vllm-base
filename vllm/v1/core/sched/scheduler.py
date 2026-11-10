@@ -1874,7 +1874,9 @@ class Scheduler(SchedulerInterface):
         limit, unknown connector hits) and go on with the next one."""
         request = request_queue.pop_request()
         admission.step_skipped_waiting.prepend_request(request)
-        if self._ranking is not None and self._ranking.on_set_aside():
+        if self._ranking is not None and self._ranking.on_set_aside(
+            request.request_id
+        ):
             admission.rerank_pending = True  # k-LPM's plan expected it next
         return True
 
@@ -2072,7 +2074,7 @@ class Scheduler(SchedulerInterface):
             and request.status == RequestStatus.WAITING
             and ranking.on_fresh_admission(
                 request,
-                prefix.num_computed_tokens,
+                prefix.num_new_local_computed_tokens,
                 itertools.chain(
                     self.waiting,
                     self.skipped_waiting,

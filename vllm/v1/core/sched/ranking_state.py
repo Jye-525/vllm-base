@@ -58,14 +58,15 @@ class RankingState:
         self._seq: dict[str, int] = {}
         self._next_seq = 0
 
+        # Requests whose first fresh admission was counted: an async KV load
+        # or a streaming-session chunk re-admits a request, counted once.
+        self._counted: set[str] = set()
+
         self.fairway: FairwayParams | None = None
         self.fairway_est: Callable[[int], float] | None = None
         if policy == "fairway":
-            if not config.fairway_prefill_model:
-                raise ValueError(
-                    "the 'fairway' scheduling policy needs fairway_prefill_model "
-                    "(a forward-sim model JSON)"
-                )
+            # SchedulerConfig requires fairway_prefill_model for this policy.
+            assert config.fairway_prefill_model
             self.fairway = FairwayParams(
                 weight=config.fairway_weight,
                 patience_mult=config.fairway_patience_mult,
@@ -113,6 +114,7 @@ class RankingState:
     def forget(self, request_id: str) -> None:
         """The request finished or was aborted."""
         self._seq.pop(request_id, None)
+        self._counted.discard(request_id)
         if self.bypass is not None:
             self.bypass.forget(request_id)
         if self.guard is not None:
@@ -191,12 +193,14 @@ class RankingState:
         (this step ranks again, unless there is at most one candidate)."""
         self._klpm_plan = []
         self._klpm_next = 0
+        self._guard_due = set()
 
-    def on_set_aside(self) -> bool:
+    def on_set_aside(self, request_id: str) -> bool:
         """A waiting request was set aside (blocked, LoRA limit, unknown
         connector hits). Returns whether the queue must be re-ranked before
-        the next admission: k-LPM's plan assumed it would be admitted."""
-        return self.klpm is not None and bool(self._klpm_plan)
+        the next admission: k-LPM's plan expected this request next."""
+        plan, i = self._klpm_plan, self._klpm_next
+        return self.klpm is not None and i < len(plan) and plan[i] == request_id
 
     # ------------------------------------------------------------ SSPF guard
 
@@ -225,14 +229,19 @@ class RankingState:
     def on_fresh_admission(
         self,
         request: Request,
-        num_computed_tokens: int,
+        num_local_hit_tokens: int,
         waiting: Iterable[Request],
     ) -> bool:
-        """``request`` (fresh) was just admitted with ``num_computed_tokens``
-        cached; ``waiting`` holds every request still in the waiting queues.
+        """``request`` (fresh) was just admitted with ``num_local_hit_tokens``
+        GPU prefix-cache hits (the hits the guard's U(r) uses);
+        ``waiting`` holds every request still in the waiting queues.
         Returns whether the queue must be re-ranked before the next
-        admission (k-LPM: the admission did not follow the plan)."""
+        admission (k-LPM: the admission did not follow the plan).
+        Only a request's first admission counts."""
         request_id = request.request_id
+        if request_id in self._counted:
+            return False
+        self._counted.add(request_id)
         key = self.arrival_key(request)
         fresh: dict[str, ArrivalKey] | None = None
         if self.bypass is not None or self.guard is not None:
@@ -248,7 +257,7 @@ class RankingState:
             assert fresh is not None
             self.guard.on_admit(
                 request_id,
-                request.num_tokens - num_computed_tokens,
+                request.num_tokens - num_local_hit_tokens,
                 key,
                 fresh,
                 was_due=request_id in self._guard_due,

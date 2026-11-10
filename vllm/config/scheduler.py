@@ -535,6 +535,47 @@ class SchedulerConfig:
                 "sspf_overtake_guard_k requires the 'sspf' scheduling policy, "
                 f"not {self.policy!r}"
             )
+        # Options of one ordering are refused under another, as the simulator
+        # does, so a mislabelled run fails instead of silently ranking otherwise.
+        owners = {
+            "fairway": (
+                "fairway_weight",
+                "fairway_patience_mult",
+                "fairway_patience_floor_s",
+                "fairway_wait",
+                "fairway_fair_lane",
+                "fairway_prefill_model",
+            ),
+            "ragcache": ("ragcache_window", "ragcache_window_mode"),
+            "klpm": ("klpm_k",),
+        }
+        for owner, names in owners.items():
+            if self.policy == owner:
+                continue
+            for name in names:
+                # The class attribute is the plain default (as EngineArgs uses).
+                if getattr(self, name) != getattr(type(self), name):
+                    raise ValueError(
+                        f"{name} applies to the {owner!r} scheduling policy only, "
+                        f"not {self.policy!r}"
+                    )
+        # The admission-counted bounds (RAGCache bypass window, k-LPM cycle,
+        # SSPF guard) assume the whole waiting queue is ranked every step.
+        counted = (
+            self.policy == "klpm"
+            or (
+                self.policy == "ragcache"
+                and self.ragcache_window_mode == "bypass"
+                and self.ragcache_window > 0
+            )
+            or self.sspf_overtake_guard_k > 0
+        )
+        if counted and (self.lpm_window_size or self.lpm_fallback_threshold):
+            raise ValueError(
+                "k-LPM, the RAGCache bypass window and the SSPF overtaking guard "
+                "rank the whole waiting queue: lpm_window_size and "
+                "lpm_fallback_threshold must be 0"
+            )
         related = self.policy in ("fairway", "ragcache", "klpm")
         if (related or self.sspf_overtake_guard_k > 0) and (
             self.admission_policy != "none"

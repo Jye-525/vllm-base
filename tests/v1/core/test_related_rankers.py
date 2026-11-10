@@ -35,6 +35,7 @@ from vllm.v1.core.sched.ragcache_ranker import (
     rank_ragcache,
     reuse_ratio,
 )
+from vllm.v1.core.sched.ranking_state import RankingState
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -484,3 +485,44 @@ class TestConfigValidation:
                 scheduler_reserve_full_isl=False,
                 **extra,
             )
+
+    def test_options_of_another_policy_are_refused(self):
+        with pytest.raises(ValueError, match="klpm_k applies"):
+            SchedulerConfig.default_factory(policy="lpm", klpm_k=2)
+        with pytest.raises(ValueError, match="ragcache_window applies"):
+            SchedulerConfig.default_factory(policy="klpm", ragcache_window=8)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"policy": "klpm"},
+            {"policy": "ragcache"},
+            {"policy": "sspf", "sspf_overtake_guard_k": 4},
+        ],
+    )
+    @pytest.mark.parametrize(
+        "limit", [{"lpm_window_size": 8}, {"lpm_fallback_threshold": 64}]
+    )
+    def test_counted_bounds_need_the_whole_queue(self, kwargs, limit):
+        with pytest.raises(ValueError, match="whole waiting queue"):
+            SchedulerConfig.default_factory(**kwargs, **limit)
+
+    def test_ragcache_without_bypass_allows_a_window(self):
+        SchedulerConfig.default_factory(
+            policy="ragcache", ragcache_window=0, lpm_window_size=8
+        )
+
+
+class TestRankingStateCounting:
+    def test_a_readmitted_request_counts_once(self):
+        # An async KV load or a streaming chunk admits a request again.
+        config = SchedulerConfig.default_factory(policy="klpm", klpm_k=3)
+        state = RankingState(config, "klpm", 8192)
+        a, b = _request("a", list(range(16))), _request("b", list(range(16, 32)))
+        for r in (a, b):
+            state.on_arrival(r.request_id)
+        state.on_fresh_admission(a, 0, [b])
+        state.on_fresh_admission(a, 0, [b])
+        assert state.klpm is not None and state.klpm.pos == 1
+        state.forget("a")
+        assert "a" not in state._counted
