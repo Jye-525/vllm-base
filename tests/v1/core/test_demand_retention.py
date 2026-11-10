@@ -7,6 +7,7 @@ under rule R; decision parity is tested in ``simulator/test_vllm_parity.py``.
 """
 
 import math
+import random
 
 import pytest
 
@@ -114,6 +115,38 @@ def test_rank_rules():
     assert retention._rank(b"p1") == math.inf
     retention.set_snapshot([((b"p0", b"p1"), 2)])
     assert retention._rank(b"p1") == 0
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_rank_map_matches_first_snapshot_path(seed):
+    """Rule R on random chained paths (a shared prefix tree): a hash ranks at
+    the first snapshot path holding it, or 0 when that path holds it past its
+    prompt blocks (a preempted request's generated blocks)."""
+    rng = random.Random(seed)
+    paths: list[tuple[bytes, ...]] = []
+    for _ in range(rng.randint(1, 30)):
+        if paths and rng.random() < 0.7:  # share a prefix of an earlier path
+            base = rng.choice(paths)
+            path = list(base[: rng.randint(0, len(base))])
+        else:
+            path = []
+        parent = path[-1] if path else b"root"
+        for _ in range(rng.randint(0 if path else 1, 6)):
+            parent = sha256((parent, rng.randrange(4)))
+            path.append(parent)
+        paths.append(tuple(path))
+    snapshot = [(p, rng.randint(0, len(p) + 1)) for p in paths]
+    _, retention = _setup(4, {})
+    retention.set_snapshot(snapshot)
+
+    def naive(h):
+        for pos, (path, num_prompt_blocks) in enumerate(snapshot):
+            if h in path:
+                return 0 if path.index(h) >= num_prompt_blocks else pos
+        return math.inf
+
+    for h in {h for p in paths for h in p} | {b"absent"}:
+        assert retention._rank(h) == naive(h)
 
 
 def test_held_hash_keeps_its_rank_when_demand_ends():
