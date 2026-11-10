@@ -19,6 +19,9 @@ class SchedulingPolicy(Enum):
     CLPM = "clpm"
     SPF = "spf"
     SSPF = "sspf"
+    FAIRWAY = "fairway"
+    RAGCACHE = "ragcache"
+    KLPM = "klpm"
 
 
 class RequestQueue(ABC):
@@ -251,6 +254,9 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         SchedulingPolicy.CLPM,
         SchedulingPolicy.SPF,
         SchedulingPolicy.SSPF,
+        SchedulingPolicy.FAIRWAY,
+        SchedulingPolicy.RAGCACHE,
+        SchedulingPolicy.KLPM,
     ):
         return FCFSRequestQueue()
     else:

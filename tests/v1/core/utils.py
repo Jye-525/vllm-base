@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 
 from tests.v1.kv_connector.unit.utils import MockKVConfig
@@ -91,6 +93,7 @@ def create_scheduler(
     peek_eviction_decay_tau: float = SchedulerConfig.peek_eviction_decay_tau,
     peek_eviction_scan_cap: int = SchedulerConfig.peek_eviction_scan_cap,
     scheduler_reserve_full_isl: bool | None = None,
+    **scheduler_overrides: Any,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -161,6 +164,8 @@ def create_scheduler(
         peek_eviction_decay_tau=peek_eviction_decay_tau,
         peek_eviction_scan_cap=peek_eviction_scan_cap,
         scheduler_reserve_full_isl=scheduler_reserve_full_isl,
+        # Other SchedulerConfig fields (e.g. fairway_*, ragcache_*, klpm_k).
+        **scheduler_overrides,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

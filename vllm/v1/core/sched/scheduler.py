@@ -48,6 +48,7 @@ from vllm.v1.core.sched.predictive_admission import (
     PredictiveAdmissionController,
     RequestSnapshot,
 )
+from vllm.v1.core.sched.ranking_state import RankingState
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
@@ -819,8 +820,12 @@ class Scheduler(SchedulerInterface):
             SchedulingPolicy.CLPM: self._rank_clpm_candidates,
             SchedulingPolicy.SPF: self._rank_spf_candidates,
             SchedulingPolicy.SSPF: self._rank_sspf_candidates,
+            SchedulingPolicy.FAIRWAY: self._rank_fairway_candidates,
+            SchedulingPolicy.RAGCACHE: self._rank_ragcache_candidates,
+            SchedulingPolicy.KLPM: self._rank_klpm_candidates,
         }
         self._waiting_ranker = rankers.get(self.policy)
+        self._init_ranking_state()
         if self.policy in (SchedulingPolicy.SPF, SchedulingPolicy.SSPF):
             name = self.policy.value.upper()
             if not self.cache_config.enable_prefix_caching:
@@ -846,6 +851,59 @@ class Scheduler(SchedulerInterface):
                 "LPM admission skips: skip up to %d waiting requests that do "
                 "not fit in free KV, admit the first that fits, then stop.",
                 self._lpm_admission_skips,
+            )
+
+    def _init_ranking_state(self) -> None:
+        """Cross-step state of Fairway, RAGCache, k-LPM and the SSPF
+        overtaking guard (None for every other configuration)."""
+        config = self.scheduler_config
+        related = (
+            SchedulingPolicy.FAIRWAY,
+            SchedulingPolicy.RAGCACHE,
+            SchedulingPolicy.KLPM,
+        )
+        self._ranking: RankingState | None = None
+        if self.policy not in related and not config.sspf_overtake_guard_k:
+            return
+        self._ranking = RankingState(
+            config, self.policy.value, self.max_num_scheduled_tokens
+        )
+        if self.policy in related and not self.cache_config.enable_prefix_caching:
+            logger.warning_once(
+                "%s without prefix caching sees no cache hits.", self.policy.value
+            )
+        if self.policy == SchedulingPolicy.FAIRWAY:
+            logger.info(
+                "Fairway scheduling: w=%.2f, patience=max(%.2f s, %.2f x prefill "
+                "time from %s), wait=%s, fair_lane=%s, window=%d",
+                config.fairway_weight,
+                config.fairway_patience_floor_s,
+                config.fairway_patience_mult,
+                config.fairway_prefill_model,
+                config.fairway_wait,
+                config.fairway_fair_lane,
+                config.lpm_window_size,
+            )
+        elif self.policy == SchedulingPolicy.RAGCACHE:
+            logger.info(
+                "RAGCache scheduling: cached/uncached ratio, starvation window "
+                "%d (%s), window=%d",
+                config.ragcache_window,
+                config.ragcache_window_mode,
+                config.lpm_window_size,
+            )
+        elif self.policy == SchedulingPolicy.KLPM:
+            logger.info(
+                "k-LPM scheduling: the oldest request every %d-th fresh "
+                "admission, the longest cached prefix otherwise, window=%d",
+                config.klpm_k,
+                config.lpm_window_size,
+            )
+        if config.sspf_overtake_guard_k:
+            logger.info(
+                "SSPF overtaking guard: a request goes first once later arrivals "
+                "admitted before it hold %.1f x its uncached tokens.",
+                config.sspf_overtake_guard_k,
             )
 
     def _can_skip_unfit_request(
@@ -1052,6 +1110,18 @@ class Scheduler(SchedulerInterface):
     def _rank_spf_candidates(self, candidates: list[Request]) -> RankPlan:
         return rank_spf(candidates, self._prefix_hits(candidates), self._spf_age_alpha)
 
+    def _rank_fairway_candidates(self, candidates: list[Request]) -> RankPlan:
+        assert self._ranking is not None
+        return self._ranking.rank_fairway(candidates, self._prefix_hits(candidates))
+
+    def _rank_ragcache_candidates(self, candidates: list[Request]) -> RankPlan:
+        assert self._ranking is not None
+        return self._ranking.rank_ragcache(candidates, self._prefix_hits(candidates))
+
+    def _rank_klpm_candidates(self, candidates: list[Request]) -> RankPlan:
+        assert self._ranking is not None
+        return self._ranking.rank_klpm(candidates, self._prefix_hits(candidates))
+
     def _rank_sspf_candidates(self, candidates: list[Request]) -> RankPlan:
         """Rank by uncached prompt tokens, each uncached full block divided by
         the number of rank-ready waiting requests that contain it; the
@@ -1084,7 +1154,10 @@ class Scheduler(SchedulerInterface):
         # ranking that ran this step: a per-admission re-rank overwrites it
         # (summing would count a request once per re-rank).
         self._step_credited = credited
-        return rank_sspf(candidates, costs, self._spf_age_alpha)
+        plan = rank_sspf(candidates, costs, self._spf_age_alpha)
+        if self._ranking is not None:
+            plan = self._ranking.guard_order(plan, prefix_hits)
+        return plan
 
     def _commit_clpm_admission(
         self, request_id: str, rank_plan: RankPlan | None
@@ -1312,6 +1385,8 @@ class Scheduler(SchedulerInterface):
             self._flush_pending_batch_logs()
         if self._retention is not None:
             self._retention.expire_holds()
+        if self._ranking is not None:
+            self._ranking.begin_step()
         self._step_preempted_tokens = 0
         self._step_rank_ns = 0
         self._step_rerank_count = 0
@@ -1662,9 +1737,7 @@ class Scheduler(SchedulerInterface):
                     "%s is still in WAITING_FOR_REMOTE_KVS state.",
                     request_id,
                 )
-            request_queue.pop_request()
-            admission.step_skipped_waiting.prepend_request(request)
-            return True
+            return self._set_aside_waiting_request(request_queue, admission)
 
         # Check that adding the request still respects the max_loras
         # constraint.
@@ -1677,17 +1750,13 @@ class Scheduler(SchedulerInterface):
             )
         ):
             # Scheduling would exceed max_loras, skip.
-            request_queue.pop_request()
-            admission.step_skipped_waiting.prepend_request(request)
-            return True
+            return self._set_aside_waiting_request(request_queue, admission)
 
         prefix = self._lookup_cached_prefix(request)
         if prefix is None:
             # The request cannot be scheduled because the KVConnector
             # couldn't determine the number of matched tokens.
-            request_queue.pop_request()
-            admission.step_skipped_waiting.prepend_request(request)
-            return True
+            return self._set_aside_waiting_request(request_queue, admission)
 
         chunk = self._plan_waiting_chunk(request, prefix, step)
         if chunk is None:
@@ -1797,6 +1866,17 @@ class Scheduler(SchedulerInterface):
             )
         # Admitted past unfit requests: stop admitting this step.
         return not admission.lpm_skipped
+
+    def _set_aside_waiting_request(
+        self, request_queue: RequestQueue, admission: _WaitingAdmission
+    ) -> bool:
+        """Set the head request aside for this step (blocked, over the LoRA
+        limit, unknown connector hits) and go on with the next one."""
+        request = request_queue.pop_request()
+        admission.step_skipped_waiting.prepend_request(request)
+        if self._ranking is not None and self._ranking.on_set_aside():
+            admission.rerank_pending = True  # k-LPM's plan expected it next
+        return True
 
     def _lookup_cached_prefix(self, request: Request) -> _CachedPrefix | None:
         """Locally and externally cached tokens of a waiting request; None if
@@ -1985,6 +2065,23 @@ class Scheduler(SchedulerInterface):
             self._unprotect_skipped_request(request)
         self._pkas_epoch += 1
         self._untrack_waiting_request(request)
+        ranking = self._ranking
+        if (
+            ranking is not None
+            and ranking.tracks_admissions
+            and request.status == RequestStatus.WAITING
+            and ranking.on_fresh_admission(
+                request,
+                prefix.num_computed_tokens,
+                itertools.chain(
+                    self.waiting,
+                    self.skipped_waiting,
+                    admission.step_skipped_waiting,
+                    admission.lpm_skipped,
+                ),
+            )
+        ):
+            admission.rerank_pending = True
         if self._rank_per_admission:
             admission.rerank_pending = (
                 self._admission_changed_waiting_hits(
@@ -3356,6 +3453,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self._ranking is not None:
+                self._ranking.on_arrival(request.request_id)
             self._enqueue_waiting_request(request)
             self._track_waiting_request(request)
             if self._session_credit is not None and not request.resumable:
@@ -3456,6 +3555,8 @@ class Scheduler(SchedulerInterface):
         self._lpm_last_skip_hits.pop(request.request_id, None)
         if self._session_credit is not None:
             self._session_credit.drop(request.request_id)
+        if self._ranking is not None:
+            self._ranking.forget(request.request_id)
         self._pkas_epoch += 1
         if self.predictive_admission is not None and request.status in (
             RequestStatus.FINISHED_STOPPED,

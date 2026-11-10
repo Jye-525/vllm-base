@@ -19,7 +19,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "lpm", "clpm", "spf", "sspf"]
+SchedulerPolicy = Literal[
+    "fcfs", "priority", "lpm", "clpm", "spf", "sspf", "fairway", "ragcache", "klpm"
+]
 PolicyProfile = Literal["vllm", "lpm", "peek", "kvreuse"]
 AdmissionPolicy = Literal["none", "pkas"]
 KVCacheEvictionPolicy = Literal["lru", "peek", "skip", "demand"]
@@ -27,6 +29,8 @@ PeekEvictionMode = Literal["plain", "cluster", "recency", "decay"]
 PKASOutputPredictor = Literal["paper", "quantile"]
 PKASSimulation = Literal["paper", "repo"]
 PreemptionVictim = Literal["lifo", "least_done"]
+FairwayWait = Literal["relative", "absolute", "none"]
+RAGCacheWindowMode = Literal["bypass", "slide"]
 
 
 @config
@@ -129,7 +133,18 @@ class SchedulerConfig:
       ``spf_age_alpha`` is set.
     - "sspf" is SPF with each uncached prompt block's tokens divided by the
       number of waiting requests that contain it (sharing-amortized SPF).
-      It uses ``spf_age_alpha``. With no sharing it orders as SPF."""
+      It uses ``spf_age_alpha``. With no sharing it orders as SPF.
+    - "fairway" is Fairway (arXiv:2611.02082): a Fast lane by cached /
+      uncached tokens plus wait / patience, merged with an arrival-order
+      Fair lane by work charges (``fairway_*`` options).
+    - "ragcache" is RAGCache's cached / uncached-tokens ratio (TOCS 2025,
+      section 5.2) with a starvation window (``ragcache_*`` options).
+    - "klpm" is k-LPM (arXiv:2502.04677, Algorithm 1): the oldest fresh
+      request every ``klpm_k``-th fresh admission, the longest cached prefix
+      otherwise.
+
+    Fairway, RAGCache and k-LPM rank only fresh requests (preempted ones
+    resume first) and are ports of the KVReuse simulator's orderings."""
 
     admission_policy: AdmissionPolicy = "none"
     """Waiting-request admission policy. ``none`` (the default) uses stock
@@ -177,11 +192,12 @@ class SchedulerConfig:
     rejected candidate on every step."""
 
     lpm_window_size: int = Field(default=0, ge=0)
-    """For LPM, cLPM, SPF and SSPF, the number of waiting requests to reorder
+    """For the ranked policies (LPM, cLPM, SPF, SSPF, Fairway, RAGCache,
+    k-LPM), the number of waiting requests to reorder
     per scheduler step. Zero (the default) means the full waiting queue."""
 
     lpm_fallback_threshold: int = Field(default=0, ge=0)
-    """For LPM, cLPM, SPF and SSPF, fall back to FCFS when the total waiting
+    """For the ranked policies, fall back to FCFS when the total waiting
     queue is larger than this threshold. Zero disables the fallback."""
 
     lpm_admission_skips: int = Field(default=0, ge=0)
@@ -219,6 +235,47 @@ class SchedulerConfig:
     """SPF and SSPF aging: uncached-token credit per second of waiting. Zero
     (the default) disables aging; e.g. ``max_model_len / 60`` makes a
     request that waited 60 s outrank any fresh one."""
+
+    fairway_weight: float = Field(default=4.0, gt=0.0)
+    """Fairway's Fast-lane work weight ``w`` (the paper uses 4)."""
+
+    fairway_patience_mult: float = Field(default=3.0, ge=0.0)
+    """Fairway patience = max(floor, mult x idle-engine prefill time of the
+    prompt) (the paper uses 3)."""
+
+    fairway_patience_floor_s: float = Field(default=1.0, ge=0.0)
+    """Fairway patience floor in seconds (the paper uses 1)."""
+
+    fairway_wait: FairwayWait = "relative"
+    """Fairway's wait term: ``relative`` (wait / patience, the paper),
+    ``absolute`` (wait in seconds) or ``none`` (cache ratio only)."""
+
+    fairway_fair_lane: bool = True
+    """Merge Fairway's Fast lane with the arrival-order Fair lane by work
+    charges. False orders by the Fast-lane score alone."""
+
+    fairway_prefill_model: str | None = None
+    """Path of a forward-sim model JSON
+    (``simulator/forward-sim/models/<config>.json``) that prices Fairway's
+    idle-engine prefill time, as the KVReuse simulator does. Required by
+    the ``fairway`` policy."""
+
+    ragcache_window: int = Field(default=32, ge=0)
+    """RAGCache starvation window in requests (the paper uses 32). Zero ranks
+    by the cached / uncached ratio alone."""
+
+    ragcache_window_mode: RAGCacheWindowMode = "bypass"
+    """``bypass``: a waiting request overtaken by ``ragcache_window``
+    admissions of later arrivals goes first (oldest first). ``slide``: only
+    the ``ragcache_window`` oldest waiting requests are reordered."""
+
+    klpm_k: int = Field(default=4, ge=1)
+    """k-LPM cycle length in fresh admissions; 1 is FCFS."""
+
+    sspf_overtake_guard_k: float = Field(default=0.0, ge=0.0)
+    """SSPF overtaking guard: a fresh request goes to the front once later
+    arrivals admitted before it hold ``k`` times its uncached tokens (at
+    least one 16-token block). Zero (the default) disables it."""
 
     rank_preempted_requests: bool = False
     """For SPF, rank preempted requests by their remaining work.
@@ -468,6 +525,24 @@ class SchedulerConfig:
                     "lpm_admission_skips is not supported with "
                     f"admission_policy={self.admission_policy!r}"
                 )
+        if self.policy == "fairway" and not self.fairway_prefill_model:
+            raise ValueError(
+                "the 'fairway' scheduling policy requires fairway_prefill_model "
+                "(a forward-sim model JSON)"
+            )
+        if self.sspf_overtake_guard_k > 0 and self.policy != "sspf":
+            raise ValueError(
+                "sspf_overtake_guard_k requires the 'sspf' scheduling policy, "
+                f"not {self.policy!r}"
+            )
+        related = self.policy in ("fairway", "ragcache", "klpm")
+        if (related or self.sspf_overtake_guard_k > 0) and (
+            self.admission_policy != "none"
+        ):
+            raise ValueError(
+                f"the {self.policy!r} ordering is not supported with "
+                f"admission_policy={self.admission_policy!r}"
+            )
         if self.kv_cache_eviction_policy == "skip" and not self.lpm_admission_skips:
             raise ValueError(
                 "kv_cache_eviction_policy='skip' requires lpm_admission_skips > 0"

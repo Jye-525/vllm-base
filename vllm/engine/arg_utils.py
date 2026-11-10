@@ -93,12 +93,14 @@ from vllm.config.parallel import (
 )
 from vllm.config.scheduler import (
     AdmissionPolicy,
+    FairwayWait,
     KVCacheEvictionPolicy,
     PeekEvictionMode,
     PKASOutputPredictor,
     PKASSimulation,
     PolicyProfile,
     PreemptionVictim,
+    RAGCacheWindowMode,
     SchedulerPolicy,
 )
 from vllm.config.utils import get_field
@@ -621,6 +623,16 @@ class EngineArgs:
     clpm_dynamic_lane: bool | None = None
     clpm_slo_budget_s: float = SchedulerConfig.clpm_slo_budget_s
     spf_age_alpha: float = SchedulerConfig.spf_age_alpha
+    fairway_weight: float = SchedulerConfig.fairway_weight
+    fairway_patience_mult: float = SchedulerConfig.fairway_patience_mult
+    fairway_patience_floor_s: float = SchedulerConfig.fairway_patience_floor_s
+    fairway_wait: FairwayWait = SchedulerConfig.fairway_wait
+    fairway_fair_lane: bool = SchedulerConfig.fairway_fair_lane
+    fairway_prefill_model: str | None = SchedulerConfig.fairway_prefill_model
+    ragcache_window: int = SchedulerConfig.ragcache_window
+    ragcache_window_mode: RAGCacheWindowMode = SchedulerConfig.ragcache_window_mode
+    klpm_k: int = SchedulerConfig.klpm_k
+    sspf_overtake_guard_k: float = SchedulerConfig.sspf_overtake_guard_k
     rank_preempted_requests: bool = SchedulerConfig.rank_preempted_requests
     preemption_victim: PreemptionVictim = SchedulerConfig.preemption_victim
     sspf_session_credit_weight: float = SchedulerConfig.sspf_session_credit_weight
@@ -1563,6 +1575,21 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--spf-age-alpha", **scheduler_kwargs["spf_age_alpha"]
         )
+        for name in (
+            "fairway_weight",
+            "fairway_patience_mult",
+            "fairway_patience_floor_s",
+            "fairway_wait",
+            "fairway_fair_lane",
+            "fairway_prefill_model",
+            "ragcache_window",
+            "ragcache_window_mode",
+            "klpm_k",
+            "sspf_overtake_guard_k",
+        ):
+            scheduler_group.add_argument(
+                "--" + name.replace("_", "-"), **scheduler_kwargs[name]
+            )
         scheduler_group.add_argument(
             "--rank-preempted-requests",
             **scheduler_kwargs["rank_preempted_requests"],
@@ -2276,6 +2303,16 @@ class EngineArgs:
             clpm_dynamic_lane=self.clpm_dynamic_lane,
             clpm_slo_budget_s=self.clpm_slo_budget_s,
             spf_age_alpha=self.spf_age_alpha,
+            fairway_weight=self.fairway_weight,
+            fairway_patience_mult=self.fairway_patience_mult,
+            fairway_patience_floor_s=self.fairway_patience_floor_s,
+            fairway_wait=self.fairway_wait,
+            fairway_fair_lane=self.fairway_fair_lane,
+            fairway_prefill_model=self.fairway_prefill_model,
+            ragcache_window=self.ragcache_window,
+            ragcache_window_mode=self.ragcache_window_mode,
+            klpm_k=self.klpm_k,
+            sspf_overtake_guard_k=self.sspf_overtake_guard_k,
             rank_preempted_requests=self.rank_preempted_requests,
             preemption_victim=self.preemption_victim,
             sspf_session_credit_weight=self.sspf_session_credit_weight,
