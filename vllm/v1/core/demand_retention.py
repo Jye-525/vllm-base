@@ -26,8 +26,12 @@ also held. This is the KVReuse simulator's ``eviction="pred"`` with
   and a hash whose demand ended since (and is not held) ranks infinite;
   admissions do not change ranks.
 
-Keys of side-pool blocks live in a lazy min-heap: every key change pushes the
-block's current key, and stale entries are dropped when popped.
+Keys of side-pool blocks live in lazy min-heaps, one per tier: every key
+change pushes the block's current key, and stale entries are dropped when
+popped. Keys start with their tier, so the hold tier's heap is drained first
+and the demand tier's keys (which need the waiting-order ranks) are built
+only when the held blocks cannot supply the victims (the simulator's
+``_pick_pred`` shortcut).
 """
 
 from __future__ import annotations
@@ -80,7 +84,13 @@ class DemandRetention:
         self.clock = clock
         # Free cached blocks with predicted reuse, by block id.
         self.side: dict[int, KVCacheBlock] = {}
-        self._heap: list[tuple[Key, int]] | None = None
+        # Lazy key heaps by tier (None: rebuild from the side pool when needed).
+        self._heaps: dict[int, list[tuple[Key, int]] | None] = {
+            HOLD_TIER: None,
+            DEMAND_TIER: None,
+        }
+        # Hashes with queued demand, as last reported by on_demand_change.
+        self._demanded: set[BlockHash] = set()
         # Session holds: hash -> [holding turns, depth]; hash -> latest expiry
         # (a running maximum, not lowered when one of several holds drops).
         self._hold: dict[BlockHash, list[int]] = {}
@@ -135,12 +145,19 @@ class DemandRetention:
         _, depth = self._hold[h]
         return (HOLD_TIER, -self._hold_t[h], -depth, block.block_id)
 
+    def _tier(self, block: KVCacheBlock) -> int:
+        """The first element of ``_key(block)``, without resolving ranks."""
+        assert block.block_hash is not None
+        h = get_block_hash(block.block_hash)
+        return DEMAND_TIER if self._demand.get(h, 0) > 0 else HOLD_TIER
+
     def _push(self, block: KVCacheBlock) -> None:
-        heap = self._heap
+        tier = self._tier(block)
+        heap = self._heaps[tier]
         if heap is None:
             return
         if len(heap) > 2 * len(self.side) + 1024:
-            self._heap = None  # mostly stale: rebuild when needed
+            self._heaps[tier] = None  # mostly stale: rebuild when needed
         else:
             heapq.heappush(heap, (self._key(block), block.block_id))
 
@@ -186,17 +203,29 @@ class DemandRetention:
             if count is None:
                 continue
             seen += 1
-            if count == 0 and h not in self._hold:
-                self._rank_extra[h] = math.inf  # demand ended (rule R)
-            self._refresh(h)
+            self._on_count(h, count)
         if seen < len(counts):  # hashes no longer on the path (replaced path)
             on_path = set(path)
             for h, count in counts.items():
                 if h not in on_path:
-                    if count == 0 and h not in self._hold:
-                        self._rank_extra[h] = math.inf
-                    self._refresh(h)
+                    self._on_count(h, count)
         self.elapsed_ns += time.perf_counter_ns() - start
+
+    def _on_count(self, h: BlockHash, count: int) -> None:
+        demanded = self._demanded
+        if count > 0:
+            if h in demanded:
+                # Demand stays positive: the hash stays wanted, in the demand
+                # tier, with the same rank and depth (cumulative hashes have
+                # one depth), and its free copies are already in the side
+                # pool. Its key is unchanged, so there is nothing to refresh.
+                return
+            demanded.add(h)
+        else:
+            demanded.discard(h)
+            if h not in self._hold:
+                self._rank_extra[h] = math.inf  # demand ended (rule R)
+        self._refresh(h)
 
     def on_preempt(self, path: Iterable[BlockHash]) -> None:
         """The request resumes at the queue head: its path ranks 0."""
@@ -213,28 +242,37 @@ class DemandRetention:
         self._snapshot = snapshot
         self._rank_map = None
         self._rank_extra = {}
-        self._heap = None
+        self._heaps = {HOLD_TIER: None, DEMAND_TIER: None}
 
     def pop_victims(self, num_blocks: int) -> list[KVCacheBlock]:
         """Take side-pool blocks once the LRU queue is empty, in key order."""
         start = time.perf_counter_ns()
-        heap = self._heap
-        if heap is None:
-            heap = [(self._key(b), b.block_id) for b in self.side.values()]
-            heapq.heapify(heap)
-            self._heap = heap
         victims: list[KVCacheBlock] = []
-        while len(victims) < num_blocks:
-            key, block_id = heapq.heappop(heap)
-            block = self.side.get(block_id)
-            if block is None or self._key(block) != key:
-                continue  # left the side pool, or re-keyed (a newer entry exists)
-            del self.side[block_id]
-            victims.append(block)
-            if key[0] == HOLD_TIER:
-                self.num_hold_evictions += 1
-            else:
-                self.num_demand_evictions += 1
+        for tier in (HOLD_TIER, DEMAND_TIER):
+            while len(victims) < num_blocks:
+                heap = self._heaps[tier]
+                if heap is None:
+                    heap = [
+                        (self._key(b), b.block_id)
+                        for b in self.side.values()
+                        if self._tier(b) == tier
+                    ]
+                    heapq.heapify(heap)
+                    self._heaps[tier] = heap
+                if not heap:
+                    break
+                key, block_id = heapq.heappop(heap)
+                block = self.side.get(block_id)
+                if block is None or self._key(block) != key:
+                    continue  # left the side pool, or re-keyed (a newer entry exists)
+                del self.side[block_id]
+                victims.append(block)
+                if tier == HOLD_TIER:
+                    self.num_hold_evictions += 1
+                else:
+                    self.num_demand_evictions += 1
+        if len(victims) < num_blocks:
+            raise RuntimeError("demand retention: side pool has too few blocks")
         self.elapsed_ns += time.perf_counter_ns() - start
         return victims
 
@@ -313,7 +351,7 @@ class DemandRetention:
         """Forget all predictions; return the side-pool blocks to free."""
         blocks = list(self.side.values())
         self.side.clear()
-        self._heap = None
+        self._heaps = {HOLD_TIER: None, DEMAND_TIER: None}
         self._hold.clear()
         self._hold_t.clear()
         self._session_hold.clear()

@@ -47,6 +47,14 @@ from .utils import EOS_TOKEN_ID, create_scheduler
 # Last vllm-kvreuse commit before the schedule() refactor.
 BASE_COMMIT = "cc8b41234a075ef4c8b6109bb5fd788db3f3e669"
 SCHEDULER_PATH = "vllm/v1/core/sched/scheduler.py"
+# Last commit before the R2 bookkeeping changes (per-root caches in the
+# waiting-prefix index, tiered retention heaps): its scheduler, run with its
+# own index and retention classes, must decide exactly as the current code.
+PRE_R2_COMMIT = "f1ee88694d1c0f8dffb37c9442f60fa618c653fa"
+PRE_R2_CLASSES = {
+    "PendingPrefixIndex": "vllm/v1/core/sched/waiting_prefix_index.py",
+    "DemandRetention": "vllm/v1/core/demand_retention.py",
+}
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 BS = 16
@@ -133,6 +141,43 @@ def _fixed_none_hash():
     init_none_hash(sha256)
 
 
+def _module_from_git(commit: str, path: str, name: str) -> types.ModuleType:
+    """Execute ``path`` as of ``commit`` as module ``name`` (registered in
+    sys.modules; the caller removes it). Skips the test without git."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{commit}:{path}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:  # git missing
+        pytest.skip(f"git unavailable: {exc}")
+    if proc.returncode != 0:
+        pytest.skip(f"reference {path} not in git: {proc.stderr.strip()}")
+    module = types.ModuleType(name)
+    module.__file__ = f"<{commit[:10]}>/{path}"
+    sys.modules[name] = module
+    exec(compile(proc.stdout, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+@pytest.fixture(scope="module")
+def pre_r2_module() -> types.ModuleType:
+    """The pre-R2 scheduler with its own index and retention classes."""
+    names = ["vllm.v1.core.sched._pre_r2_scheduler"]
+    try:
+        module = _module_from_git(PRE_R2_COMMIT, SCHEDULER_PATH, names[0])
+        for cls_name, path in PRE_R2_CLASSES.items():
+            names.append(f"vllm.v1.core.sched._pre_r2_{cls_name}")
+            dep = _module_from_git(PRE_R2_COMMIT, path, names[-1])
+            setattr(module, cls_name, getattr(dep, cls_name))
+        yield module
+    finally:
+        for name in names:
+            sys.modules.pop(name, None)
+
+
 @pytest.fixture(scope="module")
 def reference_module() -> types.ModuleType:
     """The pre-refactor scheduler module, executed from git."""
@@ -190,8 +235,7 @@ def _workload(seed: int) -> list[tuple[int, dict[str, Any]]]:
     """(arrival step, request kwargs): prefix families, bursty arrivals."""
     rng = random.Random(seed)
     families = [
-        list(range(1 + 500 * f, 1 + 500 * f + rng.randint(32, 96)))
-        for f in range(6)
+        list(range(1 + 500 * f, 1 + 500 * f + rng.randint(32, 96))) for f in range(6)
     ]
     specs: list[tuple[int, dict[str, Any]]] = []
     step = 0
@@ -366,4 +410,36 @@ def test_schedule_matches_pre_refactor_reference(
         assert refactored[part] == reference[part], (
             f"{config_name} seed={seed}: {part} diverged at "
             + _first_difference(reference[part], refactored[part])
+        )
+
+
+# Configurations whose ranking or eviction the R2 changes touch, plus the
+# related-work orderings (present before and after R2).
+PRE_R2_CONFIGS: dict[str, dict[str, Any]] = {
+    name: CONFIGS[name]
+    for name in ("lpm", "peek_full", "peek_eviction_fcfs", "sspf", "sspf_series")
+} | {
+    "clpm_lpm_order": dict(
+        scheduling_policy="clpm", lpm_window_size=0, lpm_fallback_threshold=0
+    ),
+    "sspf_series_guard": dict(CONFIGS["sspf_series"], sspf_overtake_guard_k=2.0),
+    "ragcache_bypass": dict(scheduling_policy="ragcache", ragcache_window=2),
+    "klpm_k2": dict(scheduling_policy="klpm", klpm_k=2),
+}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("config_name", list(PRE_R2_CONFIGS))
+def test_schedule_matches_pre_r2_reference(
+    pre_r2_module, monkeypatch, config_name, seed
+):
+    config = PRE_R2_CONFIGS[config_name]
+    reference = _run(pre_r2_module.Scheduler, pre_r2_module, config, seed, monkeypatch)
+    current = _run(Scheduler, scheduler_module, config, seed, monkeypatch)
+
+    assert reference["steps"], "the workload scheduled nothing"
+    for part in ("steps", "records", "info"):
+        assert current[part] == reference[part], (
+            f"{config_name} seed={seed}: {part} diverged at "
+            + _first_difference(reference[part], current[part])
         )
